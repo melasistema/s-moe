@@ -1,0 +1,9 @@
+/.idea
+/.github
+/.antigravitycli
+
+/references
+
+# Agents
+GEMINI.md
+AGENTS.md
