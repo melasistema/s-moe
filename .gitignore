@@ -2,8 +2,31 @@
 /.github
 /.antigravitycli
 
-/references
+/references/
 
 # Agents
 GEMINI.md
 AGENTS.md
+
+# ── Python virtual environment ────────────────────────────────
+.venv/
+
+# ── Python cache ──────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# ── C++ build artefacts ───────────────────────────────────────
+build/
+*.o
+*.air
+*.metallib
+
+# ── .smoe vault output (large binary files — store separately) ─
+*.smoe
+*.scout.safetensors
+
+# ── macOS noise ───────────────────────────────────────────────
+.DS_Store
