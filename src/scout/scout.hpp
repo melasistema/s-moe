@@ -43,8 +43,8 @@ struct ExpertPrediction {
 // ── Scout forward-pass result ────────────────────────────────
 struct ScoutOutput {
     uint32_t next_token_id;
-    // Predicted experts for steps [N+1 … N+K]
-    ExpertPrediction lookahead[LOOKAHEAD_K];
+    // Predicted experts for the current token for all 27 MoE layers
+    ExpertPrediction routing[27];
 };
 
 // ── Surface Scout — Week 4 interface stub ────────────────────
@@ -60,6 +60,29 @@ public:
 
     // Reset KV-cache for a new prompt.
     void reset_context();
+
+    // ── Getters for full-model execution ────────────────────────
+    const float* get_embed() const noexcept;
+    const float* get_lm_head() const noexcept;
+    const float* get_model_norm() const noexcept;
+    
+    // Layer 0: dense MLP
+    const float* get_l0_gate() const noexcept;
+    const float* get_l0_up() const noexcept;
+    const float* get_l0_down() const noexcept;
+
+    // Layers 0..27
+    const float* get_q_proj(uint32_t layer) const noexcept;
+    const float* get_k_proj(uint32_t layer) const noexcept;
+    const float* get_v_proj(uint32_t layer) const noexcept;
+    const float* get_o_proj(uint32_t layer) const noexcept;
+    const float* get_input_norm(uint32_t layer) const noexcept;
+    const float* get_post_norm(uint32_t layer) const noexcept;
+    
+    // Layers 1..27 shared experts
+    const float* get_shared_gate(uint32_t layer) const noexcept;
+    const float* get_shared_up(uint32_t layer) const noexcept;
+    const float* get_shared_down(uint32_t layer) const noexcept;
 
     Scout(const Scout&)            = delete;
     Scout& operator=(const Scout&) = delete;

@@ -98,10 +98,15 @@ public:
     [[nodiscard]] bool prefetch(uint32_t layer_id, uint32_t expert_id) noexcept;
 
     // Claim the next READY slot. Caller takes ownership; must call
-    // release() when the Metal kernel has finished with the data.
+    // claim_ready() / release() when the Metal kernel has finished with the data.
     // Returns nullptr if no slot is READY (non-blocking).
     // Zero allocations.
     [[nodiscard]] RingSlot* claim_ready() noexcept;
+
+    // Claim a specific READY slot for a given layer and expert.
+    // Caller takes ownership; must call release() when done.
+    // Returns nullptr if the specific expert is not READY (non-blocking).
+    [[nodiscard]] RingSlot* claim_specific(uint32_t layer_id, uint32_t expert_id) noexcept;
 
     // Release a slot the GPU is done with.
     // Atomically transitions CONSUMED → EMPTY.

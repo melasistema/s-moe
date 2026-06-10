@@ -457,6 +457,23 @@ RingSlot* Streamer::claim_ready() noexcept {
     return nullptr;
 }
 
+RingSlot* Streamer::claim_specific(uint32_t layer_id, uint32_t expert_id) noexcept {
+    Impl& im = *impl_;
+    for (uint32_t i = 0; i < im.ring_sz; ++i) {
+        if (im.slots[i].layer_id == layer_id && im.slots[i].expert_id == expert_id) {
+            SlotState expected = SlotState::READY;
+            if (im.slots[i].state.compare_exchange_strong(
+                    expected, SlotState::CONSUMED,
+                    std::memory_order_acquire,
+                    std::memory_order_relaxed))
+            {
+                return &im.slots[i];
+            }
+        }
+    }
+    return nullptr;
+}
+
 void Streamer::release(RingSlot* slot) noexcept {
     // The caller (Metal bridge) calls this after the GPU kernel finishes.
     // Atomically reclaim: CONSUMED → EMPTY.

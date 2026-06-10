@@ -27,6 +27,7 @@ namespace smoe {
 // ── Format constants ──────────────────────────────────────────
 inline constexpr uint32_t SMOE_VERSION        = 1;
 inline constexpr size_t   PAGE_SIZE           = 16'384;   // 16 KB Apple Silicon page
+inline constexpr uint32_t NUM_MOE_LAYERS      = 27;
 inline constexpr uint32_t Q2_GROUP_SIZE       = 64;       // weights per quantisation group
 inline constexpr uint32_t TENSORS_PER_EXPERT  = 3;        // gate_proj, up_proj, down_proj
 
@@ -138,6 +139,49 @@ static_assert(sizeof(TensorDescriptor) == 44,
     return desc_base
         + static_cast<uint64_t>(e) * TENSORS_PER_EXPERT * sizeof(TensorDescriptor)
         + static_cast<uint64_t>(t) * sizeof(TensorDescriptor);
+}
+
+// ── Inline Math Utilities ────────────────────────────────────
+
+inline float* allocate_aligned_float(size_t elems) noexcept {
+    size_t bytes = elems * sizeof(float);
+    void* ptr = nullptr;
+    if (::posix_memalign(&ptr, 16384, bytes) != 0) {
+        return nullptr;
+    }
+    return static_cast<float*>(ptr);
+}
+
+inline void free_aligned_float(float* ptr) noexcept {
+    if (ptr) {
+        ::free(ptr);
+    }
+}
+
+inline void rms_norm(float* x, const float* w, uint32_t n) noexcept {
+    float sum_sq = 0.0f;
+    for (uint32_t i = 0; i < n; ++i) {
+        sum_sq += x[i] * x[i];
+    }
+    float rms = std::sqrt(sum_sq / static_cast<float>(n) + 1e-6f);
+    float inv_rms = 1.0f / rms;
+    for (uint32_t i = 0; i < n; ++i) {
+        x[i] = x[i] * inv_rms * w[i];
+    }
+}
+
+inline void matvec(float* __restrict__ out,
+                   const float* __restrict__ weight,
+                   const float* __restrict__ x,
+                   uint32_t rows, uint32_t cols) noexcept {
+    for (uint32_t r = 0; r < rows; ++r) {
+        float acc = 0.0f;
+        const float* row = weight + static_cast<size_t>(r) * cols;
+        for (uint32_t c = 0; c < cols; ++c) {
+            acc += row[c] * x[c];
+        }
+        out[r] = acc;
+    }
 }
 
 } // namespace smoe

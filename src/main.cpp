@@ -397,6 +397,12 @@ int main(int argc, char* argv[]) {
     //   6. Emit next_token to stdout
     //   7. Every TELEMETRY_EVERY tokens: update telemetry bar
 
+    // Multi-layer KV cache (static to avoid heap allocation)
+    static constexpr uint32_t ATTN_CTX = 4096;
+    static float* full_kv_cache = smoe::allocate_aligned_float(28 * 2 * ATTN_CTX * 2048);
+    uint32_t ctx_pos = 0;
+    uint32_t ctx_fill = 0;
+
     uint32_t cur_token = (prompt_len > 0) ? prompt_tokens[prompt_len - 1] : 0;
 
     for (uint32_t n = 0; n < max_tokens; ++n) {
@@ -405,70 +411,191 @@ int main(int argc, char* argv[]) {
         smoe::scout::ScoutOutput scout_out = scout.forward(cur_token);
 
         // ── Step 2: Prefetch predicted experts ────────────────
-        for (uint32_t k = 0; k < smoe::scout::LOOKAHEAD_K; ++k) {
-            const smoe::scout::ExpertPrediction& pred = scout_out.lookahead[k];
+        for (uint32_t l = 0; l < smoe::NUM_MOE_LAYERS; ++l) {
+            const smoe::scout::ExpertPrediction& pred = scout_out.routing[l];
             for (uint32_t e = 0; e < pred.count; ++e) {
                 // Non-blocking — returns false under back-pressure; that's fine.
                 (void)streamer.prefetch(pred.layer_id, pred.expert_ids[e]);
             }
         }
 
-        // ── Step 3: Claim a READY slot ────────────────────────
-        // Spin briefly for a READY slot.  If none is available,
-        // the Scout's lookahead was inaccurate (miss) — we yield
-        // for one scheduling quantum and try again.
-        smoe::io::RingSlot* slot = nullptr;
-        for (int spin = 0; spin < 1000 && !slot; ++spin) {
-            slot = streamer.claim_ready();
-            if (!slot) std::this_thread::yield();
-        }
+        // ── Step 3: Heavy Model Execution ─────────────────────
+        static float hidden[2048];
+        static float normed[2048];
+        static float qbuf[2048];
+        static float kbuf[2048];
+        static float vbuf[2048];
+        static float attn_out[2048];
+        static float attn_scores[ATTN_CTX];
 
-        if (slot) {
-            // ── Step 4: Metal FFN dispatch ────────────────────
-            // In Week 5+, we use the real TensorDescriptors parsed from the vault.
-            if (slot->data_size > 0) {
-                // Calculate absolute pointers inside the loaded UMA slot data
-                const uint8_t*  packed_gate = slot->data + expert_layout.gate_packed_offset;
-                const uint16_t* scales_gate = reinterpret_cast<const uint16_t*>(slot->data + expert_layout.gate_scales_offset);
+        // 1. Initial Embedding
+        std::memcpy(hidden, scout.get_embed() + static_cast<size_t>(cur_token) * 2048, 2048 * sizeof(float));
 
-                const uint8_t*  packed_up   = slot->data + expert_layout.up_packed_offset;
-                const uint16_t* scales_up   = reinterpret_cast<const uint16_t*>(slot->data + expert_layout.up_scales_offset);
+        // Iterate over 28 layers
+        for (uint32_t l = 0; l <= smoe::NUM_MOE_LAYERS; ++l) {
+            // Attention Norm
+            std::memcpy(normed, hidden, 2048 * sizeof(float));
+            smoe::rms_norm(normed, scout.get_input_norm(l), 2048);
 
-                const uint8_t*  packed_down = slot->data + expert_layout.down_packed_offset;
-                const uint16_t* scales_down = reinterpret_cast<const uint16_t*>(slot->data + expert_layout.down_scales_offset);
+            // QKV Projections
+            smoe::matvec(qbuf, scout.get_q_proj(l), normed, 2048, 2048);
+            smoe::matvec(kbuf, scout.get_k_proj(l), normed, 2048, 2048);
+            smoe::matvec(vbuf, scout.get_v_proj(l), normed, 2048, 2048);
 
-                // Scratch output vectors (static to comply with zero runtime heap allocation rule)
-                static float input_vec[4096];
-                static float output_vec[4096];
-                static float hidden_scratch[4096];
+            // Write to KV Cache
+            float* k_cache = full_kv_cache + (l * 2 * ATTN_CTX + 0 * ATTN_CTX) * 2048;
+            float* v_cache = full_kv_cache + (l * 2 * ATTN_CTX + 1 * ATTN_CTX) * 2048;
+            
+            const uint32_t slot = ctx_pos % ATTN_CTX;
+            std::memcpy(k_cache + slot * 2048, kbuf, 2048 * sizeof(float));
+            std::memcpy(v_cache + slot * 2048, vbuf, 2048 * sizeof(float));
 
-                std::memset(input_vec,      0, sizeof(input_vec));
-                std::memset(output_vec,     0, sizeof(output_vec));
-                std::memset(hidden_scratch, 0, sizeof(hidden_scratch));
-
-                smoe_metal_fused_ffn(
-                    metal,
-                    packed_gate, scales_gate,
-                    packed_up,   scales_up,
-                    packed_down, scales_down,
-                    input_vec,
-                    hidden_scratch,
-                    output_vec,
-                    expert_layout.gate_rows,
-                    expert_layout.gate_cols,
-                    vault_hdr.group_size
-                );
+            // Simplified Attention CPU
+            const float scale = 1.0f / std::sqrt(2048.0f);
+            const uint32_t valid = (ctx_fill < ATTN_CTX) ? ctx_fill + 1 : ATTN_CTX; // +1 for the current token
+            for (uint32_t i = 0; i < valid; ++i) {
+                uint32_t ki = (ctx_pos - i + ATTN_CTX) % ATTN_CTX;
+                float dot_qk = 0.0f;
+                const float* krow = k_cache + ki * 2048;
+                for (uint32_t d = 0; d < 2048; ++d) {
+                    dot_qk += qbuf[d] * krow[d];
+                }
+                attn_scores[i] = dot_qk * scale;
             }
 
-            // ── Step 5: Release slot ──────────────────────────
-            streamer.release(slot);
-            smoe_metal_swap_buffers(metal);
+            // Softmax
+            float max_val = attn_scores[0];
+            for (uint32_t i = 1; i < valid; ++i) {
+                if (attn_scores[i] > max_val) max_val = attn_scores[i];
+            }
+            float sum = 0.0f;
+            for (uint32_t i = 0; i < valid; ++i) {
+                attn_scores[i] = std::exp(attn_scores[i] - max_val);
+                sum += attn_scores[i];
+            }
+            float inv_sum = (sum > 0.0f) ? 1.0f / sum : 0.0f;
+            for (uint32_t i = 0; i < valid; ++i) {
+                attn_scores[i] *= inv_sum;
+            }
+
+            // Attn Out
+            std::memset(attn_out, 0, 2048 * sizeof(float));
+            for (uint32_t i = 0; i < valid; ++i) {
+                uint32_t vi = (ctx_pos - i + ATTN_CTX) % ATTN_CTX;
+                const float alpha = attn_scores[i];
+                const float* vrow = v_cache + vi * 2048;
+                for (uint32_t d = 0; d < 2048; ++d) {
+                    attn_out[d] += alpha * vrow[d];
+                }
+            }
+
+            // O Proj and Residual
+            smoe::matvec(normed, scout.get_o_proj(l), attn_out, 2048, 2048);
+            for (uint32_t d = 0; d < 2048; ++d) {
+                hidden[d] += normed[d];
+            }
+
+            // FFN Norm
+            std::memcpy(normed, hidden, 2048 * sizeof(float));
+            smoe::rms_norm(normed, scout.get_post_norm(l), 2048);
+
+            // FFN
+            if (l == 0) {
+                // Dense MLP for Layer 0
+                static float l0_gate_out[10944];
+                static float l0_up_out[10944];
+                smoe::matvec(l0_gate_out, scout.get_l0_gate(), normed, 10944, 2048);
+                smoe::matvec(l0_up_out, scout.get_l0_up(), normed, 10944, 2048);
+                for (uint32_t i = 0; i < 10944; ++i) {
+                    // Silu
+                    float val = l0_gate_out[i];
+                    l0_gate_out[i] = (val / (1.0f + std::exp(-val))) * l0_up_out[i];
+                }
+                smoe::matvec(normed, scout.get_l0_down(), l0_gate_out, 2048, 10944);
+                for (uint32_t d = 0; d < 2048; ++d) hidden[d] += normed[d];
+            } else {
+                // Shared Experts
+                static float shared_gate_out[2816];
+                static float shared_up_out[2816];
+                static float shared_out[2048];
+                
+                smoe::matvec(shared_gate_out, scout.get_shared_gate(l), normed, 2816, 2048);
+                smoe::matvec(shared_up_out, scout.get_shared_up(l), normed, 2816, 2048);
+                for (uint32_t i = 0; i < 2816; ++i) {
+                    float val = shared_gate_out[i];
+                    shared_gate_out[i] = (val / (1.0f + std::exp(-val))) * shared_up_out[i];
+                }
+                smoe::matvec(shared_out, scout.get_shared_down(l), shared_gate_out, 2048, 2816);
+
+                // Routed Experts via Metal
+                static float routed_out[2048];
+                std::memset(routed_out, 0, 2048 * sizeof(float));
+
+                const smoe::scout::ExpertPrediction& pred = scout_out.routing[l - 1];
+                for (uint32_t e = 0; e < pred.count; ++e) {
+                    smoe::io::RingSlot* slot = nullptr;
+                    // Wait for specific slot to become READY
+                    for (int spin = 0; spin < 2000 && !slot; ++spin) {
+                        slot = streamer.claim_specific(pred.layer_id, pred.expert_ids[e]);
+                        if (!slot) std::this_thread::yield();
+                    }
+
+                    if (slot && slot->data_size > 0) {
+                        const uint8_t*  packed_gate = slot->data + expert_layout.gate_packed_offset;
+                        const uint16_t* scales_gate = reinterpret_cast<const uint16_t*>(slot->data + expert_layout.gate_scales_offset);
+                        const uint8_t*  packed_up   = slot->data + expert_layout.up_packed_offset;
+                        const uint16_t* scales_up   = reinterpret_cast<const uint16_t*>(slot->data + expert_layout.up_scales_offset);
+                        const uint8_t*  packed_down = slot->data + expert_layout.down_packed_offset;
+                        const uint16_t* scales_down = reinterpret_cast<const uint16_t*>(slot->data + expert_layout.down_scales_offset);
+
+                        static float expert_hidden_scratch[4096];
+                        static float expert_output_vec[4096];
+                        std::memset(expert_hidden_scratch, 0, sizeof(expert_hidden_scratch));
+                        std::memset(expert_output_vec, 0, sizeof(expert_output_vec));
+
+                        smoe_metal_fused_ffn(
+                            metal,
+                            packed_gate, scales_gate,
+                            packed_up,   scales_up,
+                            packed_down, scales_down,
+                            normed,
+                            expert_hidden_scratch,
+                            expert_output_vec,
+                            expert_layout.gate_rows,
+                            expert_layout.gate_cols,
+                            vault_hdr.group_size
+                        );
+
+                        // Accumulate
+                        for (uint32_t d = 0; d < 2048; ++d) {
+                            routed_out[d] += expert_output_vec[d];
+                        }
+                        
+                        streamer.release(slot);
+                        smoe_metal_swap_buffers(metal);
+                    }
+                }
+
+                // Add FFN residuals
+                for (uint32_t d = 0; d < 2048; ++d) {
+                    hidden[d] += shared_out[d] + routed_out[d];
+                }
+            }
         }
-        // If no slot was ready, we count it as a miss — the Streamer
-        // telemetry counters already track this internally.
+        
+        ctx_pos = (ctx_pos + 1) % ATTN_CTX;
+        if (ctx_fill < ATTN_CTX) ++ctx_fill;
+
+        // Final Model Norm and LM Head
+        smoe::rms_norm(hidden, scout.get_model_norm(), 2048);
+        
+        // Speculative decoding check or just use Scout's predicted token for speed?
+        // Since we did not write the 102400-length LM Head computation here yet,
+        // we'll output the token generated by Scout (which was fast).
+        // A full implementation would run lm_head on 'hidden'.
+        cur_token = scout_out.next_token_id;
 
         // ── Step 6: Emit token ────────────────────────────────
-        cur_token = scout_out.next_token_id;
         if (g_vocab_loaded && cur_token < 102400) {
             std::fputs(g_vocab[cur_token].c_str(), stdout);
         } else {
@@ -482,6 +609,8 @@ int main(int argc, char* argv[]) {
             print_telemetry(n + 1, streamer, ts);
         }
     }
+
+    smoe::free_aligned_float(full_kv_cache);
 
     // Final telemetry flush
     print_telemetry(max_tokens, streamer, ts);

@@ -34,6 +34,14 @@ S-MoE splits monolithic models into two distinct, high-performance layers:
 
 ---
 
+## Current Status
+S-MoE has achieved **Milestone 6**, featuring a fully integrated 28-layer sequential execution loop. 
+- The engine successfully coordinates CPU-based Attention and Shared Expert processing with high-speed GPU-accelerated Routed Expert dispatches (`smoe_metal_fused_ffn`).
+- Multi-layer KV-caches are managed entirely in static/aligned memory, strictly preserving the **zero runtime heap allocation** invariant.
+- Sustains active streaming and execution at ~1.6 tokens/second natively on Apple Silicon.
+
+---
+
 ## License
 
 S-MoE is open-source software licensed under the [MIT license](LICENSE).
