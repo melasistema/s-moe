@@ -169,7 +169,26 @@ static uint32_t top_k(const float* scores, uint32_t n, uint32_t k,
     uint32_t count = std::min(k, n);
     float   tmp[GATE_ROWS];
     uint32_t idx[GATE_ROWS];
-    for (uint32_t i = 0; i < n; ++i) { tmp[i] = scores[i]; idx[i] = i; }
+
+    // DeepSeek MoE requires Softmax over all experts to compute proper routing weights
+    float max_val = scores[0];
+    for (uint32_t i = 1; i < n; ++i) {
+        if (scores[i] > max_val) max_val = scores[i];
+    }
+    
+    float sum_exp = 0.0f;
+    for (uint32_t i = 0; i < n; ++i) {
+        tmp[i] = std::exp(scores[i] - max_val);
+        idx[i] = i;
+        sum_exp += tmp[i];
+    }
+    
+    float inv_sum = (sum_exp > 0.0f) ? 1.0f / sum_exp : 0.0f;
+    for (uint32_t i = 0; i < n; ++i) {
+        tmp[i] *= inv_sum;
+    }
+
+    // Top-k selection
     for (uint32_t s = 0; s < count; ++s) {
         uint32_t best = s;
         for (uint32_t i = s + 1; i < n; ++i) {
@@ -178,6 +197,7 @@ static uint32_t top_k(const float* scores, uint32_t n, uint32_t k,
         // Swap
         float   ft = tmp[s]; tmp[s] = tmp[best]; tmp[best] = ft;
         uint32_t it = idx[s]; idx[s] = idx[best]; idx[best] = it;
+        
         out_indices[s] = idx[s];
         if (out_weights) out_weights[s] = tmp[s];
     }
