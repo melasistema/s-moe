@@ -82,7 +82,10 @@ def main():
 
     while True:
         try:
-            prompt = console.input("\n[bold green]User[/bold green] ❯ ")
+            try:
+                prompt = console.input("\n[bold green]User[/bold green] ❯ ")
+            except EOFError:
+                break
             if not prompt.strip():
                 continue
             if prompt.strip().lower() in ["exit", "quit"]:
