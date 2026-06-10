@@ -130,19 +130,19 @@ kernel void smoe_down(
     threadgroup float*       tg_hidden    [[threadgroup(0)]])
 {
     uint row = gid;
-    if (row >= params.rows) return;
+    if (row >= params.cols) return;
 
     float acc   = 0.0f;
-    uint  tiles = (params.cols + TGROUP_SIZE - 1) / TGROUP_SIZE;
+    uint  tiles = (params.rows + TGROUP_SIZE - 1) / TGROUP_SIZE;
 
     for (uint t = 0; t < tiles; ++t) {
         uint col_base = t * TGROUP_SIZE;
         uint col      = col_base + tid;
-        tg_hidden[tid] = (col < params.cols) ? hidden[col] : 0.0f;
+        tg_hidden[tid] = (col < params.rows) ? hidden[col] : 0.0f;
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        uint tile_end = min(TGROUP_SIZE, params.cols - col_base);
-        uint wi_base  = row * params.cols + col_base;
+        uint tile_end = min(TGROUP_SIZE, params.rows - col_base);
+        uint wi_base  = row * params.rows + col_base;
 
         uint k = 0;
         for (; k + 3 < tile_end; k += 4) {
@@ -431,7 +431,7 @@ void smoe_metal_fused_ffn(SmoeMetalCtx*   ctx,
         NSUInteger tgroup = ctx->down_pso.maxTotalThreadsPerThreadgroup;
         tgroup = std::min(tgroup, NSUInteger(256));
         MTLSize tgSize   = MTLSizeMake(tgroup, 1, 1);
-        MTLSize gridSize = MTLSizeMake(rows,   1, 1);
+        MTLSize gridSize = MTLSizeMake(cols,   1, 1);
         [enc dispatchThreads:gridSize threadsPerThreadgroup:tgSize];
     }
 

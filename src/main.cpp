@@ -167,6 +167,56 @@ static bool read_vault_header(const char* vault_path, smoe::SmoeHeader& hdr) {
     return true;
 }
 
+struct ExpertLayout {
+    uint32_t gate_rows;
+    uint32_t gate_cols;
+    uint64_t gate_packed_offset;
+    uint64_t gate_scales_offset;
+
+    uint32_t up_rows;
+    uint32_t up_cols;
+    uint64_t up_packed_offset;
+    uint64_t up_scales_offset;
+
+    uint32_t down_rows;
+    uint32_t down_cols;
+    uint64_t down_packed_offset;
+    uint64_t down_scales_offset;
+};
+
+static bool read_expert_layout(const char* vault_path, const smoe::SmoeHeader& hdr, ExpertLayout& layout) {
+    int fd = ::open(vault_path, O_RDONLY);
+    if (fd < 0) return false;
+
+    // TensorDescriptor table starts after the ExpertTable
+    uint64_t table_bytes = static_cast<uint64_t>(hdr.total_experts) * sizeof(smoe::ExpertEntry);
+    uint64_t desc_base = hdr.table_offset + table_bytes;
+
+    smoe::TensorDescriptor descs[3];
+    ssize_t n = ::pread(fd, descs, sizeof(descs), desc_base);
+    ::close(fd);
+
+    if (n != sizeof(descs)) return false;
+
+    // Fill the layout
+    layout.gate_rows = descs[0].rows;
+    layout.gate_cols = descs[0].cols;
+    layout.gate_packed_offset = descs[0].packed_offset;
+    layout.gate_scales_offset = descs[0].scales_offset;
+
+    layout.up_rows = descs[1].rows;
+    layout.up_cols = descs[1].cols;
+    layout.up_packed_offset = descs[1].packed_offset;
+    layout.up_scales_offset = descs[1].scales_offset;
+
+    layout.down_rows = descs[2].rows;
+    layout.down_cols = descs[2].cols;
+    layout.down_packed_offset = descs[2].packed_offset;
+    layout.down_scales_offset = descs[2].scales_offset;
+
+    return true;
+}
+
 // ── Token generation loop ─────────────────────────────────────
 
 // Simple tokeniser shim: maps prompt string → token IDs.
@@ -242,6 +292,12 @@ int main(int argc, char* argv[]) {
         vault_hdr.total_experts,
         ring_size, slot_mb,
         num_workers);
+
+    ExpertLayout expert_layout {};
+    if (!read_expert_layout(vault_path, vault_hdr, expert_layout)) {
+        std::fprintf(stderr, "  ✗  Failed to read expert layout descriptors from vault.\n");
+        return 1;
+    }
 
     // ── Phase 3: Metal bridge init ────────────────────────────
     uint64_t slot_bytes = slot_mb * 1024ULL * 1024ULL;
@@ -319,47 +375,39 @@ int main(int argc, char* argv[]) {
 
         if (slot) {
             // ── Step 4: Metal FFN dispatch ────────────────────
-            // In Week 4 with the heuristic Scout, the slot data
-            // is whatever the Streamer loaded.  We dispatch the
-            // Metal kernel to validate the dispatch pipeline.
-            //
-            // The slot->data pointer is directly into UMA, so
-            // we can use it as input to the GPU without copying.
-            //
-            // For the heuristic validation build, we pass
-            // slot->data as a unified input/output pointer pair
-            // and dummy dims.  Week 5+ uses real TensorDescriptors.
-            if (slot->data_size >= 64) {  // sanity: at least one group
-                // Minimal dispatch: use slot memory as gate/up/down
-                // all pointing to the same blob, with toy dimensions.
-                // This exercises the full Metal dispatch pipeline.
-                const uint32_t dummy_rows = 16;
-                const uint32_t dummy_cols = 16;
+            // In Week 5+, we use the real TensorDescriptors parsed from the vault.
+            if (slot->data_size > 0) {
+                // Calculate absolute pointers inside the loaded UMA slot data
+                const uint8_t*  packed_gate = slot->data + expert_layout.gate_packed_offset;
+                const uint16_t* scales_gate = reinterpret_cast<const uint16_t*>(slot->data + expert_layout.gate_scales_offset);
 
-                // Scratch output vector (stack — not in alloc-banned zone
-                // as it's tiny and compiler-placed)
-                static float dummy_hidden[64];
-                static float dummy_output[64];
-                static float dummy_input [64];
-                std::memset(dummy_input,  0, sizeof(dummy_input));
-                std::memset(dummy_hidden, 0, sizeof(dummy_hidden));
+                const uint8_t*  packed_up   = slot->data + expert_layout.up_packed_offset;
+                const uint16_t* scales_up   = reinterpret_cast<const uint16_t*>(slot->data + expert_layout.up_scales_offset);
+
+                const uint8_t*  packed_down = slot->data + expert_layout.down_packed_offset;
+                const uint16_t* scales_down = reinterpret_cast<const uint16_t*>(slot->data + expert_layout.down_scales_offset);
+
+                // Scratch output vectors (static to comply with zero runtime heap allocation rule)
+                static float input_vec[4096];
+                static float output_vec[4096];
+                static float hidden_scratch[4096];
+
+                std::memset(input_vec,      0, sizeof(input_vec));
+                std::memset(output_vec,     0, sizeof(output_vec));
+                std::memset(hidden_scratch, 0, sizeof(hidden_scratch));
 
                 smoe_metal_fused_ffn(
                     metal,
-                    slot->data,                               // gate packed
-                    reinterpret_cast<const uint16_t*>(       // gate scales
-                        slot->data + dummy_rows * dummy_cols / 4),
-                    slot->data,                               // up packed (same for validation)
-                    reinterpret_cast<const uint16_t*>(
-                        slot->data + dummy_rows * dummy_cols / 4),
-                    slot->data,                               // down packed
-                    reinterpret_cast<const uint16_t*>(
-                        slot->data + dummy_rows * dummy_cols / 4),
-                    dummy_input,
-                    dummy_hidden,
-                    dummy_output,
-                    dummy_rows, dummy_cols,
-                    smoe::Q2_GROUP_SIZE);
+                    packed_gate, scales_gate,
+                    packed_up,   scales_up,
+                    packed_down, scales_down,
+                    input_vec,
+                    hidden_scratch,
+                    output_vec,
+                    expert_layout.gate_rows,
+                    expert_layout.gate_cols,
+                    vault_hdr.group_size
+                );
             }
 
             // ── Step 5: Release slot ──────────────────────────
@@ -385,10 +433,6 @@ int main(int argc, char* argv[]) {
     print_telemetry(max_tokens, streamer, ts);
     std::fprintf(stderr, "\n\n");
 
-    // ── Shutdown ──────────────────────────────────────────────
-    streamer.shutdown();
-    smoe_metal_destroy(metal);
-
     // Print final stats
     std::fprintf(stderr,
         "  ─────────────────────────────────────────\n"
@@ -399,6 +443,10 @@ int main(int argc, char* argv[]) {
         max_tokens,
         double(streamer.bytes_read()) / 1e9,
         static_cast<unsigned long long>(smoe_metal_kernel_dispatches(metal)));
+
+    // ── Shutdown ──────────────────────────────────────────────
+    streamer.shutdown();
+    smoe_metal_destroy(metal);
 
     return 0;
 }
