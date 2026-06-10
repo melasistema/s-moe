@@ -24,9 +24,15 @@ build/
 *.air
 *.metallib
 
-# ── .smoe vault output (large binary files — store separately) ─
+# ── Large binary data — NEVER commit these ────────────────────
+# HuggingFace model checkpoints (can be 10s of GB)
+checkpoints/
+# .smoe vault output (shattered weight blobs)
+vault/
 *.smoe
 *.scout.safetensors
+# Raw model shards downloaded by huggingface-cli
+*.safetensors
 
 # ── macOS noise ───────────────────────────────────────────────
 .DS_Store
