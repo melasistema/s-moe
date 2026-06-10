@@ -28,6 +28,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
 // ── Embedded MSL source ───────────────────────────────────────
 // Read at compile time from the adjacent .metal file.
@@ -163,6 +164,40 @@ kernel void smoe_down(
     output[row] = acc;
 }
 
+kernel void scout_matvec(
+    device const float*  weight       [[buffer(0)]],
+    device const float*  input_vec    [[buffer(1)]],
+    device       float*  output_vec   [[buffer(2)]],
+    constant     uint2&  dims         [[buffer(3)]],
+    uint                 row          [[thread_position_in_grid]],
+    uint                 tid          [[thread_index_in_threadgroup]],
+    threadgroup  float*  tg_input     [[threadgroup(0)]])
+{
+    uint rows = dims.x;
+    uint cols = dims.y;
+
+    for (uint i = tid; i < cols; i += TGROUP_SIZE) {
+        tg_input[i] = input_vec[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (row >= rows) return;
+
+    float acc = 0.0f;
+    device const float* row_ptr = weight + row * cols;
+    uint c = 0;
+    for (; c + 3 < cols; c += 4) {
+        acc += row_ptr[c]     * tg_input[c];
+        acc += row_ptr[c + 1] * tg_input[c + 1];
+        acc += row_ptr[c + 2] * tg_input[c + 2];
+        acc += row_ptr[c + 3] * tg_input[c + 3];
+    }
+    for (; c < cols; ++c) {
+        acc += row_ptr[c] * tg_input[c];
+    }
+    output_vec[row] = acc;
+}
+
 )MSL";
 
 // ═══════════════════════════════════════════════════════════════
@@ -174,6 +209,7 @@ struct SmoeMetalCtx {
     id<MTLLibrary>              library      = nil;
     id<MTLComputePipelineState> gate_up_pso  = nil;
     id<MTLComputePipelineState> down_pso     = nil;
+    id<MTLComputePipelineState> scout_matvec_pso = nil;
 
     // Ping-pong UMA buffers
     // buf_a = active (GPU executing)
@@ -193,7 +229,24 @@ struct SmoeMetalCtx {
 
     // Telemetry
     std::atomic<uint64_t>       dispatch_count { 0 };
+
+    struct RegisteredBuffer {
+        const void* ptr;
+        id<MTLBuffer> buffer;
+    };
+    std::vector<RegisteredBuffer> registered_buffers;
 };
+
+static id<MTLBuffer> get_registered_buffer(SmoeMetalCtx* ctx, const void* ptr, size_t sz) {
+    for (const auto& reg : ctx->registered_buffers) {
+        if (reg.ptr == ptr) return reg.buffer;
+    }
+    size_t aligned = (sz + (smoe::PAGE_SIZE - 1)) & ~(smoe::PAGE_SIZE - 1);
+    return [ctx->device newBufferWithBytesNoCopy:const_cast<void*>(ptr)
+                                          length:aligned
+                                         options:MTLResourceStorageModeShared
+                                     deallocator:nil];
+}
 
 // ── Internal helpers ──────────────────────────────────────────
 
@@ -264,6 +317,14 @@ SmoeMetalCtx* smoe_metal_init(size_t slot_bytes) {
         return nullptr;
     }
 
+    id<MTLComputePipelineState> scout_matvec_pso = make_pso(dev, lib, "scout_matvec", &err);
+    if (!scout_matvec_pso) {
+        std::fprintf(stderr,
+            "[smoe_metal] ERROR: PSO 'scout_matvec' build failed:\n%s\n",
+            [[err localizedDescription] UTF8String]);
+        return nullptr;
+    }
+
     // ── Step 4: allocate ping-pong UMA buffers ────────────────
     // MTLResourceStorageModeShared: CPU pread() and GPU shaders
     // access the same physical pages — zero-copy guaranteed.
@@ -306,6 +367,7 @@ SmoeMetalCtx* smoe_metal_init(size_t slot_bytes) {
     ctx->library     = lib;
     ctx->gate_up_pso = gate_up_pso;
     ctx->down_pso    = down_pso;
+    ctx->scout_matvec_pso = scout_matvec_pso;
     ctx->buf_a       = buf_a;
     ctx->buf_b       = buf_b;
     ctx->hidden_buf  = hidden;
@@ -465,3 +527,138 @@ uint64_t smoe_metal_kernel_dispatches(const SmoeMetalCtx* ctx) {
     if (!ctx) return 0;
     return ctx->dispatch_count.load(std::memory_order_relaxed);
 }
+
+void smoe_metal_scout_matvec(SmoeMetalCtx* ctx,
+                             const float*   weight,
+                             const float*   input_vec,
+                             float*         output_vec,
+                             uint32_t       rows,
+                             uint32_t       cols)
+{
+    if (!ctx) return;
+
+    MTLResourceOptions uma = MTLResourceStorageModeShared;
+
+    size_t weight_bytes = static_cast<size_t>(rows) * cols * sizeof(float);
+    size_t input_bytes  = static_cast<size_t>(cols) * sizeof(float);
+    size_t output_bytes = static_cast<size_t>(rows) * sizeof(float);
+
+    id<MTLBuffer> buf_wt = get_registered_buffer(ctx, weight,     weight_bytes);
+    id<MTLBuffer> buf_in = get_registered_buffer(ctx, input_vec,  input_bytes);
+    id<MTLBuffer> buf_ou = get_registered_buffer(ctx, output_vec, output_bytes);
+
+    if (!buf_wt || !buf_in || !buf_ou) {
+        std::fprintf(stderr, "[smoe_metal] ERROR: failed to wrap matvec pointers.\n");
+        return;
+    }
+
+    struct Dims { uint32_t rows, cols; };
+    Dims dims { rows, cols };
+    id<MTLBuffer> buf_dm = [ctx->device newBufferWithBytes:&dims
+                                                    length:sizeof(dims)
+                                                   options:uma];
+
+    id<MTLCommandBuffer>         cmd = [ctx->queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+
+    [enc setComputePipelineState:ctx->scout_matvec_pso];
+    [enc setBuffer:buf_wt offset:0 atIndex:0];
+    [enc setBuffer:buf_in offset:0 atIndex:1];
+    [enc setBuffer:buf_ou offset:0 atIndex:2];
+    [enc setBuffer:buf_dm offset:0 atIndex:3];
+
+    [enc setThreadgroupMemoryLength:cols * sizeof(float) atIndex:0];
+
+    NSUInteger tgroup = ctx->scout_matvec_pso.maxTotalThreadsPerThreadgroup;
+    tgroup = std::min(tgroup, NSUInteger(256));
+    MTLSize tgSize   = MTLSizeMake(tgroup, 1, 1);
+    MTLSize gridSize = MTLSizeMake(rows,   1, 1);
+    [enc dispatchThreads:gridSize threadsPerThreadgroup:tgSize];
+
+    [enc endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
+
+    ctx->dispatch_count.fetch_add(1, std::memory_order_relaxed);
+}
+
+void smoe_metal_scout_matvec_batch(SmoeMetalCtx* ctx,
+                                   const float**  weights,
+                                   const float**  inputs,
+                                   float**        outputs,
+                                   const uint32_t* rows,
+                                   const uint32_t* cols,
+                                   uint32_t       count)
+{
+    if (!ctx || count == 0) return;
+
+    MTLResourceOptions uma = MTLResourceStorageModeShared;
+
+    id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    [enc setComputePipelineState:ctx->scout_matvec_pso];
+
+    for (uint32_t idx = 0; idx < count; ++idx) {
+        uint32_t r = rows[idx];
+        uint32_t c = cols[idx];
+
+        size_t weight_bytes = static_cast<size_t>(r) * c * sizeof(float);
+        size_t input_bytes  = static_cast<size_t>(c) * sizeof(float);
+        size_t output_bytes = static_cast<size_t>(r) * sizeof(float);
+
+        id<MTLBuffer> buf_wt = get_registered_buffer(ctx, weights[idx], weight_bytes);
+        id<MTLBuffer> buf_in = get_registered_buffer(ctx, inputs[idx],  input_bytes);
+        id<MTLBuffer> buf_ou = get_registered_buffer(ctx, outputs[idx], output_bytes);
+
+        if (!buf_wt || !buf_in || !buf_ou) {
+            std::fprintf(stderr, "[smoe_metal] ERROR: failed to wrap pointers in batch index %u.\n", idx);
+            continue;
+        }
+
+        struct Dims { uint32_t rows, cols; };
+        Dims dims { r, c };
+        id<MTLBuffer> buf_dm = [ctx->device newBufferWithBytes:&dims
+                                                        length:sizeof(dims)
+                                                       options:uma];
+
+        [enc setBuffer:buf_wt offset:0 atIndex:0];
+        [enc setBuffer:buf_in offset:0 atIndex:1];
+        [enc setBuffer:buf_ou offset:0 atIndex:2];
+        [enc setBuffer:buf_dm offset:0 atIndex:3];
+
+        [enc setThreadgroupMemoryLength:c * sizeof(float) atIndex:0];
+
+        NSUInteger tgroup = ctx->scout_matvec_pso.maxTotalThreadsPerThreadgroup;
+        tgroup = std::min(tgroup, NSUInteger(256));
+        MTLSize tgSize   = MTLSizeMake(tgroup, 1, 1);
+        MTLSize gridSize = MTLSizeMake(r,      1, 1);
+        [enc dispatchThreads:gridSize threadsPerThreadgroup:tgSize];
+    }
+
+    [enc endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
+
+    ctx->dispatch_count.fetch_add(count, std::memory_order_relaxed);
+}
+
+void smoe_metal_register_buffer(SmoeMetalCtx* ctx, const void* ptr, size_t size_in_bytes) {
+    if (!ctx || !ptr) return;
+
+    for (const auto& reg : ctx->registered_buffers) {
+        if (reg.ptr == ptr) return;
+    }
+
+    size_t aligned = (size_in_bytes + (smoe::PAGE_SIZE - 1)) & ~(smoe::PAGE_SIZE - 1);
+    id<MTLBuffer> buf = [ctx->device newBufferWithBytesNoCopy:const_cast<void*>(ptr)
+                                                       length:aligned
+                                                      options:MTLResourceStorageModeShared
+                                                  deallocator:nil];
+    if (buf) {
+        ctx->registered_buffers.push_back({ptr, buf});
+    } else {
+        std::fprintf(stderr, "[smoe_metal] ERROR: failed to register buffer at %p (%zu bytes)\n", ptr, size_in_bytes);
+    }
+}
+
+

@@ -226,3 +226,41 @@ kernel void smoe_down(
 
     output[row] = acc;
 }
+
+// ── Scout Matrix-Vector Multiplication: weight[rows x cols] x input_vec[cols] → output_vec[rows] ──
+kernel void scout_matvec(
+    device const float*  weight       [[buffer(0)]],
+    device const float*  input_vec    [[buffer(1)]],
+    device       float*  output_vec   [[buffer(2)]],
+    constant     uint2&  dims         [[buffer(3)]], // x = rows, y = cols
+    uint                 row          [[thread_position_in_grid]],
+    uint                 tid          [[thread_index_in_threadgroup]],
+    threadgroup  float*  tg_input     [[threadgroup(0)]])
+{
+    uint rows = dims.x;
+    uint cols = dims.y;
+
+    // Load input_vec into threadgroup memory
+    for (uint i = tid; i < cols; i += TGROUP_SIZE) {
+        tg_input[i] = input_vec[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (row >= rows) return;
+
+    // Compute dot product
+    float acc = 0.0f;
+    device const float* row_ptr = weight + row * cols;
+    uint c = 0;
+    for (; c + 3 < cols; c += 4) {
+        acc += row_ptr[c]     * tg_input[c];
+        acc += row_ptr[c + 1] * tg_input[c + 1];
+        acc += row_ptr[c + 2] * tg_input[c + 2];
+        acc += row_ptr[c + 3] * tg_input[c + 3];
+    }
+    for (; c < cols; ++c) {
+        acc += row_ptr[c] * tg_input[c];
+    }
+    output_vec[row] = acc;
+}
+

@@ -93,6 +93,29 @@ void smoe_metal_fused_ffn(SmoeMetalCtx*   ctx,
                            uint32_t        cols,
                            uint32_t        group_size);
 
+// Perform a float32 matrix-vector multiplication on the GPU for Scout projections.
+void smoe_metal_scout_matvec(SmoeMetalCtx* ctx,
+                             const float*   weight,
+                             const float*   input_vec,
+                             float*         output_vec,
+                             uint32_t       rows,
+                             uint32_t       cols);
+
+// Perform a batch of float32 matrix-vector multiplications on the GPU to reduce sync latency.
+void smoe_metal_scout_matvec_batch(SmoeMetalCtx* ctx,
+                                   const float**  weights,
+                                   const float**  inputs,
+                                   float**        outputs,
+                                   const uint32_t* rows,
+                                   const uint32_t* cols,
+                                   uint32_t       count);
+
+// Register a CPU buffer with Metal once at boot to avoid page table mapping overhead in the hot loop.
+void smoe_metal_register_buffer(SmoeMetalCtx* ctx, const void* ptr, size_t size_in_bytes);
+
+
+
+
 // ── Ping-pong control ─────────────────────────────────────────
 
 // Atomically swap the active (A) and passive (B) buffers.

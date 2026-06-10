@@ -24,6 +24,8 @@
 #include <span>
 #include <vector>
 
+struct SmoeMetalCtx;
+
 namespace smoe::scout {
 
 // Lookahead window depth — how many future steps to predict
@@ -49,7 +51,7 @@ struct ScoutOutput {
 class Scout {
 public:
     // Load Scout weights from a .safetensors file.
-    explicit Scout(const char* scout_safetensors_path);
+    Scout(const char* scout_safetensors_path, SmoeMetalCtx* metal_ctx);
     ~Scout();
 
     // Run one forward step, updating internal KV-cache context.

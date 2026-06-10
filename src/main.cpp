@@ -341,7 +341,7 @@ int main(int argc, char* argv[]) {
     smoe::io::Streamer streamer(vault_path, ring_size, num_workers, slot_bytes);
 
     // ── Phase 4: Scout init ───────────────────────────────────
-    smoe::scout::Scout scout(scout_path);  // scout_path may be nullptr (heuristic only)
+    smoe::scout::Scout scout(scout_path, metal);  // scout_path may be nullptr (heuristic only)
 
     // ── Load vocabulary ───────────────────────────────────────
     load_vocab("vault/vocab.bin");

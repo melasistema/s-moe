@@ -51,6 +51,7 @@
 // ═══════════════════════════════════════════════════════════════
 
 #include "scout.hpp"
+#include "../compute/metal_bridge.h"
 
 #include <algorithm>
 #include <array>
@@ -115,6 +116,22 @@ static void convert_bf16_block(float* dst, const uint16_t* src, size_t n) noexce
 // ═══════════════════════════════════════════════════════════════
 // §3  Math kernels (zero allocation, no external BLAS)
 // ═══════════════════════════════════════════════════════════════
+
+// Helper to allocate 16KB page-aligned float buffers for zero-copy Metal bridge compatibility.
+static float* allocate_aligned_float(size_t elems) noexcept {
+    size_t bytes = elems * sizeof(float);
+    void* ptr = nullptr;
+    if (::posix_memalign(&ptr, 16384, bytes) != 0) {
+        return nullptr;
+    }
+    return static_cast<float*>(ptr);
+}
+
+static void free_aligned_float(float* ptr) noexcept {
+    if (ptr) {
+        ::free(ptr);
+    }
+}
 
 // RMS LayerNorm: out[i] = x[i] / rms(x) * weight[i]
 // Applied in-place.
@@ -340,6 +357,9 @@ struct Scout::Impl {
     // ── Mode flag ──────────────────────────────────────────────
     bool neural_mode { false };   // true ↔ safetensors loaded
 
+    // ── Metal context ─────────────────────────────────────────
+    SmoeMetalCtx* metal_ctx { nullptr };
+
     // ── mmap state ────────────────────────────────────────────
     void*    mmap_base { nullptr };
     size_t   mmap_size { 0 };
@@ -377,12 +397,12 @@ struct Scout::Impl {
     float* gate_w[NUM_MOE_LAYERS] {};
 
     // ── Pre-allocated compute buffers (forward(), zero alloc) ─
-    float hidden    [D_MODEL]  {};       // current hidden state
-    float normed    [D_MODEL]  {};       // scratch for post-norm
-    float qbuf      [D_MODEL]  {};
-    float kbuf      [D_MODEL]  {};
-    float vbuf      [D_MODEL]  {};
-    float attn_out  [D_MODEL]  {};
+    float* hidden       { nullptr };       // current hidden state
+    float* normed       { nullptr };       // scratch for post-norm
+    float* qbuf         { nullptr };
+    float* kbuf         { nullptr };
+    float* vbuf         { nullptr };
+    float* attn_out     { nullptr };
 
     // Attention context ring: last ATTN_CTX K-vectors [ATTN_CTX × D_MODEL]
     float k_cache   [ATTN_CTX][D_MODEL] {};
@@ -394,12 +414,11 @@ struct Scout::Impl {
     float attn_scores[ATTN_CTX] {};
 
     // Gate score buffer [GATE_ROWS]
-    float gate_scores[GATE_ROWS] {};
+    float* gate_scores  { nullptr };
+    float* gate_scores_batch { nullptr }; // [LOOKAHEAD_K * GATE_ROWS] for GPU batching
 
-    // LM head score buffer — we do NOT pre-allocate 102400 floats on stack.
-    // Instead we argmax inline over the bf16 row of lm_head to avoid the
-    // large buffer.  We keep a tiny scratch for the best-score scan.
-    // (This is still zero-alloc — we scan the converted float32 weight array.)
+    // LM head score buffer — we compute via GPU matvec and scan.
+    float* lm_head_scores { nullptr };     // [VOCAB_SIZE]
 
     // ── Heuristic fallback state (Week 4, preserved) ──────────
     NgramBucket ngram_table[NGRAM_TABLE] {};
@@ -417,7 +436,7 @@ struct Scout::Impl {
     uint64_t step              { 0 };
 
     // ── Constructor: load safetensors ─────────────────────────
-    explicit Impl(const char* path);
+    Impl(const char* path, SmoeMetalCtx* metal_ctx);
     ~Impl();
 
     // ── Helpers: neural path ──────────────────────────────────
@@ -435,7 +454,9 @@ struct Scout::Impl {
 
 // ── Impl constructor ──────────────────────────────────────────
 
-Scout::Impl::Impl(const char* path) {
+Scout::Impl::Impl(const char* path, SmoeMetalCtx* metal_ctx) {
+    this->metal_ctx = metal_ctx;
+
     if (!path) {
         std::fprintf(stderr,
             "[scout] Heuristic mode — no weight path provided.\n");
@@ -513,18 +534,37 @@ Scout::Impl::Impl(const char* path) {
     static constexpr size_t EMBED_ELEMS  = static_cast<size_t>(VOCAB_SIZE) * D_MODEL;
     static constexpr size_t ATTN_W_ELEMS = static_cast<size_t>(D_MODEL)    * D_MODEL;
 
-    w_embed              = new float[EMBED_ELEMS];
-    w_lm_head            = new float[EMBED_ELEMS];
-    w_q_proj             = new float[ATTN_W_ELEMS];
-    w_k_proj             = new float[ATTN_W_ELEMS];
-    w_v_proj             = new float[ATTN_W_ELEMS];
-    w_o_proj             = new float[ATTN_W_ELEMS];
-    gate_weights_storage = new float[GATE_STORAGE_ELEMS];
+    bool ok = true;
+    w_embed              = allocate_aligned_float(EMBED_ELEMS);
+    w_lm_head            = allocate_aligned_float(EMBED_ELEMS);
+    w_q_proj             = allocate_aligned_float(ATTN_W_ELEMS);
+    w_k_proj             = allocate_aligned_float(ATTN_W_ELEMS);
+    w_v_proj             = allocate_aligned_float(ATTN_W_ELEMS);
+    w_o_proj             = allocate_aligned_float(ATTN_W_ELEMS);
+    gate_weights_storage = allocate_aligned_float(GATE_STORAGE_ELEMS);
+
+    // ── Allocate compute scratch vectors ──────────────────────
+    hidden               = allocate_aligned_float(D_MODEL);
+    normed               = allocate_aligned_float(D_MODEL);
+    qbuf                 = allocate_aligned_float(D_MODEL);
+    kbuf                 = allocate_aligned_float(D_MODEL);
+    vbuf                 = allocate_aligned_float(D_MODEL);
+    attn_out             = allocate_aligned_float(D_MODEL);
+    gate_scores          = allocate_aligned_float(GATE_ROWS);
+    gate_scores_batch    = allocate_aligned_float(LOOKAHEAD_K * GATE_ROWS);
+    lm_head_scores       = allocate_aligned_float(VOCAB_SIZE);
+
+    if (!w_embed || !w_lm_head || !w_q_proj || !w_k_proj || !w_v_proj || !w_o_proj || !gate_weights_storage ||
+        !hidden || !normed || !qbuf || !kbuf || !vbuf || !attn_out || !gate_scores || !gate_scores_batch || !lm_head_scores) {
+        ok = false;
+    }
 
     // Wire up gate_w convenience pointers
-    for (uint32_t l = 0; l < NUM_MOE_LAYERS; ++l) {
-        gate_w[l] = gate_weights_storage +
-                    static_cast<size_t>(l) * GATE_ROWS * D_MODEL;
+    if (ok) {
+        for (uint32_t l = 0; l < NUM_MOE_LAYERS; ++l) {
+            gate_w[l] = gate_weights_storage +
+                        static_cast<size_t>(l) * GATE_ROWS * D_MODEL;
+        }
     }
 
     // ── Helper: load one tensor into a float32 buffer ─────────
@@ -549,49 +589,89 @@ Scout::Impl::Impl(const char* path) {
     };
 
     // ── Load embedding and lm_head ────────────────────────────
-    std::fprintf(stderr, "[scout] Loading embeddings ...\n");
-    bool ok = true;
-    ok &= load_tensor("model.embed_tokens.weight", w_embed,   EMBED_ELEMS);
-    ok &= load_tensor("lm_head.weight",            w_lm_head, EMBED_ELEMS);
+    if (ok) {
+        std::fprintf(stderr, "[scout] Loading embeddings ...\n");
+        ok &= load_tensor("model.embed_tokens.weight", w_embed,   EMBED_ELEMS);
+        ok &= load_tensor("lm_head.weight",            w_lm_head, EMBED_ELEMS);
+    }
 
     // ── Load layer-1 attention weights ────────────────────────
-    std::fprintf(stderr, "[scout] Loading layer 1 attention ...\n");
-    ok &= load_tensor("model.layers.1.self_attn.q_proj.weight", w_q_proj, ATTN_W_ELEMS);
-    ok &= load_tensor("model.layers.1.self_attn.k_proj.weight", w_k_proj, ATTN_W_ELEMS);
-    ok &= load_tensor("model.layers.1.self_attn.v_proj.weight", w_v_proj, ATTN_W_ELEMS);
-    ok &= load_tensor("model.layers.1.self_attn.o_proj.weight", w_o_proj, ATTN_W_ELEMS);
+    if (ok) {
+        std::fprintf(stderr, "[scout] Loading layer 1 attention ...\n");
+        ok &= load_tensor("model.layers.1.self_attn.q_proj.weight", w_q_proj, ATTN_W_ELEMS);
+        ok &= load_tensor("model.layers.1.self_attn.k_proj.weight", w_k_proj, ATTN_W_ELEMS);
+        ok &= load_tensor("model.layers.1.self_attn.v_proj.weight", w_v_proj, ATTN_W_ELEMS);
+        ok &= load_tensor("model.layers.1.self_attn.o_proj.weight", w_o_proj, ATTN_W_ELEMS);
+    }
 
     // ── Load layer-1 norms ────────────────────────────────────
-    ok &= load_tensor("model.layers.1.input_layernorm.weight",            w_input_norm, D_MODEL);
-    ok &= load_tensor("model.layers.1.post_attention_layernorm.weight",   w_post_norm,  D_MODEL);
+    if (ok) {
+        ok &= load_tensor("model.layers.1.input_layernorm.weight",            w_input_norm, D_MODEL);
+        ok &= load_tensor("model.layers.1.post_attention_layernorm.weight",   w_post_norm,  D_MODEL);
+    }
 
     // ── Load final norm ───────────────────────────────────────
-    ok &= load_tensor("model.norm.weight", w_model_norm, D_MODEL);
+    if (ok) {
+        ok &= load_tensor("model.norm.weight", w_model_norm, D_MODEL);
+    }
 
     // ── Load MoE gate weights for layers 1..27 ────────────────
-    std::fprintf(stderr, "[scout] Loading MoE gate weights (layers 1–27) ...\n");
-    char tensor_name[128];
-    for (uint32_t l = 1; l <= NUM_MOE_LAYERS; ++l) {
-        std::snprintf(tensor_name, sizeof(tensor_name),
-                      "model.layers.%u.mlp.gate.weight", l);
-        ok &= load_tensor(tensor_name, gate_w[l - 1],
-                          static_cast<size_t>(GATE_ROWS) * D_MODEL);
+    if (ok) {
+        std::fprintf(stderr, "[scout] Loading MoE gate weights (layers 1–27) ...\n");
+        char tensor_name[128];
+        for (uint32_t l = 1; l <= NUM_MOE_LAYERS; ++l) {
+            std::snprintf(tensor_name, sizeof(tensor_name),
+                          "model.layers.%u.mlp.gate.weight", l);
+            ok &= load_tensor(tensor_name, gate_w[l - 1],
+                              static_cast<size_t>(GATE_ROWS) * D_MODEL);
+        }
     }
 
     if (!ok) {
         std::fprintf(stderr,
-            "[scout] ⚠  Some tensors failed to load — falling back to heuristic.\n");
+            "[scout] ⚠  Some tensors failed to load or allocate — falling back to heuristic.\n");
         // Free allocations; heuristic path will run
-        delete[] w_embed;              w_embed              = nullptr;
-        delete[] w_lm_head;            w_lm_head            = nullptr;
-        delete[] w_q_proj;             w_q_proj             = nullptr;
-        delete[] w_k_proj;             w_k_proj             = nullptr;
-        delete[] w_v_proj;             w_v_proj             = nullptr;
-        delete[] w_o_proj;             w_o_proj             = nullptr;
-        delete[] gate_weights_storage; gate_weights_storage = nullptr;
-        ::munmap(mmap_base, mmap_size);
-        mmap_base = nullptr;
+        free_aligned_float(w_embed);              w_embed              = nullptr;
+        free_aligned_float(w_lm_head);            w_lm_head            = nullptr;
+        free_aligned_float(w_q_proj);             w_q_proj             = nullptr;
+        free_aligned_float(w_k_proj);             w_k_proj             = nullptr;
+        free_aligned_float(w_v_proj);             w_v_proj             = nullptr;
+        free_aligned_float(w_o_proj);             w_o_proj             = nullptr;
+        free_aligned_float(gate_weights_storage); gate_weights_storage = nullptr;
+        free_aligned_float(hidden);               hidden               = nullptr;
+        free_aligned_float(normed);               normed               = nullptr;
+        free_aligned_float(qbuf);                 qbuf                 = nullptr;
+        free_aligned_float(kbuf);                 kbuf                 = nullptr;
+        free_aligned_float(vbuf);                 vbuf                 = nullptr;
+        free_aligned_float(attn_out);             attn_out             = nullptr;
+        free_aligned_float(gate_scores);          gate_scores          = nullptr;
+        free_aligned_float(gate_scores_batch);    gate_scores_batch    = nullptr;
+        free_aligned_float(lm_head_scores);       lm_head_scores       = nullptr;
+        if (mmap_base) {
+            ::munmap(mmap_base, mmap_size);
+            mmap_base = nullptr;
+        }
         return;
+    }
+
+    if (ok && metal_ctx) {
+        std::fprintf(stderr, "[scout] Registering buffers with GPU for zero-copy JIT execution ...\n");
+        smoe_metal_register_buffer(metal_ctx, w_embed, EMBED_ELEMS * sizeof(float));
+        smoe_metal_register_buffer(metal_ctx, w_lm_head, EMBED_ELEMS * sizeof(float));
+        smoe_metal_register_buffer(metal_ctx, w_q_proj, ATTN_W_ELEMS * sizeof(float));
+        smoe_metal_register_buffer(metal_ctx, w_k_proj, ATTN_W_ELEMS * sizeof(float));
+        smoe_metal_register_buffer(metal_ctx, w_v_proj, ATTN_W_ELEMS * sizeof(float));
+        smoe_metal_register_buffer(metal_ctx, w_o_proj, ATTN_W_ELEMS * sizeof(float));
+        smoe_metal_register_buffer(metal_ctx, gate_weights_storage, GATE_STORAGE_ELEMS * sizeof(float));
+
+        smoe_metal_register_buffer(metal_ctx, hidden, D_MODEL * sizeof(float));
+        smoe_metal_register_buffer(metal_ctx, normed, D_MODEL * sizeof(float));
+        smoe_metal_register_buffer(metal_ctx, qbuf, D_MODEL * sizeof(float));
+        smoe_metal_register_buffer(metal_ctx, kbuf, D_MODEL * sizeof(float));
+        smoe_metal_register_buffer(metal_ctx, vbuf, D_MODEL * sizeof(float));
+        smoe_metal_register_buffer(metal_ctx, attn_out, D_MODEL * sizeof(float));
+        smoe_metal_register_buffer(metal_ctx, gate_scores_batch, LOOKAHEAD_K * GATE_ROWS * sizeof(float));
+        smoe_metal_register_buffer(metal_ctx, lm_head_scores, VOCAB_SIZE * sizeof(float));
     }
 
     neural_mode = true;
@@ -603,13 +683,23 @@ Scout::Impl::Impl(const char* path) {
 // ── Impl destructor ───────────────────────────────────────────
 
 Scout::Impl::~Impl() {
-    delete[] w_embed;
-    delete[] w_lm_head;
-    delete[] w_q_proj;
-    delete[] w_k_proj;
-    delete[] w_v_proj;
-    delete[] w_o_proj;
-    delete[] gate_weights_storage;
+    free_aligned_float(w_embed);
+    free_aligned_float(w_lm_head);
+    free_aligned_float(w_q_proj);
+    free_aligned_float(w_k_proj);
+    free_aligned_float(w_v_proj);
+    free_aligned_float(w_o_proj);
+    free_aligned_float(gate_weights_storage);
+
+    free_aligned_float(hidden);
+    free_aligned_float(normed);
+    free_aligned_float(qbuf);
+    free_aligned_float(kbuf);
+    free_aligned_float(vbuf);
+    free_aligned_float(attn_out);
+    free_aligned_float(gate_scores);
+    free_aligned_float(gate_scores_batch);
+    free_aligned_float(lm_head_scores);
 
     if (mmap_base) {
         ::munmap(mmap_base, mmap_size);
@@ -636,10 +726,19 @@ ScoutOutput Scout::Impl::neural_forward(uint32_t token_id) noexcept {
     std::memcpy(normed, hidden, D_MODEL * sizeof(float));
     rms_norm(normed, w_input_norm, D_MODEL);
 
-    // b. Q/K/V projections
-    matvec(qbuf, w_q_proj, normed, D_MODEL, D_MODEL);
-    matvec(kbuf, w_k_proj, normed, D_MODEL, D_MODEL);
-    matvec(vbuf, w_v_proj, normed, D_MODEL, D_MODEL);
+    // b. Q/K/V projections (batched on GPU)
+    if (metal_ctx) {
+        const float* weights[3] = { w_q_proj, w_k_proj, w_v_proj };
+        const float* inputs[3]  = { normed, normed, normed };
+        float* outputs[3]       = { qbuf, kbuf, vbuf };
+        uint32_t rows[3]        = { D_MODEL, D_MODEL, D_MODEL };
+        uint32_t cols[3]        = { D_MODEL, D_MODEL, D_MODEL };
+        smoe_metal_scout_matvec_batch(metal_ctx, weights, inputs, outputs, rows, cols, 3);
+    } else {
+        matvec(qbuf, w_q_proj, normed, D_MODEL, D_MODEL);
+        matvec(kbuf, w_k_proj, normed, D_MODEL, D_MODEL);
+        matvec(vbuf, w_v_proj, normed, D_MODEL, D_MODEL);
+    }
 
     // c. Write K/V into ring cache
     const uint32_t slot = ctx_pos % ATTN_CTX;
@@ -677,7 +776,11 @@ ScoutOutput Scout::Impl::neural_forward(uint32_t token_id) noexcept {
 
     // e. Output projection + residual
     // normed (scratch) ← o_proj @ attn_out
-    matvec(normed, w_o_proj, attn_out, D_MODEL, D_MODEL);
+    if (metal_ctx) {
+        smoe_metal_scout_matvec(metal_ctx, w_o_proj, attn_out, normed, D_MODEL, D_MODEL);
+    } else {
+        matvec(normed, w_o_proj, attn_out, D_MODEL, D_MODEL);
+    }
     // residual: hidden += normed
     for (uint32_t d = 0; d < D_MODEL; ++d) {
         hidden[d] += normed[d];
@@ -694,29 +797,65 @@ ScoutOutput Scout::Impl::neural_forward(uint32_t token_id) noexcept {
     // Apply model.norm before lm_head and gate projections.
     rms_norm(hidden, w_model_norm, D_MODEL);
 
-    // ── 4. Gate routing for MoE layers 1..27 ─────────────────
-    // For each MoE layer: gate_scores = hidden @ gate_w[l].T → softmax → top-8.
-    // We populate LOOKAHEAD_K steps by cycling through layers.
-    // Each lookahead slot predicts one MoE layer's expert activations.
-    for (uint32_t k = 0; k < LOOKAHEAD_K; ++k) {
-        // Cycle through layers 0..26 (= model layers 1..27)
-        const uint32_t li = k % NUM_MOE_LAYERS;
-        ExpertPrediction& pred = out.lookahead[k];
-        pred.layer_id = li + 1;  // model layer index (1-based)
+    // ── 4. Gate routing for MoE layers 1..27 & 5. Next token ──
+    if (metal_ctx) {
+        // Batch gates and lm_head together (11 operations total: 10 gates + 1 lm_head)
+        const float* weights[11];
+        const float* inputs[11];
+        float* outputs[11];
+        uint32_t rows[11];
+        uint32_t cols[11];
 
-        // gate_scores[e] = dot(hidden, gate_w[li][e*D_MODEL .. +D_MODEL])
-        matvec(gate_scores, gate_w[li], hidden, GATE_ROWS, D_MODEL);
-        softmax(gate_scores, GATE_ROWS);
+        for (uint32_t k = 0; k < LOOKAHEAD_K; ++k) {
+            const uint32_t li = k % NUM_MOE_LAYERS;
+            weights[k] = gate_w[li];
+            inputs[k]  = hidden;
+            outputs[k] = gate_scores_batch + k * GATE_ROWS;
+            rows[k]    = GATE_ROWS;
+            cols[k]    = D_MODEL;
+        }
 
-        // top-8 expert indices
-        pred.count = top_k(gate_scores, GATE_ROWS, MAX_ACTIVE, pred.expert_ids);
-    }
+        weights[10] = w_lm_head;
+        inputs[10]  = hidden;
+        outputs[10] = lm_head_scores;
+        rows[10]    = VOCAB_SIZE;
+        cols[10]    = D_MODEL;
 
-    // ── 5. Next token: argmax over lm_head scores ────────────
-    // We scan row-by-row to avoid allocating a VOCAB_SIZE float buffer.
-    // lm_head.weight is [VOCAB_SIZE × D_MODEL]; we compute dot(hidden, row_v)
-    // for each row v and track the running argmax.
-    {
+        smoe_metal_scout_matvec_batch(metal_ctx, weights, inputs, outputs, rows, cols, 11);
+
+        // Process gate results
+        for (uint32_t k = 0; k < LOOKAHEAD_K; ++k) {
+            const uint32_t li = k % NUM_MOE_LAYERS;
+            ExpertPrediction& pred = out.lookahead[k];
+            pred.layer_id = li + 1;  // model layer index (1-based)
+
+            float* scores = gate_scores_batch + k * GATE_ROWS;
+            softmax(scores, GATE_ROWS);
+            pred.count = top_k(scores, GATE_ROWS, MAX_ACTIVE, pred.expert_ids);
+        }
+
+        // Process lm_head result
+        uint32_t best_tok   = 0;
+        float    best_score = -1e38f;
+        for (uint32_t v = 0; v < VOCAB_SIZE; ++v) {
+            if (lm_head_scores[v] > best_score) {
+                best_score = lm_head_scores[v];
+                best_tok   = v;
+            }
+        }
+        out.next_token_id = best_tok;
+    } else {
+        // Fallback: CPU routing gates
+        for (uint32_t k = 0; k < LOOKAHEAD_K; ++k) {
+            const uint32_t li = k % NUM_MOE_LAYERS;
+            ExpertPrediction& pred = out.lookahead[k];
+            pred.layer_id = li + 1;
+            matvec(gate_scores, gate_w[li], hidden, GATE_ROWS, D_MODEL);
+            softmax(gate_scores, GATE_ROWS);
+            pred.count = top_k(gate_scores, GATE_ROWS, MAX_ACTIVE, pred.expert_ids);
+        }
+
+        // Fallback: CPU lm_head argmax
         uint32_t best_tok   = 0;
         float    best_score = -1e38f;
         for (uint32_t v = 0; v < VOCAB_SIZE; ++v) {
@@ -736,6 +875,7 @@ ScoutOutput Scout::Impl::neural_forward(uint32_t token_id) noexcept {
     ++step;
     return out;
 }
+
 
 // ═══════════════════════════════════════════════════════════════
 // §9  Heuristic path (Week 4 — preserved verbatim)
@@ -858,8 +998,8 @@ ScoutOutput Scout::Impl::heuristic_forward(uint32_t token_id) noexcept {
 // §10  Scout public API
 // ═══════════════════════════════════════════════════════════════
 
-Scout::Scout(const char* scout_safetensors_path)
-    : impl_(new Impl(scout_safetensors_path))
+Scout::Scout(const char* scout_safetensors_path, SmoeMetalCtx* metal_ctx)
+    : impl_(new Impl(scout_safetensors_path, metal_ctx))
 {}
 
 Scout::~Scout() {
