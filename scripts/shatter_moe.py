@@ -223,17 +223,38 @@ def quantize_smoeq2(
     n_groups = len(padded) // group_size
     grouped  = padded.reshape(n_groups, group_size)
 
-    # Per-group absmax scale (stored as float16 to halve scale array size)
+    # ── MSE Scale Optimizer ──
+    # Instead of naive absmax (which destroys sparsity when outliers exist),
+    # we grid-search 64 candidate scales between 0.1*absmax and 1.0*absmax
+    # to find the scale that minimizes the L2 error for each group.
+    
     absmax = np.max(np.abs(grouped), axis=1, keepdims=True)  # shape (G, 1)
-    scales = absmax.squeeze(1).astype(np.float16)             # shape (G,)
+    safe_abs = np.where(absmax == 0.0, 1.0, absmax)
+    
+    # 64 candidate multipliers
+    ratios = np.linspace(0.1, 1.0, 64, dtype=np.float32).reshape(64, 1, 1)
+    candidate_scales = safe_abs * ratios  # (64, G, 1)
+    
+    # We broadcast W to (64, G, 64) virtually to compute MSE
+    # (W / s) * 1.5 => round to codes
+    # Decoded = (codes - 1.5) * (1.0 / 1.5) * s
+    W = grouped[np.newaxis, :, :]  # (1, G, 64)
+    code_float = (W / candidate_scales) * 1.5
+    codes_search = np.clip(np.round(code_float + 1.5), 0, 3)
+    decoded = (codes_search - 1.5) * (1.0 / 1.5) * candidate_scales
+    
+    # L2 Error (MSE)
+    mse = np.sum((W - decoded) ** 2, axis=2)  # (64, G)
+    
+    # Best scale per group
+    best_idx = np.argmin(mse, axis=0)  # (G,)
+    best_scales = candidate_scales[best_idx, np.arange(n_groups), 0]  # (G,)
+    scales = best_scales.astype(np.float16)
 
-    # Normalise ∈ [-1, +1], scale to code space [-1.5, +1.5]
-    safe_abs   = np.where(absmax == 0.0, 1.0, absmax)
-    code_float = (grouped / safe_abs) * 1.5                   # ∈ [-1.5, +1.5]
-
-    # Quantise: round to nearest integer offset, clamp to [0, 3]
-    #   code 0 → -1.5  code 1 → -0.5  code 2 → +0.5  code 3 → +1.5
-    codes = np.clip(np.round(code_float + 1.5).astype(np.int32), 0, 3).astype(np.uint8)
+    # Now compute the final 2-bit codes using the optimal scales
+    safe_best = np.where(best_scales == 0.0, 1.0, best_scales).reshape(n_groups, 1)
+    final_code_float = (grouped / safe_best) * 1.5
+    codes = np.clip(np.round(final_code_float + 1.5).astype(np.int32), 0, 3).astype(np.uint8)
 
     # Trim group-padding, then pack 4 codes per byte
     codes_flat = codes.ravel()[:n]
