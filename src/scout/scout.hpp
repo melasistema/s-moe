@@ -31,12 +31,13 @@ namespace smoe::scout {
 // Lookahead window depth — how many future steps to predict
 inline constexpr uint32_t LOOKAHEAD_K   = 10;
 // Maximum simultaneously active experts per token per layer
-inline constexpr uint32_t MAX_ACTIVE    =  8;
+inline constexpr uint32_t MAX_ACTIVE    =  6;
 
 // ── Expert prediction for one future step ────────────────────
 struct ExpertPrediction {
     uint32_t layer_id;
     uint32_t expert_ids[MAX_ACTIVE];
+    float    expert_weights[MAX_ACTIVE];
     uint32_t count;   // actual active count ≤ MAX_ACTIVE
 };
 
@@ -78,6 +79,8 @@ public:
     const float* get_o_proj(uint32_t layer) const noexcept;
     const float* get_input_norm(uint32_t layer) const noexcept;
     const float* get_post_norm(uint32_t layer) const noexcept;
+    
+    float* get_lm_head_scores() const noexcept;
     
     // Layers 1..27 shared experts
     const float* get_shared_gate(uint32_t layer) const noexcept;

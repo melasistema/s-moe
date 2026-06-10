@@ -165,12 +165,8 @@ static void softmax(float* x, uint32_t n) noexcept {
 // Returns k (or fewer if n < k).
 // Uses a simple partial selection — fine for k=8, n=64.
 static uint32_t top_k(const float* scores, uint32_t n, uint32_t k,
-                       uint32_t* out_indices) noexcept {
+                       uint32_t* out_indices, float* out_weights = nullptr) noexcept {
     uint32_t count = std::min(k, n);
-    // Fill with sentinel -1 (unused)
-    static_assert(sizeof(uint32_t) == 4);
-    // We mark selected indices to avoid duplicates
-    // Use a small stack-local copy of scores — n ≤ 64, fine on stack
     float   tmp[GATE_ROWS];
     uint32_t idx[GATE_ROWS];
     for (uint32_t i = 0; i < n; ++i) { tmp[i] = scores[i]; idx[i] = i; }
@@ -183,6 +179,7 @@ static uint32_t top_k(const float* scores, uint32_t n, uint32_t k,
         float   ft = tmp[s]; tmp[s] = tmp[best]; tmp[best] = ft;
         uint32_t it = idx[s]; idx[s] = idx[best]; idx[best] = it;
         out_indices[s] = idx[s];
+        if (out_weights) out_weights[s] = tmp[s];
     }
     return count;
 }
@@ -756,10 +753,12 @@ const float* Scout::get_q_proj(uint32_t l) const noexcept { return impl_->w_q_pr
 const float* Scout::get_k_proj(uint32_t l) const noexcept { return impl_->w_k_proj[l]; }
 const float* Scout::get_v_proj(uint32_t l) const noexcept { return impl_->w_v_proj[l]; }
 const float* Scout::get_o_proj(uint32_t l) const noexcept { return impl_->w_o_proj[l]; }
-const float* Scout::get_input_norm(uint32_t l) const noexcept { return impl_->w_input_norm[l]; }
-const float* Scout::get_post_norm(uint32_t l) const noexcept { return impl_->w_post_norm[l]; }
+const float* Scout::get_input_norm(uint32_t layer) const noexcept { return impl_->w_input_norm[layer]; }
+const float* Scout::get_post_norm(uint32_t layer) const noexcept { return impl_->w_post_norm[layer]; }
 
-const float* Scout::get_shared_gate(uint32_t l) const noexcept { return impl_->w_shared_gate[l]; }
+float* Scout::get_lm_head_scores() const noexcept { return impl_->lm_head_scores; }
+
+const float* Scout::get_shared_gate(uint32_t layer) const noexcept { return impl_->w_shared_gate[layer]; }
 const float* Scout::get_shared_up(uint32_t l) const noexcept { return impl_->w_shared_up[l]; }
 const float* Scout::get_shared_down(uint32_t l) const noexcept { return impl_->w_shared_down[l]; }
 
@@ -886,7 +885,7 @@ ScoutOutput Scout::Impl::neural_forward(uint32_t token_id) noexcept {
 
             float* scores = gate_scores_batch + k * GATE_ROWS;
             softmax(scores, GATE_ROWS);
-            pred.count = top_k(scores, GATE_ROWS, MAX_ACTIVE, pred.expert_ids);
+            pred.count = top_k(scores, GATE_ROWS, MAX_ACTIVE, pred.expert_ids, pred.expert_weights);
         }
 
         // Process lm_head result
@@ -906,7 +905,7 @@ ScoutOutput Scout::Impl::neural_forward(uint32_t token_id) noexcept {
             pred.layer_id = k + 1;
             matvec(gate_scores, gate_w[k], hidden, GATE_ROWS, D_MODEL);
             softmax(gate_scores, GATE_ROWS);
-            pred.count = top_k(gate_scores, GATE_ROWS, MAX_ACTIVE, pred.expert_ids);
+            pred.count = top_k(gate_scores, GATE_ROWS, MAX_ACTIVE, pred.expert_ids, pred.expert_weights);
         }
 
         // Fallback: CPU lm_head argmax

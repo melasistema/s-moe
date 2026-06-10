@@ -403,9 +403,16 @@ int main(int argc, char* argv[]) {
     uint32_t ctx_pos = 0;
     uint32_t ctx_fill = 0;
 
-    uint32_t cur_token = (prompt_len > 0) ? prompt_tokens[prompt_len - 1] : 0;
+    uint32_t total_steps = prompt_len + max_tokens;
+    if (prompt_len > 0) total_steps -= 1;
 
-    for (uint32_t n = 0; n < max_tokens; ++n) {
+    uint32_t cur_token = (prompt_len > 0) ? prompt_tokens[0] : 0;
+
+    for (uint32_t n = 0; n < total_steps; ++n) {
+
+        if (n < prompt_len) {
+            cur_token = prompt_tokens[n];
+        }
 
         // ── Step 1: Scout forward ─────────────────────────────
         smoe::scout::ScoutOutput scout_out = scout.forward(cur_token);
@@ -414,7 +421,6 @@ int main(int argc, char* argv[]) {
         for (uint32_t l = 0; l < smoe::NUM_MOE_LAYERS; ++l) {
             const smoe::scout::ExpertPrediction& pred = scout_out.routing[l];
             for (uint32_t e = 0; e < pred.count; ++e) {
-                // Non-blocking — returns false under back-pressure; that's fine.
                 (void)streamer.prefetch(pred.layer_id, pred.expert_ids[e]);
             }
         }
@@ -428,21 +434,36 @@ int main(int argc, char* argv[]) {
         static float attn_out[2048];
         static float attn_scores[ATTN_CTX];
 
-        // 1. Initial Embedding
         std::memcpy(hidden, scout.get_embed() + static_cast<size_t>(cur_token) * 2048, 2048 * sizeof(float));
 
-        // Iterate over 28 layers
         for (uint32_t l = 0; l <= smoe::NUM_MOE_LAYERS; ++l) {
-            // Attention Norm
             std::memcpy(normed, hidden, 2048 * sizeof(float));
             smoe::rms_norm(normed, scout.get_input_norm(l), 2048);
 
-            // QKV Projections
             smoe::matvec(qbuf, scout.get_q_proj(l), normed, 2048, 2048);
             smoe::matvec(kbuf, scout.get_k_proj(l), normed, 2048, 2048);
             smoe::matvec(vbuf, scout.get_v_proj(l), normed, 2048, 2048);
 
-            // Write to KV Cache
+            // Apply RoPE to Q and K (16 heads, 128 dim) - Half-split pairing
+            for (uint32_t h = 0; h < 16; ++h) {
+                for (uint32_t d = 0; d < 64; ++d) {
+                    float freq = 1.0f / std::pow(10000.0f, static_cast<float>(d * 2) / 128.0f);
+                    float angle = static_cast<float>(n) * freq;
+                    float cos_val = std::cos(angle);
+                    float sin_val = std::sin(angle);
+                    
+                    float q0 = qbuf[h * 128 + d];
+                    float q1 = qbuf[h * 128 + d + 64];
+                    qbuf[h * 128 + d]      = q0 * cos_val - q1 * sin_val;
+                    qbuf[h * 128 + d + 64] = q0 * sin_val + q1 * cos_val;
+                    
+                    float k0 = kbuf[h * 128 + d];
+                    float k1 = kbuf[h * 128 + d + 64];
+                    kbuf[h * 128 + d]      = k0 * cos_val - k1 * sin_val;
+                    kbuf[h * 128 + d + 64] = k0 * sin_val + k1 * cos_val;
+                }
+            }
+
             float* k_cache = full_kv_cache + (l * 2 * ATTN_CTX + 0 * ATTN_CTX) * 2048;
             float* v_cache = full_kv_cache + (l * 2 * ATTN_CTX + 1 * ATTN_CTX) * 2048;
             
@@ -450,42 +471,45 @@ int main(int argc, char* argv[]) {
             std::memcpy(k_cache + slot * 2048, kbuf, 2048 * sizeof(float));
             std::memcpy(v_cache + slot * 2048, vbuf, 2048 * sizeof(float));
 
-            // Simplified Attention CPU
-            const float scale = 1.0f / std::sqrt(2048.0f);
-            const uint32_t valid = (ctx_fill < ATTN_CTX) ? ctx_fill + 1 : ATTN_CTX; // +1 for the current token
-            for (uint32_t i = 0; i < valid; ++i) {
-                uint32_t ki = (ctx_pos - i + ATTN_CTX) % ATTN_CTX;
-                float dot_qk = 0.0f;
-                const float* krow = k_cache + ki * 2048;
-                for (uint32_t d = 0; d < 2048; ++d) {
-                    dot_qk += qbuf[d] * krow[d];
-                }
-                attn_scores[i] = dot_qk * scale;
-            }
-
-            // Softmax
-            float max_val = attn_scores[0];
-            for (uint32_t i = 1; i < valid; ++i) {
-                if (attn_scores[i] > max_val) max_val = attn_scores[i];
-            }
-            float sum = 0.0f;
-            for (uint32_t i = 0; i < valid; ++i) {
-                attn_scores[i] = std::exp(attn_scores[i] - max_val);
-                sum += attn_scores[i];
-            }
-            float inv_sum = (sum > 0.0f) ? 1.0f / sum : 0.0f;
-            for (uint32_t i = 0; i < valid; ++i) {
-                attn_scores[i] *= inv_sum;
-            }
-
-            // Attn Out
+            // Multi-Head Attention CPU
+            const float scale = 1.0f / std::sqrt(128.0f);
+            const uint32_t valid = (ctx_fill < ATTN_CTX) ? ctx_fill + 1 : ATTN_CTX;
             std::memset(attn_out, 0, 2048 * sizeof(float));
-            for (uint32_t i = 0; i < valid; ++i) {
-                uint32_t vi = (ctx_pos - i + ATTN_CTX) % ATTN_CTX;
-                const float alpha = attn_scores[i];
-                const float* vrow = v_cache + vi * 2048;
-                for (uint32_t d = 0; d < 2048; ++d) {
-                    attn_out[d] += alpha * vrow[d];
+
+            for (uint32_t h = 0; h < 16; ++h) {
+                for (uint32_t i = 0; i < valid; ++i) {
+                    uint32_t ki = (ctx_pos - i + ATTN_CTX) % ATTN_CTX;
+                    float dot_qk = 0.0f;
+                    const float* krow = k_cache + ki * 2048 + h * 128;
+                    const float* qhead = qbuf + h * 128;
+                    for (uint32_t d = 0; d < 128; ++d) {
+                        dot_qk += qhead[d] * krow[d];
+                    }
+                    attn_scores[i] = dot_qk * scale;
+                }
+
+                float max_val = attn_scores[0];
+                for (uint32_t i = 1; i < valid; ++i) {
+                    if (attn_scores[i] > max_val) max_val = attn_scores[i];
+                }
+                float sum = 0.0f;
+                for (uint32_t i = 0; i < valid; ++i) {
+                    attn_scores[i] = std::exp(attn_scores[i] - max_val);
+                    sum += attn_scores[i];
+                }
+                float inv_sum = (sum > 0.0f) ? 1.0f / sum : 0.0f;
+                for (uint32_t i = 0; i < valid; ++i) {
+                    attn_scores[i] *= inv_sum;
+                }
+
+                for (uint32_t i = 0; i < valid; ++i) {
+                    uint32_t vi = (ctx_pos - i + ATTN_CTX) % ATTN_CTX;
+                    const float alpha = attn_scores[i];
+                    const float* vrow = v_cache + vi * 2048 + h * 128;
+                    float* out_head = attn_out + h * 128;
+                    for (uint32_t d = 0; d < 128; ++d) {
+                        out_head[d] += alpha * vrow[d];
+                    }
                 }
             }
 
@@ -567,8 +591,9 @@ int main(int argc, char* argv[]) {
                         );
 
                         // Accumulate
+                        float weight = pred.expert_weights[e];
                         for (uint32_t d = 0; d < 2048; ++d) {
-                            routed_out[d] += expert_output_vec[d];
+                            routed_out[d] += weight * expert_output_vec[d];
                         }
                         
                         streamer.release(slot);
@@ -586,27 +611,45 @@ int main(int argc, char* argv[]) {
         ctx_pos = (ctx_pos + 1) % ATTN_CTX;
         if (ctx_fill < ATTN_CTX) ++ctx_fill;
 
-        // Final Model Norm and LM Head
+        // ── Step 5: Final Model Norm and LM Head ──────────────
         smoe::rms_norm(hidden, scout.get_model_norm(), 2048);
         
-        // Speculative decoding check or just use Scout's predicted token for speed?
-        // Since we did not write the 102400-length LM Head computation here yet,
-        // we'll output the token generated by Scout (which was fast).
-        // A full implementation would run lm_head on 'hidden'.
-        cur_token = scout_out.next_token_id;
+        // Execute LM Head on GPU
+        const float* weights[1] = { scout.get_lm_head() };
+        const float* inputs[1]  = { hidden };
+        float* outputs[1]       = { scout.get_lm_head_scores() };
+        uint32_t rows[1]        = { 102400 };
+        uint32_t cols[1]        = { 2048 };
+        smoe_metal_scout_matvec_batch(metal, weights, inputs, outputs, rows, cols, 1);
+
+        // Process lm_head result
+        float* scores = scout.get_lm_head_scores();
+        uint32_t best_tok   = 0;
+        float    best_score = -1e38f;
+        for (uint32_t v = 0; v < 102400; ++v) {
+            if (scores[v] > best_score) {
+                best_score = scores[v];
+                best_tok   = v;
+            }
+        }
+        
+        cur_token = best_tok;
 
         // ── Step 6: Emit token ────────────────────────────────
-        if (g_vocab_loaded && cur_token < 102400) {
-            std::fputs(g_vocab[cur_token].c_str(), stdout);
-        } else {
-            unsigned char c = static_cast<unsigned char>(cur_token & 0xFF);
-            std::fputc(c, stdout);
+        bool is_generating = (prompt_len == 0) || (n >= prompt_len - 1);
+        if (is_generating) {
+            if (g_vocab_loaded && cur_token < 102400) {
+                std::fputs(g_vocab[cur_token].c_str(), stdout);
+            } else {
+                unsigned char c = static_cast<unsigned char>(cur_token & 0xFF);
+                std::fputc(c, stdout);
+            }
+            std::fflush(stdout);
         }
-        std::fflush(stdout);
 
         // ── Step 7: Telemetry ─────────────────────────────────
-        if ((n + 1) % TELEMETRY_EVERY == 0) {
-            print_telemetry(n + 1, streamer, ts);
+        if (is_generating && ((n + 1) % TELEMETRY_EVERY == 0)) {
+            print_telemetry(n + 1 - (prompt_len > 0 ? prompt_len - 1 : 0), streamer, ts);
         }
     }
 
