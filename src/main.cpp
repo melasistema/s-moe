@@ -217,6 +217,34 @@ static bool read_expert_layout(const char* vault_path, const smoe::SmoeHeader& h
     return true;
 }
 
+static bool g_vocab_loaded = false;
+static std::string g_vocab[102400];
+
+static void load_vocab(const char* vocab_bin_path) {
+    FILE* f = std::fopen(vocab_bin_path, "rb");
+    if (!f) {
+        std::fprintf(stderr, "[vocab] ⚠ Failed to open vocabulary file '%s'\n", vocab_bin_path);
+        return;
+    }
+    uint32_t loaded = 0;
+    for (uint32_t i = 0; i < 102400; ++i) {
+        uint32_t len = 0;
+        if (std::fread(&len, sizeof(len), 1, f) != 1) break;
+        g_vocab[i].resize(len);
+        if (len > 0) {
+            if (std::fread(&g_vocab[i][0], 1, len, f) != len) break;
+        }
+        loaded++;
+    }
+    std::fclose(f);
+    if (loaded == 102400) {
+        g_vocab_loaded = true;
+        std::fprintf(stderr, "[vocab] ✓ Loaded 102,400 tokens from '%s'\n", vocab_bin_path);
+    } else {
+        std::fprintf(stderr, "[vocab] ⚠ Only loaded %u/102,400 tokens\n", loaded);
+    }
+}
+
 // ── Token generation loop ─────────────────────────────────────
 
 // Simple tokeniser shim: maps prompt string → token IDs.
@@ -242,6 +270,7 @@ int main(int argc, char* argv[]) {
     const char* vault_path  = nullptr;
     const char* scout_path  = nullptr;
     const char* prompt_text = nullptr;
+    const char* tokens_in   = nullptr;
     uint32_t    max_tokens  = DEFAULT_MAX_TOKENS;
     uint32_t    ring_size   = DEFAULT_RING_SIZE;
     uint32_t    num_workers = DEFAULT_WORKERS;
@@ -251,13 +280,14 @@ int main(int argc, char* argv[]) {
         auto arg = [&](const char* flag) {
             return std::strcmp(argv[i], flag) == 0 && i + 1 < argc;
         };
-        if      (arg("--vault"))   { vault_path  = argv[++i]; }
-        else if (arg("--scout"))   { scout_path  = argv[++i]; }
-        else if (arg("--prompt"))  { prompt_text = argv[++i]; }
-        else if (arg("--tokens"))  { max_tokens  = static_cast<uint32_t>(std::atoi(argv[++i])); }
-        else if (arg("--ring"))    { ring_size   = static_cast<uint32_t>(std::atoi(argv[++i])); }
-        else if (arg("--workers")) { num_workers = static_cast<uint32_t>(std::atoi(argv[++i])); }
-        else if (arg("--slot-mb")) { slot_mb     = static_cast<uint64_t>(std::atoll(argv[++i])); }
+        if      (arg("--vault"))     { vault_path  = argv[++i]; }
+        else if (arg("--scout"))     { scout_path  = argv[++i]; }
+        else if (arg("--prompt"))    { prompt_text = argv[++i]; }
+        else if (arg("--tokens-in")) { tokens_in   = argv[++i]; }
+        else if (arg("--tokens"))    { max_tokens  = static_cast<uint32_t>(std::atoi(argv[++i])); }
+        else if (arg("--ring"))      { ring_size   = static_cast<uint32_t>(std::atoi(argv[++i])); }
+        else if (arg("--workers"))   { num_workers = static_cast<uint32_t>(std::atoi(argv[++i])); }
+        else if (arg("--slot-mb"))   { slot_mb     = static_cast<uint64_t>(std::atoll(argv[++i])); }
         else if (std::strcmp(argv[i], "--help") == 0 ||
                  std::strcmp(argv[i], "-h")     == 0) {
             print_usage(argv[0]);
@@ -265,9 +295,9 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    if (!vault_path || !prompt_text) {
+    if (!vault_path || (!prompt_text && !tokens_in)) {
         std::fprintf(stderr,
-            "\n  ✗  --vault and --prompt are required.\n");
+            "\n  ✗  --vault and either --prompt or --tokens-in are required.\n");
         print_usage(argv[0]);
         return 1;
     }
@@ -313,12 +343,29 @@ int main(int argc, char* argv[]) {
     // ── Phase 4: Scout init ───────────────────────────────────
     smoe::scout::Scout scout(scout_path);  // scout_path may be nullptr (heuristic only)
 
+    // ── Load vocabulary ───────────────────────────────────────
+    load_vocab("vault/vocab.bin");
+
     // ── Tokenise prompt ───────────────────────────────────────
     // Pre-allocate on the stack — no heap in the loop.
     static uint32_t prompt_tokens[2048];
     uint32_t        prompt_len = 0;
-    tokenise_prompt(prompt_text, prompt_tokens, prompt_len,
-                    std::min(max_tokens, uint32_t(2048)));
+    if (tokens_in) {
+        std::string s(tokens_in);
+        size_t pos = 0;
+        while (pos < s.size() && prompt_len < 2048) {
+            size_t next_comma = s.find(',', pos);
+            if (next_comma == std::string::npos) {
+                prompt_tokens[prompt_len++] = std::stoul(s.substr(pos));
+                break;
+            }
+            prompt_tokens[prompt_len++] = std::stoul(s.substr(pos, next_comma - pos));
+            pos = next_comma + 1;
+        }
+    } else {
+        tokenise_prompt(prompt_text, prompt_tokens, prompt_len,
+                        std::min(max_tokens, uint32_t(2048)));
+    }
 
     // ── Pre-generate telemetry state ──────────────────────────
     TelemetryState ts;
@@ -329,10 +376,13 @@ int main(int argc, char* argv[]) {
     // ── Print prompt passthrough ──────────────────────────────
     std::fprintf(stdout, "\n");
     for (uint32_t i = 0; i < prompt_len; ++i) {
-        // Heuristic "detokeniser": treat token ID as ASCII code point.
-        // Week 5+: replace with real BPE decoder.
-        unsigned char c = static_cast<unsigned char>(prompt_tokens[i] & 0xFF);
-        std::fputc(c, stdout);
+        uint32_t tok = prompt_tokens[i];
+        if (g_vocab_loaded && tok < 102400) {
+            std::fputs(g_vocab[tok].c_str(), stdout);
+        } else {
+            unsigned char c = static_cast<unsigned char>(tok & 0xFF);
+            std::fputc(c, stdout);
+        }
     }
 
     // ── Token Generation Loop ─────────────────────────────────
@@ -419,8 +469,12 @@ int main(int argc, char* argv[]) {
 
         // ── Step 6: Emit token ────────────────────────────────
         cur_token = scout_out.next_token_id;
-        unsigned char c = static_cast<unsigned char>(cur_token & 0xFF);
-        std::fputc(c, stdout);
+        if (g_vocab_loaded && cur_token < 102400) {
+            std::fputs(g_vocab[cur_token].c_str(), stdout);
+        } else {
+            unsigned char c = static_cast<unsigned char>(cur_token & 0xFF);
+            std::fputc(c, stdout);
+        }
         std::fflush(stdout);
 
         // ── Step 7: Telemetry ─────────────────────────────────
