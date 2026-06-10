@@ -63,6 +63,13 @@ from typing import Optional
 
 import numpy as np
 
+# Register bfloat16 data type in numpy
+try:
+    import ml_dtypes
+except ImportError:
+    print("ERROR: ml_dtypes not installed. Run: pip install ml_dtypes")
+    sys.exit(1)
+
 # ── safetensors (required) ────────────────────────────────────────
 try:
     from safetensors import safe_open

@@ -102,9 +102,9 @@ print('  ✓  SMOE-Q2 smoke-test passed') \
 # C++ / METAL ENGINE  (Weeks 2-4)
 # ─────────────────────────────────────────────────────────────
 
-## all: Build the C++ engine binary and Metal kernel library.
+## all: Build the C++ engine binary.
 .PHONY: all
-all: $(TARGET) $(METAL_LIB)
+all: $(TARGET)
 	@echo "  ⚡  smoe-engine → $(TARGET)"
 
 $(TARGET): $(OBJS_CXX) $(OBJS_MM) | $(BUILD_DIR)
