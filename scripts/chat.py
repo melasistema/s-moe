@@ -38,11 +38,11 @@ def main():
     console = Console()
 
     parser = argparse.ArgumentParser(description="S-MoE Interactive Chat Console")
-    parser.add_argument("--vault", type=str, default="vault/521d2bc4fb69a3f3ae565310fcc3b65f97af2580.smoe", help="Path to .smoe vault")
-    parser.add_argument("--scout", type=str, default="vault/521d2bc4fb69a3f3ae565310fcc3b65f97af2580.scout.safetensors", help="Path to scout safetensors")
-    parser.add_argument("--model-dir", type=str, default="/Users/vixdrummer/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-MoE-16B-Base/snapshots/521d2bc4fb69a3f3ae565310fcc3b65f97af2580/", help="Path to HF snapshot for tokenizer")
+    parser.add_argument("--vault", type=str, default="vault/deepseek-chat.smoe", help="Path to .smoe vault")
+    parser.add_argument("--scout", type=str, default="vault/deepseek-chat.scout.safetensors", help="Path to scout safetensors")
+    parser.add_argument("--model", type=str, default="deepseek-ai/DeepSeek-MoE-16B-chat", help="HuggingFace model ID for tokenizer")
     parser.add_argument("--tokens", type=int, default=100, help="Max tokens to generate per response")
-    parser.add_argument("--ring", type=int, default=48, help="Ring buffer slot count")
+    parser.add_argument("--ring", type=int, default=256, help="Ring buffer slot count")
     parser.add_argument("--workers", type=int, default=4, help="I/O worker thread count")
 
     args = parser.parse_args()
@@ -51,7 +51,6 @@ def main():
     vault_path = Path(args.vault)
     scout_path = Path(args.scout)
     engine_bin = Path("build/smoe-engine")
-    model_dir = Path(args.model_dir)
 
     if not engine_bin.exists():
         console.print("[red]ERROR: C++ binary 'build/smoe-engine' not found.[/red]")
@@ -63,9 +62,9 @@ def main():
         sys.exit(1)
 
     # Load tokenizer
-    console.print(f"Loading BPE Tokenizer from '{model_dir.name}' ...")
+    console.print(f"Loading BPE Tokenizer from '{args.model}' ...")
     try:
-        tokenizer = AutoTokenizer.from_pretrained(str(model_dir), trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     except Exception as e:
         console.print(f"[red]Failed to load tokenizer: {e}[/red]")
         sys.exit(1)
@@ -81,6 +80,8 @@ def main():
     )
 
     while True:
+        # Keep conversational history stateless for now since engine restarts per prompt
+        messages = []
         try:
             try:
                 prompt = console.input("\n[bold green]User[/bold green] ❯ ")
@@ -92,9 +93,15 @@ def main():
                 console.print("[yellow]Exiting S-MoE chat session.[/yellow]")
                 break
 
-            # 1. BPE Tokenise input prompt
-            # DeepSeek begins sentences with special bos token
-            token_ids = tokenizer.encode(prompt, add_special_tokens=True)
+            # Append to conversational history
+            messages.append({"role": "user", "content": prompt})
+
+            # 1. BPE Tokenise input prompt using chat template if available
+            if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template is not None:
+                token_ids = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
+            else:
+                token_ids = tokenizer.encode(prompt, add_special_tokens=True)
+            
             token_str = ",".join(map(str, token_ids))
 
             console.print("\n[bold cyan]S-MoE Engine[/bold cyan] ❯", end="")

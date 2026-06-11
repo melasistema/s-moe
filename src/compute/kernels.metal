@@ -39,7 +39,8 @@ constant uint TGROUP_SIZE = 256;
 struct FusedFFNParams {
     uint rows;        // weight matrix rows  (= intermediate / hidden dim)
     uint cols;        // weight matrix cols  (= input dim)
-    uint group_size;  // SMOE-Q2 quantisation group size (= 64)
+    uint group_size;  // SMOE quantisation group size (= 64)
+    uint bits;        // bits per weight (2 or 4)
 };
 
 // ── SiLU activation: x · σ(x) ───────────────────────────────
@@ -70,6 +71,23 @@ inline float smoeq2_dequant(
 
     // Affine mapping: centre 0–3 around zero, then scale
     return ((float(code) - 1.5f) * (1.0f / 1.5f)) * scale;
+}
+
+inline float smoeq4_dequant(
+    device const uint8_t* packed,
+    device const half*    scales,
+    uint wi,
+    uint group_size)
+{
+    uint    pack_idx  = wi >> 1;                        // wi / 2
+    uint    bit_shift = (wi & 1u) << 2u;               // (wi % 2) * 4
+    uint    group_idx = wi / group_size;
+
+    uint8_t code  = (packed[pack_idx] >> bit_shift) & 0xFu;
+    float   scale = float(scales[group_idx]);
+
+    // Affine mapping: centre 0–15 around zero, then scale
+    return ((float(code) - 7.5f) * (1.0f / 7.5f)) * scale;
 }
 
 // ── Fused Gate+Up+Down FFN kernel ────────────────────────────
@@ -134,34 +152,56 @@ kernel void smoe_gate_up(
         uint wi_base = row * params.cols + col_base;
 
         uint k = 0;
-        for (; k + 3 < tile_end; k += 4) {
-            uint wi = wi_base + k;
+        if (params.bits == 4) {
+            for (; k + 1 < tile_end; k += 2) {
+                uint wi = wi_base + k;
+                uint pidx = wi >> 1;
+                uint8_t gbyte = gate_packed[pidx];
+                uint8_t ubyte = up_packed[pidx];
 
-            // Decode 4 gate weights from one byte
-            uint pidx = wi >> 2;
-            uint8_t gbyte = gate_packed[pidx];
-            uint8_t ubyte = up_packed[pidx];
+                float gs = float(gate_scales[wi / params.group_size]);
+                float us = float(up_scales[wi  / params.group_size]);
 
-            float gs = float(gate_scales[wi / params.group_size]);
-            float us = float(up_scales[wi  / params.group_size]);
-
-            // Process all 4 codes in the byte
-            for (uint b = 0; b < 4; ++b) {
-                float gcode = float((gbyte >> (b * 2)) & 0x3u);
-                float ucode = float((ubyte >> (b * 2)) & 0x3u);
-                float gw    = (gcode - 1.5f) * (1.0f / 1.5f) * gs;
-                float uw    = (ucode - 1.5f) * (1.0f / 1.5f) * us;
-                float x_k   = tg_input[k + b];
-                gate_acc   += gw * x_k;
-                up_acc     += uw * x_k;
+                for (uint b = 0; b < 2; ++b) {
+                    float gcode = float((gbyte >> (b * 4)) & 0xFu);
+                    float ucode = float((ubyte >> (b * 4)) & 0xFu);
+                    float gw    = (gcode - 7.5f) * (1.0f / 7.5f) * gs;
+                    float uw    = (ucode - 7.5f) * (1.0f / 7.5f) * us;
+                    float x_k   = tg_input[k + b];
+                    gate_acc   += gw * x_k;
+                    up_acc     += uw * x_k;
+                }
             }
-        }
+            for (; k < tile_end; ++k) {
+                uint wi = wi_base + k;
+                gate_acc += smoeq4_dequant(gate_packed, gate_scales, wi, params.group_size) * tg_input[k];
+                up_acc   += smoeq4_dequant(up_packed,   up_scales,   wi, params.group_size) * tg_input[k];
+            }
+        } else {
+            for (; k + 3 < tile_end; k += 4) {
+                uint wi = wi_base + k;
+                uint pidx = wi >> 2;
+                uint8_t gbyte = gate_packed[pidx];
+                uint8_t ubyte = up_packed[pidx];
 
-        // Scalar tail (handles cols not divisible by 4)
-        for (; k < tile_end; ++k) {
-            uint wi = wi_base + k;
-            gate_acc += smoeq2_dequant(gate_packed, gate_scales, wi, params.group_size) * tg_input[k];
-            up_acc   += smoeq2_dequant(up_packed,   up_scales,   wi, params.group_size) * tg_input[k];
+                float gs = float(gate_scales[wi / params.group_size]);
+                float us = float(up_scales[wi  / params.group_size]);
+
+                for (uint b = 0; b < 4; ++b) {
+                    float gcode = float((gbyte >> (b * 2)) & 0x3u);
+                    float ucode = float((ubyte >> (b * 2)) & 0x3u);
+                    float gw    = (gcode - 1.5f) * (1.0f / 1.5f) * gs;
+                    float uw    = (ucode - 1.5f) * (1.0f / 1.5f) * us;
+                    float x_k   = tg_input[k + b];
+                    gate_acc   += gw * x_k;
+                    up_acc     += uw * x_k;
+                }
+            }
+            for (; k < tile_end; ++k) {
+                uint wi = wi_base + k;
+                gate_acc += smoeq2_dequant(gate_packed, gate_scales, wi, params.group_size) * tg_input[k];
+                up_acc   += smoeq2_dequant(up_packed,   up_scales,   wi, params.group_size) * tg_input[k];
+            }
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -204,21 +244,38 @@ kernel void smoe_down(
         uint wi_base  = row * params.rows + col_base;
 
         uint k = 0;
-        for (; k + 3 < tile_end; k += 4) {
-            uint    pidx  = (wi_base + k) >> 2;
-            uint8_t dbyte = down_packed[pidx];
-            float   ds    = float(down_scales[(wi_base + k) / params.group_size]);
+        if (params.bits == 4) {
+            for (; k + 1 < tile_end; k += 2) {
+                uint    pidx  = (wi_base + k) >> 1;
+                uint8_t dbyte = down_packed[pidx];
+                float   ds    = float(down_scales[(wi_base + k) / params.group_size]);
 
-            for (uint b = 0; b < 4; ++b) {
-                float dcode = float((dbyte >> (b * 2)) & 0x3u);
-                float dw    = (dcode - 1.5f) * (1.0f / 1.5f) * ds;
-                acc        += dw * tg_hidden[k + b];
+                for (uint b = 0; b < 2; ++b) {
+                    float dcode = float((dbyte >> (b * 4)) & 0xFu);
+                    float dw    = (dcode - 7.5f) * (1.0f / 7.5f) * ds;
+                    acc        += dw * tg_hidden[k + b];
+                }
             }
-        }
+            for (; k < tile_end; ++k) {
+                uint wi = wi_base + k;
+                acc += smoeq4_dequant(down_packed, down_scales, wi, params.group_size) * tg_hidden[k];
+            }
+        } else {
+            for (; k + 3 < tile_end; k += 4) {
+                uint    pidx  = (wi_base + k) >> 2;
+                uint8_t dbyte = down_packed[pidx];
+                float   ds    = float(down_scales[(wi_base + k) / params.group_size]);
 
-        for (; k < tile_end; ++k) {
-            uint wi = wi_base + k;
-            acc += smoeq2_dequant(down_packed, down_scales, wi, params.group_size) * tg_hidden[k];
+                for (uint b = 0; b < 4; ++b) {
+                    float dcode = float((dbyte >> (b * 2)) & 0x3u);
+                    float dw    = (dcode - 1.5f) * (1.0f / 1.5f) * ds;
+                    acc        += dw * tg_hidden[k + b];
+                }
+            }
+            for (; k < tile_end; ++k) {
+                uint wi = wi_base + k;
+                acc += smoeq2_dequant(down_packed, down_scales, wi, params.group_size) * tg_hidden[k];
+            }
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);

@@ -33,7 +33,7 @@
 #include <unistd.h>
 
 // ── Compile-time defaults ─────────────────────────────────────
-inline constexpr uint32_t DEFAULT_RING_SIZE    = 48;
+inline constexpr uint32_t DEFAULT_RING_SIZE    = 256;
 inline constexpr uint32_t DEFAULT_WORKERS      = 4;
 inline constexpr uint64_t DEFAULT_SLOT_MB      = 8;
 inline constexpr uint32_t DEFAULT_MAX_TOKENS   = 512;
@@ -389,13 +389,12 @@ int main(int argc, char* argv[]) {
     //
     // Invariant per token step N:
     //
-    //   1. Scout.forward(token) → next_token + K-step lookahead
-    //   2. Fire prefetch() for all predicted experts in lookahead[0..K-1]
-    //   3. Claim one READY ring slot for the current step's expert
-    //   4. Dispatch Metal FFN kernel on claimed slot
-    //   5. Release slot back to ring
-    //   6. Emit next_token to stdout
-    //   7. Every TELEMETRY_EVERY tokens: update telemetry bar
+    //   1. Scout runs ahead up to K steps, queueing its predicted tokens
+    //      and routing gates, firing prefetch requests.
+    //   2. Heavy Model executes one step.
+    //   3. Compare Heavy token vs Scout token.
+    //   4. If mismatch, rollback Scout KV-cache and flush queue.
+    //   5. Every TELEMETRY_EVERY tokens: update telemetry bar
 
     // Multi-layer KV cache (static to avoid heap allocation)
     static constexpr uint32_t ATTN_CTX = 4096;
@@ -406,26 +405,48 @@ int main(int argc, char* argv[]) {
     uint32_t total_steps = prompt_len + max_tokens;
     if (prompt_len > 0) total_steps -= 1;
 
-    uint32_t cur_token = (prompt_len > 0) ? prompt_tokens[0] : 0;
+    uint32_t heavy_cur_token = (prompt_len > 0) ? prompt_tokens[0] : 0;
+    uint32_t scout_cur_token = heavy_cur_token;
+
+    // Speculative lookahead queue
+    static constexpr uint32_t LOOKAHEAD_K = 3;
+    static smoe::scout::ScoutOutput scout_queue[LOOKAHEAD_K];
+    uint32_t sq_head = 0;
+    uint32_t sq_tail = 0;
+    uint32_t sq_size = 0;
 
     for (uint32_t n = 0; n < total_steps; ++n) {
 
         if (n < prompt_len) {
-            cur_token = prompt_tokens[n];
+            heavy_cur_token = prompt_tokens[n];
+            scout_cur_token = heavy_cur_token;
+            sq_size = 0;
+            sq_head = 0;
+            sq_tail = 0;
         }
 
-        // ── Step 1: Scout forward ─────────────────────────────
-        smoe::scout::ScoutOutput scout_out = scout.forward(cur_token);
+        // ── Phase A: Scout Speculative Lookahead ──────────────
+        while (sq_size < LOOKAHEAD_K) {
+            smoe::scout::ScoutOutput sout = scout.forward(scout_cur_token);
+            scout_queue[sq_tail] = sout;
+            sq_tail = (sq_tail + 1) % LOOKAHEAD_K;
+            sq_size++;
 
-        // ── Step 2: Prefetch predicted experts ────────────────
-        for (uint32_t l = 0; l < smoe::NUM_MOE_LAYERS; ++l) {
-            const smoe::scout::ExpertPrediction& pred = scout_out.routing[l];
-            for (uint32_t e = 0; e < pred.count; ++e) {
-                (void)streamer.prefetch(pred.layer_id, pred.expert_ids[e]);
+            // Prefetch the experts predicted by the Scout for this step
+            for (uint32_t l = 0; l < smoe::NUM_MOE_LAYERS; ++l) {
+                const smoe::scout::ExpertPrediction& pred = sout.routing[l];
+                for (uint32_t e = 0; e < pred.count; ++e) {
+                    (void)streamer.prefetch(pred.layer_id, pred.expert_ids[e]);
+                }
             }
+            
+            // Assume the scout is correct and advance it
+            scout_cur_token = sout.next_token_id;
         }
 
-        // ── Step 3: Heavy Model Execution ─────────────────────
+        // ── Phase B: Heavy Model Execution ─────────────────────
+        // Claim the routing map for the current step from the queue head
+        smoe::scout::ScoutOutput scout_out = scout_queue[sq_head];
         static float hidden[2048];
         static float normed[2048];
         static float qbuf[2048];
@@ -434,7 +455,7 @@ int main(int argc, char* argv[]) {
         static float attn_out[2048];
         static float attn_scores[ATTN_CTX];
 
-        std::memcpy(hidden, scout.get_embed() + static_cast<size_t>(cur_token) * 2048, 2048 * sizeof(float));
+        std::memcpy(hidden, scout.get_embed() + static_cast<size_t>(heavy_cur_token) * 2048, 2048 * sizeof(float));
 
         for (uint32_t l = 0; l <= smoe::NUM_MOE_LAYERS; ++l) {
             std::memcpy(normed, hidden, 2048 * sizeof(float));
@@ -587,7 +608,8 @@ int main(int argc, char* argv[]) {
                             expert_output_vec,
                             expert_layout.gate_rows,
                             expert_layout.gate_cols,
-                            vault_hdr.group_size
+                            vault_hdr.group_size,
+                            vault_hdr.bits
                         );
 
                         // Accumulate
@@ -633,15 +655,39 @@ int main(int argc, char* argv[]) {
             }
         }
         
-        cur_token = best_tok;
+        heavy_cur_token = best_tok;
+        uint32_t expected_scout_token = scout_out.next_token_id;
+
+        // ── Phase C: Speculative Divergence Check ─────────────
+        if (heavy_cur_token != expected_scout_token) {
+            // Divergence! Scout guessed wrong.
+            // Rollback scout KV-cache by the number of steps it is currently ahead.
+            // The Scout evaluated the current token (valid) + (sq_size - 1) speculative tokens.
+            if (sq_size > 1) {
+                scout.rollback(sq_size - 1);
+            }
+            
+            // Flush the lookahead queue
+            sq_size = 0;
+            sq_head = 0;
+            sq_tail = 0;
+            
+            // Force the scout back to the true heavy token
+            scout_cur_token = heavy_cur_token;
+        } else {
+            // Scout guessed correctly!
+            // Consume the head of the queue. The scout is still ahead!
+            sq_head = (sq_head + 1) % LOOKAHEAD_K;
+            sq_size--;
+        }
 
         // ── Step 6: Emit token ────────────────────────────────
         bool is_generating = (prompt_len == 0) || (n >= prompt_len - 1);
         if (is_generating) {
-            if (g_vocab_loaded && cur_token < 102400) {
-                std::fputs(g_vocab[cur_token].c_str(), stdout);
+            if (g_vocab_loaded && heavy_cur_token < 102400) {
+                std::fputs(g_vocab[heavy_cur_token].c_str(), stdout);
             } else {
-                unsigned char c = static_cast<unsigned char>(cur_token & 0xFF);
+                unsigned char c = static_cast<unsigned char>(heavy_cur_token & 0xFF);
                 std::fputc(c, stdout);
             }
             std::fflush(stdout);

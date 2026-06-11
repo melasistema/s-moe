@@ -58,8 +58,9 @@ struct SmoeHeader {
     uint32_t total_experts;          // [20]  total entries in the expert table
     uint64_t table_offset;           // [24]  byte offset to the first ExpertEntry
     uint64_t data_offset;            // [32]  byte offset to the first expert blob
-    uint32_t group_size;             // [40]  SMOE-Q2 quantisation group size (= 64)
-    uint8_t  reserved[20];           // [44]  must be zero
+    uint32_t group_size;             // [40]  SMOE quantisation group size (= 64)
+    uint32_t bits;                   // [44]  quantisation bit depth (2 or 4)
+    uint8_t  reserved[16];           // [48]  must be zero
 };                                   // [64]
 
 static_assert(sizeof(SmoeHeader) == 64,

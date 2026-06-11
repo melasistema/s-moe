@@ -91,7 +91,8 @@ void smoe_metal_fused_ffn(SmoeMetalCtx*   ctx,
                            float*          output_vec,
                            uint32_t        rows,
                            uint32_t        cols,
-                           uint32_t        group_size);
+                           uint32_t        group_size,
+                           uint32_t        bits);
 
 // Perform a float32 matrix-vector multiplication on the GPU for Scout projections.
 void smoe_metal_scout_matvec(SmoeMetalCtx* ctx,

@@ -123,8 +123,8 @@ TENSOR_DOWN = 2
 # FILE HEADER — 64 bytes
 #   magic(8s) + version(I) + num_moe_layers(I) + max_experts(I) +
 #   total_experts(I) + table_offset(Q) + data_offset(Q) +
-#   group_size(I) + reserved(20s)
-HEADER_FMT = struct.Struct("<8sIIIIQQI20s")
+#   group_size(I) + bits(I) + reserved(16s)
+HEADER_FMT = struct.Struct("<8sIIIIQQII16s")
 assert HEADER_FMT.size == 64, f"Header size error: {HEADER_FMT.size}"
 
 # EXPERT TABLE ENTRY — 48 bytes
@@ -314,6 +314,97 @@ def measure_q2_error(
 
 
 # ═════════════════════════════════════════════════════════════════
+# QUANTISATION: SMOE-Q4
+# ═════════════════════════════════════════════════════════════════
+
+def quantize_smoeq4(
+    weights: np.ndarray,
+    group_size: int = Q2_GROUP_SIZE,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Quantise a weight tensor to SMOE-Q4 format.
+    Scheme: symmetric group absmax, 16 levels, 4 bits per weight.
+    Packing: 2 codes per byte, LSB-first (bits 0-3, 4-7).
+    """
+    flat = weights.astype(np.float32, copy=False).ravel()
+    n    = len(flat)
+
+    pad_g   = (group_size - (n % group_size)) % group_size
+    padded  = np.pad(flat, (0, pad_g))
+
+    n_groups = len(padded) // group_size
+    grouped  = padded.reshape(n_groups, group_size)
+
+    # ── MSE Scale Optimizer for 4-bit ──
+    absmax = np.max(np.abs(grouped), axis=1, keepdims=True)
+    safe_abs = np.where(absmax == 0.0, 1.0, absmax)
+    
+    ratios = np.linspace(0.1, 1.0, 64, dtype=np.float32).reshape(64, 1, 1)
+    candidate_scales = safe_abs * ratios
+    
+    W = grouped[np.newaxis, :, :]
+    code_float = (W / candidate_scales) * 7.5
+    codes_search = np.clip(np.round(code_float + 7.5), 0, 15)
+    decoded = (codes_search - 7.5) * (1.0 / 7.5) * candidate_scales
+    
+    mse = np.sum((W - decoded) ** 2, axis=2)
+    
+    best_idx = np.argmin(mse, axis=0)
+    best_scales = candidate_scales[best_idx, np.arange(n_groups), 0]
+    scales = best_scales.astype(np.float16)
+
+    safe_best = np.where(best_scales == 0.0, 1.0, best_scales).reshape(n_groups, 1)
+    final_code_float = (grouped / safe_best) * 7.5
+    codes = np.clip(np.round(final_code_float + 7.5).astype(np.int32), 0, 15).astype(np.uint8)
+
+    codes_flat = codes.ravel()[:n]
+    pad_p      = (2 - (len(codes_flat) % 2)) % 2
+    c2         = np.pad(codes_flat, (0, pad_p)).reshape(-1, 2)
+
+    packed = (
+          (c2[:, 0] & 0xF)
+        | ((c2[:, 1] & 0xF) << 4)
+    ).astype(np.uint8)
+
+    return packed, scales
+
+
+def dequantize_smoeq4(
+    packed: np.ndarray,
+    scales: np.ndarray,
+    n_weights: int,
+    group_size: int = Q2_GROUP_SIZE,
+) -> np.ndarray:
+    codes = np.empty(len(packed) * 2, dtype=np.float32)
+    codes[0::2] = ( packed       & 0xF).astype(np.float32)
+    codes[1::2] = ((packed >> 4) & 0xF).astype(np.float32)
+    codes = codes[:n_weights]
+
+    pad     = (group_size - (n_weights % group_size)) % group_size
+    codes_p = np.pad(codes, (0, pad)).reshape(-1, group_size)
+    levels  = (codes_p - 7.5) / 7.5
+    recon   = (levels * scales.astype(np.float32)[:, np.newaxis])
+
+    return recon.ravel()[:n_weights]
+
+
+def measure_q4_error(
+    original: np.ndarray,
+    packed: np.ndarray,
+    scales: np.ndarray,
+) -> dict:
+    orig_flat = original.astype(np.float32).ravel()
+    recon     = dequantize_smoeq4(packed, scales, len(orig_flat))
+    diff      = orig_flat - recon
+    rmse      = float(np.sqrt(np.mean(diff ** 2)))
+    absmax    = float(np.max(np.abs(diff)))
+    var_s     = float(np.var(orig_flat))
+    var_n     = float(np.var(diff))
+    snr_db    = 10.0 * math.log10(max(var_s / max(var_n, 1e-30), 1e-12))
+    return {"rmse": rmse, "absmax_err": absmax, "snr_db": snr_db}
+
+
+# ═════════════════════════════════════════════════════════════════
 # DeepSeek MoE TOPOLOGY DETECTION
 # ═════════════════════════════════════════════════════════════════
 
@@ -396,6 +487,7 @@ def load_expert_tensors(
 def build_expert_blob(
     tensors: dict[str, np.ndarray],
     group_size: int = Q2_GROUP_SIZE,
+    bits: int = 2,
 ) -> tuple[bytes, list[TensorDescriptor]]:
     """
     Quantise and pack the three expert weight tensors into a contiguous byte blob.
@@ -418,7 +510,11 @@ def build_expert_blob(
         rows = w.shape[0]
         cols = w.shape[1] if w.ndim > 1 else 1
 
-        packed, scales = quantize_smoeq2(w, group_size)
+        if bits == 4:
+            packed, scales = quantize_smoeq4(w, group_size)
+        else:
+            packed, scales = quantize_smoeq2(w, group_size)
+            
         pb = packed.tobytes()
         sb = scales.tobytes()   # float16 → 2 bytes per scale
 
@@ -469,6 +565,7 @@ def write_smoe_vault(
     output_path: Path,
     experts: list[ExpertBlob],
     topology: dict,
+    bits: int = 2,
 ) -> dict:
     """
     Serialise all expert blobs into the .smoe binary vault.
@@ -500,7 +597,8 @@ def write_smoe_vault(
             HEADER_FMT.size,    # table_offset: table starts immediately after header
             data_offset,
             Q2_GROUP_SIZE,
-            b"\x00" * 20,       # reserved
+            bits,               # bits
+            b"\x00" * 16,       # reserved
         ))
 
         # ── EXPERT TABLE (N × 48 bytes) ───────────────────────────
@@ -701,8 +799,10 @@ def main() -> None:
                         help="Process only the first N MoE layers (for quick testing)")
     parser.add_argument("--max-experts",   type=int, default=None,
                         help="Process only the first N experts per layer (for quick testing)")
+    parser.add_argument("--bits",          type=int, default=2, choices=[2, 4],
+                        help="Quantisation bit depth: 2 (SMOE-Q2) or 4 (SMOE-Q4)")
     parser.add_argument("--measure-error", action="store_true",
-                        help="Compute Q2 RMSE / SNR for the first expert's gate_proj (slow)")
+                        help="Compute RMSE / SNR for the first expert's gate_proj (slow)")
 
     args = parser.parse_args()
 
@@ -800,7 +900,7 @@ def main() -> None:
                 for arr in tensors.values():
                     total_raw_bytes += arr.nbytes
 
-                blob_bytes, descs = build_expert_blob(tensors, args.group_size)
+                blob_bytes, descs = build_expert_blob(tensors, args.group_size, args.bits)
                 total_q2_bytes += len(blob_bytes)
 
                 # Measure reconstruction error for the very first expert
@@ -808,7 +908,10 @@ def main() -> None:
                     d      = descs[0]    # gate_proj descriptor
                     packed = np.frombuffer(blob_bytes[d.packed_offset: d.packed_offset + d.packed_size], np.uint8)
                     scales = np.frombuffer(blob_bytes[d.scales_offset: d.scales_offset + d.scales_size], np.float16)
-                    error_metrics = measure_q2_error(tensors["gate"].astype(np.float32), packed, scales)
+                    if args.bits == 4:
+                        error_metrics = measure_q4_error(tensors["gate"].astype(np.float32), packed, scales)
+                    else:
+                        error_metrics = measure_q2_error(tensors["gate"].astype(np.float32), packed, scales)
 
                 experts.append(ExpertBlob(
                     layer_id=lid,
@@ -843,7 +946,7 @@ def main() -> None:
     # ── Write vault ───────────────────────────────────────────────
     console.print(f"\n  Writing vault → [bold]{smoe_path.name}[/bold]")
     t_write_start = time.perf_counter()
-    telemetry = write_smoe_vault(smoe_path, experts, topology)
+    telemetry = write_smoe_vault(smoe_path, experts, topology, args.bits)
     t_write = time.perf_counter() - t_write_start
 
     # ── Extract Scout weights ─────────────────────────────────────

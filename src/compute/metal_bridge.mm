@@ -410,15 +410,16 @@ void smoe_metal_fused_ffn(SmoeMetalCtx*   ctx,
                            float*          output_vec,
                            uint32_t        rows,
                            uint32_t        cols,
-                           uint32_t        group_size)
+                           uint32_t        group_size,
+                           uint32_t        bits)
 {
     if (!ctx) return;
 
     // ── Build FusedFFNParams ──────────────────────────────────
     // Stack allocation — not in hot-path alloc-banned zone because
     // this struct is tiny and compiler-stack-allocated.
-    struct FusedFFNParamsC { uint32_t rows, cols, group_size; };
-    FusedFFNParamsC params { rows, cols, group_size };
+    struct FusedFFNParamsC { uint32_t rows, cols, group_size, bits; };
+    FusedFFNParamsC params { rows, cols, group_size, bits };
 
     // ── Wrap raw pointers in MTLBuffers (no-copy) ─────────────
     // newBufferWithBytesNoCopy creates an MTLBuffer view over
@@ -436,7 +437,7 @@ void smoe_metal_fused_ffn(SmoeMetalCtx*   ctx,
     };
 
     // Compute byte sizes for each sub-tensor
-    uint64_t packed_bytes = static_cast<uint64_t>(rows) * cols / 4;   // 2-bit packing
+    uint64_t packed_bytes = static_cast<uint64_t>(rows) * cols * bits / 8;
     uint64_t scale_bytes  = static_cast<uint64_t>(rows) * cols / group_size * sizeof(uint16_t);
     uint64_t input_bytes  = static_cast<uint64_t>(cols)  * sizeof(float);
     uint64_t output_bytes = static_cast<uint64_t>(rows)  * sizeof(float);

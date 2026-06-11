@@ -56,8 +56,12 @@ public:
     ~Scout();
 
     // Run one forward step, updating internal KV-cache context.
-    // Returns next token + K-step expert lookahead.
+    // Returns next token + expert routing for the current token.
     ScoutOutput forward(uint32_t token_id);
+
+    // Rollback the internal KV-cache state by K steps to recover from 
+    // speculative divergence.
+    void rollback(uint32_t steps);
 
     // Reset KV-cache for a new prompt.
     void reset_context();

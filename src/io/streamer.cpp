@@ -131,7 +131,7 @@ public:
     }
 };
 
-static constexpr size_t REQUEST_QUEUE_CAPACITY = 256;  // power of two
+static constexpr size_t REQUEST_QUEUE_CAPACITY = 1024;  // power of two
 
 // ─────────────────────────────────────────────────────────────
 // Streamer::Impl — all private state

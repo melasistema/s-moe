@@ -1155,4 +1155,12 @@ void Scout::reset_context() {
     std::fprintf(stderr, "[scout] Context reset.\n");
 }
 
+void Scout::rollback(uint32_t steps) {
+    if (steps == 0) return;
+    impl_->ctx_pos = (impl_->ctx_pos + ATTN_CTX - steps) % ATTN_CTX;
+    if (impl_->ctx_fill < ATTN_CTX) {
+        impl_->ctx_fill = (impl_->ctx_fill > steps) ? impl_->ctx_fill - steps : 0;
+    }
+}
+
 } // namespace smoe::scout
