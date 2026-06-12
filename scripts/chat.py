@@ -14,6 +14,7 @@ and streams the detokenised outputs in real-time with live telemetry.
 
 import argparse
 import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import subprocess
 import sys
 from pathlib import Path
@@ -42,8 +43,11 @@ def main():
     parser.add_argument("--scout", type=str, default="vault/deepseek-chat.scout.safetensors", help="Path to scout safetensors")
     parser.add_argument("--model", type=str, default="deepseek-ai/DeepSeek-MoE-16B-chat", help="HuggingFace model ID for tokenizer")
     parser.add_argument("--tokens", type=int, default=100, help="Max tokens to generate per response")
-    parser.add_argument("--ring", type=int, default=256, help="Ring buffer slot count")
+    parser.add_argument("--ring", type=int, default=1024, help="Ring buffer slot count")
     parser.add_argument("--workers", type=int, default=4, help="I/O worker thread count")
+    parser.add_argument("--temperature", type=float, default=0.6, help="Sampling temperature")
+    parser.add_argument("--top-p", type=float, default=0.95, help="Top-p sampling")
+    parser.add_argument("--rep-penalty", type=float, default=1.1, help="Repetition penalty")
 
     args = parser.parse_args()
 
@@ -96,12 +100,10 @@ def main():
             # Append to conversational history
             messages.append({"role": "user", "content": prompt})
 
-            # 1. BPE Tokenise input prompt using chat template if available
-            if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template is not None:
-                token_ids = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
-            else:
-                token_ids = tokenizer.encode(prompt, add_special_tokens=True)
-            
+            # 1. BPE Tokenise input prompt. DeepSeek-MoE is highly sensitive
+            # to formatting. We use a single newline before Assistant: to prevent degradation.
+            prompt_str = f"User: {prompt}\nAssistant:"
+            token_ids = tokenizer.encode(prompt_str, add_special_tokens=True)
             token_str = ",".join(map(str, token_ids))
 
             console.print("\n[bold cyan]S-MoE Engine[/bold cyan] ❯", end="")
@@ -115,15 +117,30 @@ def main():
                 "--tokens-in", token_str,
                 "--tokens", str(args.tokens),
                 "--ring", str(args.ring),
-                "--workers", str(args.workers)
+                "--workers", str(args.workers),
+                "--temperature", str(args.temperature),
+                "--top-p", str(args.top_p),
+                "--rep-penalty", str(args.rep_penalty)
             ]
 
-            # Run and let C++ write directly to stdout and stderr
+            # Run and let C++ write directly to stdout and stderr, intercepting to clean BPE chars
             process = subprocess.Popen(
                 cmd,
-                stdout=sys.stdout,
-                stderr=sys.stderr
+                stdout=subprocess.PIPE,
+                stderr=sys.stderr,
+                text=True,
+                bufsize=1
             )
+            for char in iter(lambda: process.stdout.read(1), ''):
+                if char == 'Ġ':
+                    sys.stdout.write(' ')
+                elif char == 'Ċ':
+                    sys.stdout.write('\n')
+                elif char == 'ĉ':
+                    sys.stdout.write('\t')
+                else:
+                    sys.stdout.write(char)
+                sys.stdout.flush()
             process.wait()
             print() # Print newline after output completion
 

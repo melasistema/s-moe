@@ -29,6 +29,18 @@
 #include <cstdio>
 #include <cstring>
 #include <vector>
+#include <cstdlib>
+#include <cstdarg>
+
+static void info_printf(const char* format, ...) {
+    const char* sm_dbg = std::getenv("SMOE_DEBUG");
+    if (sm_dbg && (std::strcmp(sm_dbg, "1") == 0 || std::strcmp(sm_dbg, "true") == 0)) {
+        va_list args;
+        va_start(args, format);
+        std::vfprintf(stderr, format, args);
+        va_end(args);
+    }
+}
 
 // ── Embedded MSL source ───────────────────────────────────────
 // Read at compile time from the adjacent .metal file.
@@ -408,15 +420,24 @@ struct SmoeMetalCtx {
     std::vector<RegisteredBuffer> registered_buffers;
 };
 
-static id<MTLBuffer> get_registered_buffer(SmoeMetalCtx* ctx, const void* ptr, size_t sz) {
+static id<MTLBuffer> get_registered_buffer(SmoeMetalCtx* ctx, const void* ptr, size_t sz, NSUInteger& out_offset) {
+    uintptr_t p = reinterpret_cast<uintptr_t>(ptr);
+    uintptr_t aligned_p = p & ~(smoe::PAGE_SIZE - 1);
+    out_offset = p - aligned_p;
+    const void* aligned_ptr = reinterpret_cast<const void*>(aligned_p);
+
     for (const auto& reg : ctx->registered_buffers) {
-        if (reg.ptr == ptr) return reg.buffer;
+        if (reg.ptr == aligned_ptr) return reg.buffer;
     }
-    size_t aligned = (sz + (smoe::PAGE_SIZE - 1)) & ~(smoe::PAGE_SIZE - 1);
-    return [ctx->device newBufferWithBytesNoCopy:const_cast<void*>(ptr)
-                                          length:aligned
+    size_t aligned_sz = ((p + sz + (smoe::PAGE_SIZE - 1)) & ~(smoe::PAGE_SIZE - 1)) - aligned_p;
+    id<MTLBuffer> buf = [ctx->device newBufferWithBytesNoCopy:const_cast<void*>(aligned_ptr)
+                                          length:aligned_sz
                                          options:MTLResourceStorageModeShared
                                      deallocator:nil];
+    if (buf) {
+        ctx->registered_buffers.push_back({aligned_ptr, buf});
+    }
+    return buf;
 }
 
 // ── Internal helpers ──────────────────────────────────────────
@@ -451,7 +472,7 @@ SmoeMetalCtx* smoe_metal_init(size_t slot_bytes) {
     // ── Step 2: JIT-compile the embedded MSL source ───────────
     // This takes ~200–500 ms on first run; the compiled PSO is
     // cached by the Metal compiler for subsequent launches.
-    std::fprintf(stderr, "[smoe_metal] Compiling SMOE-Q2 kernels (JIT)...\n");
+    info_printf("[smoe_metal] Compiling SMOE-Q2 kernels (JIT)...\n");
 
     NSError*  err    = nil;
     NSString* source = [NSString stringWithUTF8String:kMetalSource];
@@ -469,7 +490,7 @@ SmoeMetalCtx* smoe_metal_init(size_t slot_bytes) {
             [[err localizedDescription] UTF8String]);
         return nullptr;
     }
-    std::fprintf(stderr, "[smoe_metal] Kernel compilation OK.\n");
+    info_printf("[smoe_metal] Kernel compilation OK.\n");
 
     // ── Step 3: build PSOs ────────────────────────────────────
     id<MTLComputePipelineState> gate_up_pso = make_pso(dev, lib, "smoe_gate_up", &err);
@@ -553,7 +574,7 @@ SmoeMetalCtx* smoe_metal_init(size_t slot_bytes) {
     ctx->passive_ready.store(true, std::memory_order_release);
     ctx->dispatch_count.store(0, std::memory_order_relaxed);
 
-    std::fprintf(stderr,
+    info_printf(
         "[smoe_metal] Init OK — slot=%.1f MB, hidden_scratch=%u floats.\n",
         double(slot_bytes) / (1024.0 * 1024.0), max_rows);
 
@@ -730,9 +751,10 @@ void smoe_metal_scout_matvec(SmoeMetalCtx* ctx,
     size_t input_bytes  = static_cast<size_t>(cols) * sizeof(float);
     size_t output_bytes = static_cast<size_t>(rows) * sizeof(float);
 
-    id<MTLBuffer> buf_wt = get_registered_buffer(ctx, weight,     weight_bytes);
-    id<MTLBuffer> buf_in = get_registered_buffer(ctx, input_vec,  input_bytes);
-    id<MTLBuffer> buf_ou = get_registered_buffer(ctx, output_vec, output_bytes);
+    NSUInteger off_wt = 0, off_in = 0, off_ou = 0;
+    id<MTLBuffer> buf_wt = get_registered_buffer(ctx, weight,     weight_bytes, off_wt);
+    id<MTLBuffer> buf_in = get_registered_buffer(ctx, input_vec,  input_bytes,  off_in);
+    id<MTLBuffer> buf_ou = get_registered_buffer(ctx, output_vec, output_bytes, off_ou);
 
     if (!buf_wt || !buf_in || !buf_ou) {
         std::fprintf(stderr, "[smoe_metal] ERROR: failed to wrap matvec pointers.\n");
@@ -749,9 +771,9 @@ void smoe_metal_scout_matvec(SmoeMetalCtx* ctx,
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
 
     [enc setComputePipelineState:ctx->scout_matvec_pso];
-    [enc setBuffer:buf_wt offset:0 atIndex:0];
-    [enc setBuffer:buf_in offset:0 atIndex:1];
-    [enc setBuffer:buf_ou offset:0 atIndex:2];
+    [enc setBuffer:buf_wt offset:off_wt atIndex:0];
+    [enc setBuffer:buf_in offset:off_in atIndex:1];
+    [enc setBuffer:buf_ou offset:off_ou atIndex:2];
     [enc setBuffer:buf_dm offset:0 atIndex:3];
 
     [enc setThreadgroupMemoryLength:cols * sizeof(float) atIndex:0];
@@ -793,9 +815,10 @@ void smoe_metal_scout_matvec_batch(SmoeMetalCtx* ctx,
         size_t input_bytes  = static_cast<size_t>(c) * sizeof(float);
         size_t output_bytes = static_cast<size_t>(r) * sizeof(float);
 
-        id<MTLBuffer> buf_wt = get_registered_buffer(ctx, weights[idx], weight_bytes);
-        id<MTLBuffer> buf_in = get_registered_buffer(ctx, inputs[idx],  input_bytes);
-        id<MTLBuffer> buf_ou = get_registered_buffer(ctx, outputs[idx], output_bytes);
+        NSUInteger off_wt = 0, off_in = 0, off_ou = 0;
+        id<MTLBuffer> buf_wt = get_registered_buffer(ctx, weights[idx], weight_bytes, off_wt);
+        id<MTLBuffer> buf_in = get_registered_buffer(ctx, inputs[idx],  input_bytes,  off_in);
+        id<MTLBuffer> buf_ou = get_registered_buffer(ctx, outputs[idx], output_bytes, off_ou);
 
         if (!buf_wt || !buf_in || !buf_ou) {
             std::fprintf(stderr, "[smoe_metal] ERROR: failed to wrap pointers in batch index %u.\n", idx);
@@ -808,9 +831,9 @@ void smoe_metal_scout_matvec_batch(SmoeMetalCtx* ctx,
                                                         length:sizeof(dims)
                                                        options:uma];
 
-        [enc setBuffer:buf_wt offset:0 atIndex:0];
-        [enc setBuffer:buf_in offset:0 atIndex:1];
-        [enc setBuffer:buf_ou offset:0 atIndex:2];
+        [enc setBuffer:buf_wt offset:off_wt atIndex:0];
+        [enc setBuffer:buf_in offset:off_in atIndex:1];
+        [enc setBuffer:buf_ou offset:off_ou atIndex:2];
         [enc setBuffer:buf_dm offset:0 atIndex:3];
 
         [enc setThreadgroupMemoryLength:c * sizeof(float) atIndex:0];

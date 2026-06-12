@@ -62,6 +62,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cstdarg>
 
 // POSIX / macOS headers for mmap
 #include <fcntl.h>
@@ -70,6 +71,16 @@
 #include <unistd.h>
 
 namespace smoe::scout {
+
+static void info_printf(const char* format, ...) {
+    const char* sm_dbg = std::getenv("SMOE_DEBUG");
+    if (sm_dbg && (std::strcmp(sm_dbg, "1") == 0 || std::strcmp(sm_dbg, "true") == 0)) {
+        va_list args;
+        va_start(args, format);
+        std::vfprintf(stderr, format, args);
+        va_end(args);
+    }
+}
 
 // ═══════════════════════════════════════════════════════════════
 // §1  Compile-time constants
@@ -82,7 +93,7 @@ inline constexpr uint32_t VOCAB_SIZE     = 102400;  // lm_head / embed rows
 inline constexpr uint32_t GATE_ROWS      = 64;      // experts per gate
 
 // Context ring depth for the single-layer attention
-inline constexpr uint32_t ATTN_CTX       = 64;
+inline constexpr uint32_t ATTN_CTX       = 4096;
 
 // ── Heuristic constants (fallback path, unchanged from Week 4) ─
 inline constexpr uint32_t NGRAM_WINDOW    = 4;
@@ -189,7 +200,6 @@ static uint32_t top_k(const float* scores, uint32_t n, uint32_t k,
     }
 
     // Top-k selection
-    float topk_sum = 0.0f;
     for (uint32_t s = 0; s < count; ++s) {
         uint32_t best = s;
         for (uint32_t i = s + 1; i < n; ++i) {
@@ -202,15 +212,6 @@ static uint32_t top_k(const float* scores, uint32_t n, uint32_t k,
         out_indices[s] = idx[s];
         if (out_weights) {
             out_weights[s] = tmp[s];
-            topk_sum += tmp[s];
-        }
-    }
-
-    // DeepSeek MoE routing weight normalization
-    if (out_weights && topk_sum > 0.0f) {
-        float inv_topk_sum = 1.0f / topk_sum;
-        for (uint32_t s = 0; s < count; ++s) {
-            out_weights[s] *= inv_topk_sum;
         }
     }
 
@@ -504,7 +505,7 @@ Scout::Impl::Impl(const char* path, SmoeMetalCtx* metal_ctx) {
         return;
     }
     mmap_size = static_cast<size_t>(st.st_size);
-    std::fprintf(stderr,
+    info_printf(
         "[scout] Loading scout weights: %s  (%.2f GB)\n",
         path, static_cast<double>(mmap_size) / 1e9);
 
@@ -547,7 +548,7 @@ Scout::Impl::Impl(const char* path, SmoeMetalCtx* metal_ctx) {
     // Data region starts immediately after the JSON header
     const uint8_t* data_region = base + 8 + header_len;
 
-    std::fprintf(stderr,
+    info_printf(
         "[scout] Safetensors header: %llu bytes\n",
         static_cast<unsigned long long>(header_len));
 
@@ -635,7 +636,7 @@ Scout::Impl::Impl(const char* path, SmoeMetalCtx* metal_ctx) {
     };
 
     if (ok) {
-        std::fprintf(stderr, "[scout] Loading backbone weights for 28 layers ...\n");
+        info_printf("[scout] Loading backbone weights for 28 layers ...\n");
         ok &= load_tensor("model.embed_tokens.weight", w_embed,   EMBED_ELEMS);
         ok &= load_tensor("lm_head.weight",            w_lm_head, EMBED_ELEMS);
         ok &= load_tensor("model.norm.weight",         w_model_norm, D_MODEL);
@@ -714,7 +715,7 @@ Scout::Impl::Impl(const char* path, SmoeMetalCtx* metal_ctx) {
     }
 
     if (ok && metal_ctx) {
-        std::fprintf(stderr, "[scout] Registering buffers with GPU for zero-copy JIT execution ...\n");
+        info_printf("[scout] Registering buffers with GPU for zero-copy JIT execution ...\n");
         smoe_metal_register_buffer(metal_ctx, w_embed, EMBED_ELEMS * sizeof(float));
         smoe_metal_register_buffer(metal_ctx, w_lm_head, EMBED_ELEMS * sizeof(float));
         
@@ -736,7 +737,7 @@ Scout::Impl::Impl(const char* path, SmoeMetalCtx* metal_ctx) {
     }
 
     neural_mode = true;
-    std::fprintf(stderr,
+    info_printf(
         "[scout] ✓ Neural scout ready (Week 5 · D=%u · vocab=%u · %u MoE gates)\n",
         D_MODEL, VOCAB_SIZE, NUM_MOE_LAYERS);
 }
@@ -914,11 +915,6 @@ ScoutOutput Scout::Impl::neural_forward(uint32_t token_id) noexcept {
             hidden[i] += normed[i];
         }
 
-        if (step == 0 && l == 0) {
-            std::fprintf(stderr, "[DEBUG-SCOUT] step=0 l=0 hidden after attn: %.4f %.4f %.4f %.4f %.4f\n", 
-                         hidden[0], hidden[1], hidden[2], hidden[3], hidden[4]);
-        }
-
         // f. Post-attention RMS norm
         std::memcpy(normed, hidden, D_MODEL * sizeof(float));
         rms_norm(normed, w_post_norm[l], D_MODEL);
@@ -958,10 +954,6 @@ ScoutOutput Scout::Impl::neural_forward(uint32_t token_id) noexcept {
             if (metal_ctx) smoe_metal_scout_matvec(metal_ctx, w_l0_down, l0_gate_out, normed, D_MODEL, 10944);
             else matvec(normed, w_l0_down, l0_gate_out, D_MODEL, 10944);
             for (uint32_t d = 0; d < D_MODEL; ++d) hidden[d] += normed[d];
-            if (step == 0 && l == 0) {
-                std::fprintf(stderr, "[DEBUG-SCOUT] step=0 l=0 hidden after mlp: %.4f %.4f %.4f %.4f %.4f\n", 
-                             hidden[0], hidden[1], hidden[2], hidden[3], hidden[4]);
-            }
         } else {
             static float shared_gate_out[2816];
             static float shared_up_out[2816];
@@ -1011,6 +1003,13 @@ ScoutOutput Scout::Impl::neural_forward(uint32_t token_id) noexcept {
             best_score = lm_head_scores[v];
             best_tok   = v;
         }
+    }
+    const char* sm_dbg = std::getenv("SMOE_DEBUG");
+    if (sm_dbg && (std::strcmp(sm_dbg, "1") == 0 || std::strcmp(sm_dbg, "true") == 0)) {
+        std::fprintf(stderr, "\n[DEBUG SCOUT] step=%llu, token_id=%u -> predicted=%u (score=%f)\n", 
+                     static_cast<unsigned long long>(step), token_id, best_tok, best_score);
+        std::fprintf(stderr, "[DEBUG SCOUT] scores[0..4]: %f, %f, %f, %f, %f\n", 
+                     lm_head_scores[0], lm_head_scores[1], lm_head_scores[2], lm_head_scores[3], lm_head_scores[4]);
     }
     out.next_token_id = best_tok;
 
@@ -1173,7 +1172,7 @@ void Scout::reset_context() {
     }
 
     impl_->step = 0;
-    std::fprintf(stderr, "[scout] Context reset.\n");
+    info_printf("[scout] Context reset.\n");
 }
 
 void Scout::rollback(uint32_t steps) {
@@ -1187,6 +1186,15 @@ void Scout::rollback(uint32_t steps) {
     } else {
         impl_->step = 0;
     }
+}
+
+void Scout::write_kv_cache(uint32_t layer, uint32_t slot, const float* k, const float* v) {
+    if (!impl_->neural_mode) return;
+    if (layer >= 28 || slot >= ATTN_CTX) return;
+    float* layer_k = impl_->k_cache + (layer * ATTN_CTX + slot) * D_MODEL;
+    float* layer_v = impl_->v_cache + (layer * ATTN_CTX + slot) * D_MODEL;
+    std::memcpy(layer_k, k, D_MODEL * sizeof(float));
+    std::memcpy(layer_v, v, D_MODEL * sizeof(float));
 }
 
 } // namespace smoe::scout

@@ -51,9 +51,9 @@ enum class SlotState : uint32_t {
 // ─────────────────────────────────────────────────────────────
 struct alignas(64) RingSlot {
     std::atomic<SlotState> state     { SlotState::EMPTY };
-    uint32_t               layer_id  { 0 };
-    uint32_t               expert_id { 0 };
-    uint32_t               _pad0     { 0 };
+    uint32_t               layer_id  { 0xFFFFFFFF };
+    uint32_t               expert_id { 0xFFFFFFFF };
+    std::atomic<uint32_t>  ref_count { 0 };
     uint8_t*               data      { nullptr };  // posix_memalign 16 KB-aligned
     uint64_t               data_size { 0 };        // bytes actually loaded by pread()
     uint8_t                _pad1[32] {};
@@ -113,6 +113,10 @@ public:
     // Zero allocations.
     void release(RingSlot* slot) noexcept;
 
+    // Reclaim/garbage collect any READY slots whose (layer, expert) is NOT active.
+    // Zero allocations.
+    void prune_slots(bool (*is_active)(uint32_t, uint32_t, void*), void* ctx) noexcept;
+
     // Gracefully stop all worker threads and join them.
     void shutdown() noexcept;
 
@@ -122,6 +126,7 @@ public:
     [[nodiscard]] uint64_t miss_count()   const noexcept;
     [[nodiscard]] uint32_t ring_size()    const noexcept;
     [[nodiscard]] uint32_t ready_count()  const noexcept;
+    void print_debug_states()             const noexcept;
 
     Streamer(const Streamer&)            = delete;
     Streamer& operator=(const Streamer&) = delete;

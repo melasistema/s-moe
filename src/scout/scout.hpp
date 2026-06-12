@@ -66,6 +66,9 @@ public:
     // Reset KV-cache for a new prompt.
     void reset_context();
 
+    // Write key/value directly to the Scout's KV cache to keep it in sync with Heavy model.
+    void write_kv_cache(uint32_t layer, uint32_t slot, const float* k, const float* v);
+
     // ── Getters for full-model execution ────────────────────────
     const float* get_embed() const noexcept;
     const float* get_lm_head() const noexcept;

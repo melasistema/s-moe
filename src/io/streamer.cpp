@@ -129,6 +129,9 @@ public:
             }
         }
     }
+
+    size_t get_enqueue_pos() const noexcept { return enqueue_pos_.load(std::memory_order_relaxed); }
+    size_t get_dequeue_pos() const noexcept { return dequeue_pos_.load(std::memory_order_relaxed); }
 };
 
 static constexpr size_t REQUEST_QUEUE_CAPACITY = 1024;  // power of two
@@ -299,6 +302,7 @@ void Streamer::Impl::run(Impl* impl, uint32_t worker_id)
         // this slot exclusively (state == LOADING).
         slot->layer_id   = req.layer_id;
         slot->expert_id  = req.expert_id;
+        slot->ref_count.store(1, std::memory_order_relaxed);
         slot->data_size  = static_cast<uint64_t>(n);
 
         // Release fence: all prior writes must be visible to any thread
@@ -421,6 +425,7 @@ bool Streamer::prefetch(uint32_t layer_id, uint32_t expert_id) noexcept {
             im.slots[i].layer_id  == layer_id &&
             im.slots[i].expert_id == expert_id)
         {
+            im.slots[i].ref_count.fetch_add(1, std::memory_order_relaxed);
             return true;  // already queued or ready — no duplicate load
         }
     }
@@ -433,10 +438,17 @@ bool Streamer::prefetch(uint32_t layer_id, uint32_t expert_id) noexcept {
             break;
         }
     }
-    if (!has_empty) return false;
+    if (!has_empty) {
+        std::fprintf(stderr, "[DEBUG] prefetch failed: no empty slots!\n");
+        return false;
+    }
 
     // ── Enqueue the request ───────────────────────────────────
-    return im.request_queue.push({ layer_id, expert_id });
+    bool ok = im.request_queue.push({ layer_id, expert_id });
+    if (!ok) {
+        std::fprintf(stderr, "[DEBUG] prefetch failed: request queue full!\n");
+    }
+    return ok;
 }
 
 RingSlot* Streamer::claim_ready() noexcept {
@@ -469,17 +481,38 @@ RingSlot* Streamer::claim_specific(uint32_t layer_id, uint32_t expert_id) noexce
             {
                 return &im.slots[i];
             }
+            if (im.slots[i].state.load(std::memory_order_acquire) == SlotState::CONSUMED) {
+                return &im.slots[i];
+            }
         }
     }
     return nullptr;
 }
 
 void Streamer::release(RingSlot* slot) noexcept {
-    // The caller (Metal bridge) calls this after the GPU kernel finishes.
-    // Atomically reclaim: CONSUMED → EMPTY.
-    // The release fence makes the slot's data region reusable by workers.
-    slot->data_size = 0;
-    slot->state.store(SlotState::EMPTY, std::memory_order_release);
+    // Atomically decrement ref_count. Only release to EMPTY if it drops to 0.
+    if (slot->ref_count.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        slot->data_size = 0;
+        slot->layer_id = 0xFFFFFFFF;
+        slot->expert_id = 0xFFFFFFFF;
+        slot->state.store(SlotState::EMPTY, std::memory_order_release);
+    }
+}
+
+void Streamer::prune_slots(bool (*is_active)(uint32_t, uint32_t, void*), void* ctx) noexcept {
+    Impl& im = *impl_;
+    for (uint32_t i = 0; i < im.ring_sz; ++i) {
+        SlotState s = im.slots[i].state.load(std::memory_order_relaxed);
+        if (s == SlotState::READY || s == SlotState::CONSUMED) {
+            if (!is_active(im.slots[i].layer_id, im.slots[i].expert_id, ctx)) {
+                im.slots[i].ref_count.store(0, std::memory_order_relaxed);
+                im.slots[i].data_size = 0;
+                im.slots[i].layer_id = 0xFFFFFFFF;
+                im.slots[i].expert_id = 0xFFFFFFFF;
+                im.slots[i].state.store(SlotState::EMPTY, std::memory_order_release);
+            }
+        }
+    }
 }
 
 // ── Telemetry getters ─────────────────────────────────────────
@@ -507,6 +540,30 @@ uint32_t Streamer::ready_count() const noexcept {
             ++n;
     }
     return n;
+}
+
+void Streamer::print_debug_states() const noexcept {
+    uint32_t states[4] = {0};
+    for (uint32_t i = 0; i < impl_->ring_sz; ++i) {
+        SlotState s = impl_->slots[i].state.load(std::memory_order_relaxed);
+        states[static_cast<int>(s)]++;
+    }
+    size_t eq = impl_->request_queue.get_enqueue_pos();
+    size_t dq = impl_->request_queue.get_dequeue_pos();
+    std::fprintf(stderr, "[DEBUG RING] EMPTY=%u LOADING=%u READY=%u CONSUMED=%u | QUEUE eq=%zu dq=%zu\n",
+                 states[0], states[1], states[2], states[3], eq, dq);
+    
+    for (uint32_t i = 0; i < impl_->ring_sz; ++i) {
+        SlotState s = impl_->slots[i].state.load(std::memory_order_relaxed);
+        if (s != SlotState::EMPTY) {
+            std::fprintf(stderr, "  Slot[%u]: state=%u L%u E%u ref=%u\n",
+                         i, static_cast<uint32_t>(s),
+                         impl_->slots[i].layer_id,
+                         impl_->slots[i].expert_id,
+                         impl_->slots[i].ref_count.load(std::memory_order_relaxed));
+        }
+    }
+    std::fflush(stderr);
 }
 
 } // namespace smoe::io

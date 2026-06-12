@@ -35,7 +35,7 @@
 #include <algorithm>
 
 // ── Compile-time defaults ─────────────────────────────────────
-inline constexpr uint32_t DEFAULT_RING_SIZE    = 256;
+inline constexpr uint32_t DEFAULT_RING_SIZE    = 1024;
 inline constexpr uint32_t DEFAULT_WORKERS      = 4;
 inline constexpr uint64_t DEFAULT_SLOT_MB      = 8;
 inline constexpr uint32_t DEFAULT_MAX_TOKENS   = 512;
@@ -221,6 +221,7 @@ static bool read_expert_layout(const char* vault_path, const smoe::SmoeHeader& h
 
 static bool g_vocab_loaded = false;
 static std::string g_vocab[102400];
+static bool g_debug = false;
 
 static void load_vocab(const char* vocab_bin_path) {
     FILE* f = std::fopen(vocab_bin_path, "rb");
@@ -241,7 +242,9 @@ static void load_vocab(const char* vocab_bin_path) {
     std::fclose(f);
     if (loaded == 102400) {
         g_vocab_loaded = true;
-        std::fprintf(stderr, "[vocab] ✓ Loaded 102,400 tokens from '%s'\n", vocab_bin_path);
+        if (g_debug) {
+            std::fprintf(stderr, "[vocab] ✓ Loaded 102,400 tokens from '%s'\n", vocab_bin_path);
+        }
     } else {
         std::fprintf(stderr, "[vocab] ⚠ Only loaded %u/102,400 tokens\n", loaded);
     }
@@ -310,26 +313,31 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    const char* sm_dbg = std::getenv("SMOE_DEBUG");
+    g_debug = sm_dbg && (std::strcmp(sm_dbg, "1") == 0 || std::strcmp(sm_dbg, "true") == 0);
+
     // ── Vault header read ─────────────────────────────────────
     smoe::SmoeHeader vault_hdr {};
     if (!read_vault_header(vault_path, vault_hdr)) return 1;
 
-    std::fprintf(stderr,
-        "\n"
-        "  S-MoE Engine — Week 4 Heuristic Build\n"
-        "  ───────────────────────────────────────\n"
-        "  Vault      : %s\n"
-        "  MoE layers : %u\n"
-        "  Experts/L  : %u  (total: %u)\n"
-        "  Ring slots : %u × %llu MB\n"
-        "  Workers    : %u\n"
-        "\n",
-        vault_path,
-        vault_hdr.num_moe_layers,
-        vault_hdr.max_experts_per_layer,
-        vault_hdr.total_experts,
-        ring_size, slot_mb,
-        num_workers);
+    if (g_debug) {
+        std::fprintf(stderr,
+            "\n"
+            "  S-MoE Engine — Week 4 Heuristic Build\n"
+            "  ───────────────────────────────────────\n"
+            "  Vault      : %s\n"
+            "  MoE layers : %u\n"
+            "  Experts/L  : %u  (total: %u)\n"
+            "  Ring slots : %u × %llu MB\n"
+            "  Workers    : %u\n"
+            "\n",
+            vault_path,
+            vault_hdr.num_moe_layers,
+            vault_hdr.max_experts_per_layer,
+            vault_hdr.total_experts,
+            ring_size, slot_mb,
+            num_workers);
+    }
 
     ExpertLayout expert_layout {};
     if (!read_expert_layout(vault_path, vault_hdr, expert_layout)) {
@@ -392,14 +400,16 @@ int main(int argc, char* argv[]) {
     std::mt19937 rng(1337); // Fixed seed for deterministic debug, can be randomized later
 
     // ── Print prompt passthrough ──────────────────────────────
-    std::fprintf(stdout, "\n");
-    for (uint32_t i = 0; i < prompt_len; ++i) {
-        uint32_t tok = prompt_tokens[i];
-        if (g_vocab_loaded && tok < 102400) {
-            std::fputs(g_vocab[tok].c_str(), stdout);
-        } else {
-            unsigned char c = static_cast<unsigned char>(tok & 0xFF);
-            std::fputc(c, stdout);
+    if (g_debug) {
+        std::fprintf(stdout, "\n");
+        for (uint32_t i = 0; i < prompt_len; ++i) {
+            uint32_t tok = prompt_tokens[i];
+            if (g_vocab_loaded && tok < 102400) {
+                std::fputs(g_vocab[tok].c_str(), stdout);
+            } else {
+                unsigned char c = static_cast<unsigned char>(tok & 0xFF);
+                std::fputc(c, stdout);
+            }
         }
     }
 
@@ -433,18 +443,52 @@ int main(int argc, char* argv[]) {
     uint32_t sq_tail = 0;
     uint32_t sq_size = 0;
 
-    for (uint32_t n = 0; n < total_steps; ++n) {
+    struct ActiveExpertsContext {
+        const smoe::scout::ScoutOutput* queue;
+        uint32_t head;
+        uint32_t size;
+    };
 
-        if (n < prompt_len) {
+    auto is_expert_active = [](uint32_t layer_id, uint32_t expert_id, void* ctx) -> bool {
+        auto* c = static_cast<ActiveExpertsContext*>(ctx);
+        for (uint32_t i = 0; i < c->size; ++i) {
+            uint32_t idx = (c->head + i) % 3; // LOOKAHEAD_K
+            const auto& scout_out = c->queue[idx];
+            if (layer_id == 0) continue;
+            if (layer_id - 1 < smoe::NUM_MOE_LAYERS) {
+                const auto& pred = scout_out.routing[layer_id - 1];
+                for (uint32_t e = 0; e < pred.count; ++e) {
+                    if (pred.expert_ids[e] == expert_id) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    };
+
+    for (uint32_t n = 0; n < total_steps; ++n) {
+        bool is_prompt = (n < prompt_len);
+
+        if (is_prompt) {
             heavy_cur_token = prompt_tokens[n];
             scout_cur_token = heavy_cur_token;
+            // During prompt, we do not lookahead. We only evaluate the exact token.
             sq_size = 0;
             sq_head = 0;
             sq_tail = 0;
         }
 
+        // Clean up any leaked/discarded slots in the streamer
+        {
+            ActiveExpertsContext act_ctx { scout_queue, sq_head, sq_size };
+            streamer.prune_slots(is_expert_active, &act_ctx);
+        }
+
         // ── Phase A: Scout Speculative Lookahead ──────────────
-        while (sq_size < LOOKAHEAD_K) {
+        uint32_t target_sq_size = is_prompt ? 1 : LOOKAHEAD_K;
+
+        while (sq_size < target_sq_size) {
             smoe::scout::ScoutOutput sout = scout.forward(scout_cur_token);
             scout_queue[sq_tail] = sout;
             sq_tail = (sq_tail + 1) % LOOKAHEAD_K;
@@ -509,6 +553,7 @@ int main(int argc, char* argv[]) {
             const uint32_t slot = ctx_pos % ATTN_CTX;
             std::memcpy(k_cache + slot * 2048, kbuf, 2048 * sizeof(float));
             std::memcpy(v_cache + slot * 2048, vbuf, 2048 * sizeof(float));
+            scout.write_kv_cache(l, slot, kbuf, vbuf);
 
             // Multi-Head Attention CPU
             const float scale = 1.0f / std::sqrt(128.0f);
@@ -595,19 +640,25 @@ int main(int argc, char* argv[]) {
                 std::memset(routed_out, 0, 2048 * sizeof(float));
 
                 const smoe::scout::ExpertPrediction& pred = scout_out.routing[l - 1];
-                if (l == 1) {
-                    std::fprintf(stderr, "\n[DEBUG] Layer 1 experts: [");
-                    for (uint32_t e = 0; e < pred.count; ++e) {
-                        std::fprintf(stderr, "%d%s", pred.expert_ids[e], e == pred.count - 1 ? "]" : ", ");
-                    }
-                    std::fprintf(stderr, "\n");
-                }
                 for (uint32_t e = 0; e < pred.count; ++e) {
                     smoe::io::RingSlot* slot = nullptr;
-                    // Wait for specific slot to become READY
-                    for (int spin = 0; spin < 2000 && !slot; ++spin) {
+                    // Wait indefinitely for specific slot to become READY (SSD can take ~100ms)
+                    uint64_t spin = 0;
+                    while (!slot) {
                         slot = streamer.claim_specific(pred.layer_id, pred.expert_ids[e]);
-                        if (!slot) std::this_thread::yield();
+                        if (!slot) {
+                            std::this_thread::yield();
+                            spin++;
+                            if (spin == 5000000) {
+                                std::fprintf(stderr, "\n[HANG] Waiting for L%u E%u (ready_count=%u, hits=%llu, misses=%llu)\n",
+                                             pred.layer_id, pred.expert_ids[e],
+                                             streamer.ready_count(),
+                                             streamer.hit_count(),
+                                             streamer.miss_count());
+                                streamer.print_debug_states();
+                                std::fflush(stderr);
+                            }
+                        }
                     }
 
                     if (slot && slot->data_size > 0) {
@@ -742,10 +793,15 @@ int main(int argc, char* argv[]) {
         }
         
         heavy_cur_token = best_tok;
-        if (history_len < 8192) {
+        bool is_generating = (prompt_len == 0) || (n >= prompt_len - 1);
+        if (is_generating && history_len < 8192) {
             token_history[history_len++] = heavy_cur_token;
         }
         uint32_t expected_scout_token = scout_out.next_token_id;
+        if (g_debug) {
+            std::fprintf(stderr, "[Scout:%u] ", expected_scout_token);
+            std::fflush(stderr);
+        }
 
         // ── Phase C: Speculative Divergence Check ─────────────
         if (heavy_cur_token != expected_scout_token) {
@@ -763,6 +819,10 @@ int main(int argc, char* argv[]) {
             
             // Force the scout back to the true heavy token
             scout_cur_token = heavy_cur_token;
+
+            // Immediately prune discarded experts
+            ActiveExpertsContext act_ctx { scout_queue, sq_head, sq_size };
+            streamer.prune_slots(is_expert_active, &act_ctx);
         } else {
             // Scout guessed correctly!
             // Consume the head of the queue. The scout is still ahead!
@@ -771,7 +831,7 @@ int main(int argc, char* argv[]) {
         }
 
         // ── Step 6: Emit token ────────────────────────────────
-        bool is_generating = (prompt_len == 0) || (n >= prompt_len - 1);
+        is_generating = (prompt_len == 0) || (n >= prompt_len - 1);
         if (is_generating) {
             if (g_vocab_loaded && heavy_cur_token < 102400) {
                 std::fputs(g_vocab[heavy_cur_token].c_str(), stdout);
@@ -783,7 +843,7 @@ int main(int argc, char* argv[]) {
         }
 
         // ── Step 7: Telemetry ─────────────────────────────────
-        if (is_generating && ((n + 1) % TELEMETRY_EVERY == 0)) {
+        if (g_debug && is_generating && ((n + 1) % TELEMETRY_EVERY == 0)) {
             print_telemetry(n + 1 - (prompt_len > 0 ? prompt_len - 1 : 0), streamer, ts);
         }
     }
@@ -791,19 +851,21 @@ int main(int argc, char* argv[]) {
     smoe::free_aligned_float(full_kv_cache);
 
     // Final telemetry flush
-    print_telemetry(max_tokens, streamer, ts);
-    std::fprintf(stderr, "\n\n");
+    if (g_debug) {
+        print_telemetry(max_tokens, streamer, ts);
+        std::fprintf(stderr, "\n\n");
 
-    // Print final stats
-    std::fprintf(stderr,
-        "  ─────────────────────────────────────────\n"
-        "  Tokens generated : %u\n"
-        "  Bytes read       : %.2f GB\n"
-        "  Kernel dispatches: %llu\n"
-        "  ─────────────────────────────────────────\n\n",
-        max_tokens,
-        double(streamer.bytes_read()) / 1e9,
-        static_cast<unsigned long long>(smoe_metal_kernel_dispatches(metal)));
+        // Print final stats
+        std::fprintf(stderr,
+            "  ─────────────────────────────────────────\n"
+            "  Tokens generated : %u\n"
+            "  Bytes read       : %.2f GB\n"
+            "  Kernel dispatches: %llu\n"
+            "  ─────────────────────────────────────────\n\n",
+            max_tokens,
+            double(streamer.bytes_read()) / 1e9,
+            static_cast<unsigned long long>(smoe_metal_kernel_dispatches(metal)));
+    }
 
     // ── Shutdown ──────────────────────────────────────────────
     streamer.shutdown();
