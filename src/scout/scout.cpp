@@ -189,6 +189,7 @@ static uint32_t top_k(const float* scores, uint32_t n, uint32_t k,
     }
 
     // Top-k selection
+    float topk_sum = 0.0f;
     for (uint32_t s = 0; s < count; ++s) {
         uint32_t best = s;
         for (uint32_t i = s + 1; i < n; ++i) {
@@ -199,8 +200,20 @@ static uint32_t top_k(const float* scores, uint32_t n, uint32_t k,
         uint32_t it = idx[s]; idx[s] = idx[best]; idx[best] = it;
         
         out_indices[s] = idx[s];
-        if (out_weights) out_weights[s] = tmp[s];
+        if (out_weights) {
+            out_weights[s] = tmp[s];
+            topk_sum += tmp[s];
+        }
     }
+
+    // DeepSeek MoE routing weight normalization
+    if (out_weights && topk_sum > 0.0f) {
+        float inv_topk_sum = 1.0f / topk_sum;
+        for (uint32_t s = 0; s < count; ++s) {
+            out_weights[s] *= inv_topk_sum;
+        }
+    }
+
     return count;
 }
 
