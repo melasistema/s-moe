@@ -31,6 +31,8 @@
 #include <mach/mach.h>
 #include <thread>
 #include <unistd.h>
+#include <random>
+#include <algorithm>
 
 // ── Compile-time defaults ─────────────────────────────────────
 inline constexpr uint32_t DEFAULT_RING_SIZE    = 256;
@@ -275,6 +277,9 @@ int main(int argc, char* argv[]) {
     uint32_t    ring_size   = DEFAULT_RING_SIZE;
     uint32_t    num_workers = DEFAULT_WORKERS;
     uint64_t    slot_mb     = DEFAULT_SLOT_MB;
+    float       temperature = 0.6f;
+    float       top_p       = 0.95f;
+    float       rep_penalty = 1.1f;
 
     for (int i = 1; i < argc; ++i) {
         auto arg = [&](const char* flag) {
@@ -288,6 +293,9 @@ int main(int argc, char* argv[]) {
         else if (arg("--ring"))      { ring_size   = static_cast<uint32_t>(std::atoi(argv[++i])); }
         else if (arg("--workers"))   { num_workers = static_cast<uint32_t>(std::atoi(argv[++i])); }
         else if (arg("--slot-mb"))   { slot_mb     = static_cast<uint64_t>(std::atoll(argv[++i])); }
+        else if (arg("--temperature")){ temperature = static_cast<float>(std::atof(argv[++i])); }
+        else if (arg("--top-p"))     { top_p       = static_cast<float>(std::atof(argv[++i])); }
+        else if (arg("--rep-penalty")){ rep_penalty = static_cast<float>(std::atof(argv[++i])); }
         else if (std::strcmp(argv[i], "--help") == 0 ||
                  std::strcmp(argv[i], "-h")     == 0) {
             print_usage(argv[0]);
@@ -372,6 +380,16 @@ int main(int argc, char* argv[]) {
     ts.start_ms   = wall_ms();
     ts.prev_ms    = ts.start_ms;
     ts.prev_bytes = 0;
+
+    // ── Sampling state ────────────────────────────────────────
+    static uint32_t token_history[8192];
+    uint32_t history_len = 0;
+    for (uint32_t i = 0; i < prompt_len; ++i) {
+        if (history_len < 8192) {
+            token_history[history_len++] = prompt_tokens[i];
+        }
+    }
+    std::mt19937 rng(1337); // Fixed seed for deterministic debug, can be randomized later
 
     // ── Print prompt passthrough ──────────────────────────────
     std::fprintf(stdout, "\n");
@@ -654,15 +672,79 @@ int main(int argc, char* argv[]) {
         // Process lm_head result
         float* scores = scout.get_lm_head_scores();
         uint32_t best_tok   = 0;
-        float    best_score = -1e38f;
-        for (uint32_t v = 0; v < 102400; ++v) {
-            if (scores[v] > best_score) {
-                best_score = scores[v];
-                best_tok   = v;
+        
+        // Repetition penalty
+        if (rep_penalty != 1.0f) {
+            for (uint32_t i = 0; i < history_len; ++i) {
+                uint32_t tok = token_history[i];
+                if (scores[tok] <= 0) {
+                    scores[tok] *= rep_penalty;
+                } else {
+                    scores[tok] /= rep_penalty;
+                }
+            }
+        }
+
+        if (temperature < 1e-4f) {
+            // Greedy
+            float best_score = -1e38f;
+            for (uint32_t v = 0; v < 102400; ++v) {
+                if (scores[v] > best_score) {
+                    best_score = scores[v];
+                    best_tok   = v;
+                }
+            }
+        } else {
+            // Temperature + Top-p
+            float max_score = scores[0];
+            for (uint32_t v = 1; v < 102400; ++v) {
+                if (scores[v] > max_score) max_score = scores[v];
+            }
+            
+            float sum_exp = 0.0f;
+            struct ProbTok { float p; uint32_t v; };
+            static ProbTok probs[102400];
+            
+            for (uint32_t v = 0; v < 102400; ++v) {
+                probs[v].v = v;
+                probs[v].p = std::exp((scores[v] - max_score) / temperature);
+                sum_exp += probs[v].p;
+            }
+            
+            float inv_sum = 1.0f / sum_exp;
+            for (uint32_t v = 0; v < 102400; ++v) {
+                probs[v].p *= inv_sum;
+            }
+            
+            std::sort(probs, probs + 102400, [](const ProbTok& a, const ProbTok& b) {
+                return a.p > b.p;
+            });
+            
+            float cumsum = 0.0f;
+            uint32_t top_k_len = 0;
+            for (uint32_t v = 0; v < 102400; ++v) {
+                cumsum += probs[v].p;
+                top_k_len++;
+                if (cumsum >= top_p) break;
+            }
+            
+            std::uniform_real_distribution<float> dist(0.0f, cumsum);
+            float r = dist(rng);
+            float running = 0.0f;
+            best_tok = probs[top_k_len - 1].v;
+            for (uint32_t v = 0; v < top_k_len; ++v) {
+                running += probs[v].p;
+                if (r <= running) {
+                    best_tok = probs[v].v;
+                    break;
+                }
             }
         }
         
         heavy_cur_token = best_tok;
+        if (history_len < 8192) {
+            token_history[history_len++] = heavy_cur_token;
+        }
         uint32_t expected_scout_token = scout_out.next_token_id;
 
         // ── Phase C: Speculative Divergence Check ─────────────
