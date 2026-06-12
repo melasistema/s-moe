@@ -536,8 +536,8 @@ int main(int argc, char* argv[]) {
 
             // O Proj and Residual
             smoe::matvec(normed, scout.get_o_proj(l), attn_out, 2048, 2048);
-            for (uint32_t d = 0; d < 2048; ++d) {
-                hidden[d] += normed[d];
+            for (uint32_t i = 0; i < 2048; ++i) {
+                hidden[i] += normed[i];
             }
 
             // FFN Norm
@@ -577,6 +577,13 @@ int main(int argc, char* argv[]) {
                 std::memset(routed_out, 0, 2048 * sizeof(float));
 
                 const smoe::scout::ExpertPrediction& pred = scout_out.routing[l - 1];
+                if (l == 1) {
+                    std::fprintf(stderr, "\n[DEBUG] Layer 1 experts: [");
+                    for (uint32_t e = 0; e < pred.count; ++e) {
+                        std::fprintf(stderr, "%d%s", pred.expert_ids[e], e == pred.count - 1 ? "]" : ", ");
+                    }
+                    std::fprintf(stderr, "\n");
+                }
                 for (uint32_t e = 0; e < pred.count; ++e) {
                     smoe::io::RingSlot* slot = nullptr;
                     // Wait for specific slot to become READY

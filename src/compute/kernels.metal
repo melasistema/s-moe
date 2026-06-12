@@ -79,15 +79,15 @@ inline float smoeq4_dequant(
     uint wi,
     uint group_size)
 {
-    uint    pack_idx  = wi >> 1;                        // wi / 2
-    uint    bit_shift = (wi & 1u) << 2u;               // (wi % 2) * 4
+    uint    pack_idx  = wi >> 2;                        // wi / 4
+    uint    bit_shift = (wi & 3u) << 1u;               // (wi % 4) * 2
     uint    group_idx = wi / group_size;
 
-    uint8_t code  = (packed[pack_idx] >> bit_shift) & 0xFu;
+    uint8_t code  = (packed[pack_idx] >> bit_shift) & 0x3u;
     float   scale = float(scales[group_idx]);
 
-    // Affine mapping: centre 0–15 around zero, then scale
-    return ((float(code) - 7.5f) * (1.0f / 7.5f)) * scale;
+    // Affine mapping: centre 0-3 around 1.5, then scale
+    return ((float(code) - 1.5f) * 0.666666667f) * scale;
 }
 
 // ── Fused Gate+Up+Down FFN kernel ────────────────────────────

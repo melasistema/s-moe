@@ -335,26 +335,14 @@ def quantize_smoeq4(
     n_groups = len(padded) // group_size
     grouped  = padded.reshape(n_groups, group_size)
 
-    # ── MSE Scale Optimizer for 4-bit ──
+    # ── Standard Absmax Optimizer for 4-bit ──
+    # Unlike 2-bit, 4-bit has 16 bins, making standard absmax perfectly
+    # sufficient and ~100x faster than a massive 64-way grid search.
     absmax = np.max(np.abs(grouped), axis=1, keepdims=True)
-    safe_abs = np.where(absmax == 0.0, 1.0, absmax)
-    
-    ratios = np.linspace(0.1, 1.0, 64, dtype=np.float32).reshape(64, 1, 1)
-    candidate_scales = safe_abs * ratios
-    
-    W = grouped[np.newaxis, :, :]
-    code_float = (W / candidate_scales) * 7.5
-    codes_search = np.clip(np.round(code_float + 7.5), 0, 15)
-    decoded = (codes_search - 7.5) * (1.0 / 7.5) * candidate_scales
-    
-    mse = np.sum((W - decoded) ** 2, axis=2)
-    
-    best_idx = np.argmin(mse, axis=0)
-    best_scales = candidate_scales[best_idx, np.arange(n_groups), 0]
-    scales = best_scales.astype(np.float16)
+    best_scales = np.where(absmax == 0.0, 1.0, absmax)
+    scales = best_scales.astype(np.float16).ravel()
 
-    safe_best = np.where(best_scales == 0.0, 1.0, best_scales).reshape(n_groups, 1)
-    final_code_float = (grouped / safe_best) * 7.5
+    final_code_float = (grouped / best_scales) * 7.5
     codes = np.clip(np.round(final_code_float + 7.5).astype(np.int32), 0, 15).astype(np.uint8)
 
     codes_flat = codes.ravel()[:n]

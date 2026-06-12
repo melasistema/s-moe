@@ -892,13 +892,19 @@ ScoutOutput Scout::Impl::neural_forward(uint32_t token_id) noexcept {
             }
         }
 
-        // e. Output projection + residual
         if (metal_ctx) {
             smoe_metal_scout_matvec(metal_ctx, w_o_proj[l], attn_out, normed, D_MODEL, D_MODEL);
         } else {
             matvec(normed, w_o_proj[l], attn_out, D_MODEL, D_MODEL);
         }
-        for (uint32_t d = 0; d < D_MODEL; ++d) hidden[d] += normed[d];
+        for (uint32_t i = 0; i < D_MODEL; ++i) {
+            hidden[i] += normed[i];
+        }
+
+        if (step == 0 && l == 0) {
+            std::fprintf(stderr, "[DEBUG-SCOUT] step=0 l=0 hidden after attn: %.4f %.4f %.4f %.4f %.4f\n", 
+                         hidden[0], hidden[1], hidden[2], hidden[3], hidden[4]);
+        }
 
         // f. Post-attention RMS norm
         std::memcpy(normed, hidden, D_MODEL * sizeof(float));
@@ -909,13 +915,11 @@ ScoutOutput Scout::Impl::neural_forward(uint32_t token_id) noexcept {
             ExpertPrediction& pred = out.routing[l - 1];
             pred.layer_id = l;
             float* scores = gate_scores_batch + (l - 1) * GATE_ROWS;
-            
             if (metal_ctx) {
                 smoe_metal_scout_matvec(metal_ctx, gate_w[l - 1], normed, scores, GATE_ROWS, D_MODEL);
             } else {
                 matvec(scores, gate_w[l - 1], normed, GATE_ROWS, D_MODEL);
             }
-            softmax(scores, GATE_ROWS);
             pred.count = top_k(scores, GATE_ROWS, MAX_ACTIVE, pred.expert_ids, pred.expert_weights);
         }
 
@@ -941,6 +945,10 @@ ScoutOutput Scout::Impl::neural_forward(uint32_t token_id) noexcept {
             if (metal_ctx) smoe_metal_scout_matvec(metal_ctx, w_l0_down, l0_gate_out, normed, D_MODEL, 10944);
             else matvec(normed, w_l0_down, l0_gate_out, D_MODEL, 10944);
             for (uint32_t d = 0; d < D_MODEL; ++d) hidden[d] += normed[d];
+            if (step == 0 && l == 0) {
+                std::fprintf(stderr, "[DEBUG-SCOUT] step=0 l=0 hidden after mlp: %.4f %.4f %.4f %.4f %.4f\n", 
+                             hidden[0], hidden[1], hidden[2], hidden[3], hidden[4]);
+            }
         } else {
             static float shared_gate_out[2816];
             static float shared_up_out[2816];
@@ -1158,8 +1166,13 @@ void Scout::reset_context() {
 void Scout::rollback(uint32_t steps) {
     if (steps == 0) return;
     impl_->ctx_pos = (impl_->ctx_pos + ATTN_CTX - steps) % ATTN_CTX;
-    if (impl_->ctx_fill < ATTN_CTX) {
+    if (impl_->ctx_fill > 0) {
         impl_->ctx_fill = (impl_->ctx_fill > steps) ? impl_->ctx_fill - steps : 0;
+    }
+    if (impl_->step >= steps) {
+        impl_->step -= steps;
+    } else {
+        impl_->step = 0;
     }
 }
 
