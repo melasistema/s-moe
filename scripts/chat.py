@@ -101,8 +101,8 @@ def main():
             messages.append({"role": "user", "content": prompt})
 
             # 1. BPE Tokenise input prompt. DeepSeek-MoE is highly sensitive
-            # to formatting. We use a single newline before Assistant: to prevent degradation.
-            prompt_str = f"User: {prompt}\nAssistant:"
+            # to formatting. We use a double newline before Assistant: to prevent degradation.
+            prompt_str = f"User: {prompt}\n\nAssistant:"
             token_ids = tokenizer.encode(prompt_str, add_special_tokens=True)
             token_str = ",".join(map(str, token_ids))
 

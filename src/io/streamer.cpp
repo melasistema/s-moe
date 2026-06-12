@@ -44,8 +44,9 @@ namespace smoe::io {
 // ─────────────────────────────────────────────────────────────
 
 struct PrefetchRequest {
-    uint32_t layer_id;
-    uint32_t expert_id;
+    uint32_t  layer_id;
+    uint32_t  expert_id;
+    RingSlot* slot;
 };
 
 [[nodiscard]] static constexpr uint64_t expert_key(
@@ -249,32 +250,9 @@ void Streamer::Impl::run(Impl* impl, uint32_t worker_id)
         }
         const smoe::ExpertEntry& entry = it->second;
 
-        // ── 3. Claim an EMPTY ring slot via CAS ───────────────
-        // Scan cyclically starting from scan_start to spread
-        // workers evenly across the ring and reduce CAS contention.
-        RingSlot* slot = nullptr;
-        for (uint32_t attempt = 0; attempt < impl->ring_sz; ++attempt) {
-            const uint32_t idx = (scan_start + attempt) % impl->ring_sz;
-            SlotState expected = SlotState::EMPTY;
-
-            if (impl->slots[idx].state.compare_exchange_strong(
-                    expected, SlotState::LOADING,
-                    std::memory_order_acquire,
-                    std::memory_order_relaxed))
-            {
-                slot = &impl->slots[idx];
-                // Advance scan cursor so the next search starts past here
-                scan_start = (idx + 1) % impl->ring_sz;
-                break;
-            }
-        }
-
-        if (!slot) {
-            // Ring fully saturated — back-pressure should have prevented this.
-            // Drop the request; the Scout will re-issue it next step.
-            impl->stat_misses.fetch_add(1, std::memory_order_relaxed);
-            continue;
-        }
+        // ── 3. We ALREADY claimed the ring slot in prefetch() ─
+        RingSlot* slot = req.slot;
+        if (!slot) continue;
 
         // ── 4. Direct I/O read into 16 KB-aligned slot buffer ─
         //
@@ -300,9 +278,6 @@ void Streamer::Impl::run(Impl* impl, uint32_t worker_id)
         // ── 5. Fill metadata and flip to READY ────────────────
         // Writes to non-atomic fields are safe because we own
         // this slot exclusively (state == LOADING).
-        slot->layer_id   = req.layer_id;
-        slot->expert_id  = req.expert_id;
-        slot->ref_count.store(1, std::memory_order_relaxed);
         slot->data_size  = static_cast<uint64_t>(n);
 
         // Release fence: all prior writes must be visible to any thread
@@ -430,23 +405,37 @@ bool Streamer::prefetch(uint32_t layer_id, uint32_t expert_id) noexcept {
         }
     }
 
-    // ── Back-pressure: at least one EMPTY slot must exist ─────
-    bool has_empty = false;
+    // ── Claim an EMPTY ring slot via CAS ───────────────
+    RingSlot* slot = nullptr;
     for (uint32_t i = 0; i < im.ring_sz; ++i) {
-        if (im.slots[i].state.load(std::memory_order_relaxed) == SlotState::EMPTY) {
-            has_empty = true;
+        SlotState expected = SlotState::EMPTY;
+        if (im.slots[i].state.compare_exchange_strong(
+                expected, SlotState::LOADING,
+                std::memory_order_acquire,
+                std::memory_order_relaxed))
+        {
+            slot = &im.slots[i];
             break;
         }
     }
-    if (!has_empty) {
+
+    if (!slot) {
         std::fprintf(stderr, "[DEBUG] prefetch failed: no empty slots!\n");
         return false;
     }
 
+    // Set metadata NOW so idempotency check catches subsequent prefetch calls
+    slot->layer_id = layer_id;
+    slot->expert_id = expert_id;
+    slot->ref_count.store(1, std::memory_order_relaxed);
+
     // ── Enqueue the request ───────────────────────────────────
-    bool ok = im.request_queue.push({ layer_id, expert_id });
+    bool ok = im.request_queue.push({ layer_id, expert_id, slot });
     if (!ok) {
         std::fprintf(stderr, "[DEBUG] prefetch failed: request queue full!\n");
+        slot->layer_id = 0xFFFFFFFF;
+        slot->expert_id = 0xFFFFFFFF;
+        slot->state.store(SlotState::EMPTY, std::memory_order_release);
     }
     return ok;
 }

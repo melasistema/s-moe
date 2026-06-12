@@ -120,6 +120,7 @@ kernel void smoe_gate_up(
     constant FusedFFNParams&   params       [[buffer(9)]],
     uint                       gid          [[thread_position_in_grid]],
     uint                       tid          [[thread_index_in_threadgroup]],
+    uint                       threads_per_tg [[threads_per_threadgroup]],
     threadgroup float*         tg_input     [[threadgroup(0)]])
 {
     // ── Phase A: cooperatively load the input vector into SRAM ──
@@ -130,7 +131,6 @@ kernel void smoe_gate_up(
     // DeepSeek experts are narrow (cols typically 2048–7168), the
     // entire input vector may fit in a single tile on most configs.
     uint row = gid;                           // output element index
-    if (row >= params.rows) return;
 
     float gate_acc = 0.0f;
     float up_acc   = 0.0f;
@@ -139,14 +139,18 @@ kernel void smoe_gate_up(
 
     for (uint t = 0; t < tiles; ++t) {
         uint col_base = t * TGROUP_SIZE;
-        uint col      = col_base + tid;
 
         // Load this thread's element into shared memory
-        tg_input[tid] = (col < params.cols) ? input[col] : 0.0f;
+        for (uint i = tid; i < TGROUP_SIZE; i += threads_per_tg) {
+            uint col = col_base + i;
+            tg_input[i] = (col < params.cols) ? input[col] : 0.0f;
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // Accumulate dot-products for all cols in this tile
         uint tile_end = min(TGROUP_SIZE, params.cols - col_base);
+
+        if (row < params.rows) {
 
         // Unroll x4 over the natural 4-codes-per-byte boundary
         uint wi_base = row * params.cols + col_base;
@@ -205,10 +209,15 @@ kernel void smoe_gate_up(
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     // ── Phase B: fused SiLU gate ─────────────────────────────
-    hidden[row] = silu(gate_acc) * up_acc;
+    if (row < params.rows) {
+        hidden[row] = silu(gate_acc) * up_acc;
+    }
 }
 
 // ── Down projection: hidden[rows] → output[rows] ─────────────
@@ -225,23 +234,27 @@ kernel void smoe_down(
     constant FusedFFNParams&   params       [[buffer(9)]],
     uint                       gid          [[thread_position_in_grid]],
     uint                       tid          [[thread_index_in_threadgroup]],
+    uint                       threads_per_tg [[threads_per_threadgroup]],
     threadgroup float*         tg_hidden    [[threadgroup(0)]])
 {
     uint row = gid;
-    if (row >= params.cols) return;
 
     float acc   = 0.0f;
     uint  tiles = (params.rows + TGROUP_SIZE - 1) / TGROUP_SIZE;
 
     for (uint t = 0; t < tiles; ++t) {
         uint col_base = t * TGROUP_SIZE;
-        uint col      = col_base + tid;
 
-        tg_hidden[tid] = (col < params.rows) ? hidden[col] : 0.0f;
+        for (uint i = tid; i < TGROUP_SIZE; i += threads_per_tg) {
+            uint col = col_base + i;
+            tg_hidden[i] = (col < params.rows) ? hidden[col] : 0.0f;
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         uint tile_end = min(TGROUP_SIZE, params.rows - col_base);
         uint wi_base  = row * params.rows + col_base;
+
+        if (row < params.cols) {
 
         uint k = 0;
         if (params.bits == 4) {
@@ -279,9 +292,14 @@ kernel void smoe_down(
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    output[row] = acc;
+    if (row < params.cols) {
+        output[row] = acc;
+    }
 }
 
 // ── Scout Matrix-Vector Multiplication: weight[rows x cols] x input_vec[cols] → output_vec[rows] ──

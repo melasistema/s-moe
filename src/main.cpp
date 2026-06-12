@@ -299,6 +299,7 @@ int main(int argc, char* argv[]) {
         else if (arg("--temperature")){ temperature = static_cast<float>(std::atof(argv[++i])); }
         else if (arg("--top-p"))     { top_p       = static_cast<float>(std::atof(argv[++i])); }
         else if (arg("--rep-penalty")){ rep_penalty = static_cast<float>(std::atof(argv[++i])); }
+        else if (std::strcmp(argv[i], "--debug") == 0) { g_debug = true; }
         else if (std::strcmp(argv[i], "--help") == 0 ||
                  std::strcmp(argv[i], "-h")     == 0) {
             print_usage(argv[0]);
@@ -314,7 +315,9 @@ int main(int argc, char* argv[]) {
     }
 
     const char* sm_dbg = std::getenv("SMOE_DEBUG");
-    g_debug = sm_dbg && (std::strcmp(sm_dbg, "1") == 0 || std::strcmp(sm_dbg, "true") == 0);
+    if (sm_dbg) {
+        g_debug = g_debug || (std::strcmp(sm_dbg, "1") == 0 || std::strcmp(sm_dbg, "true") == 0);
+    }
 
     // ── Vault header read ─────────────────────────────────────
     smoe::SmoeHeader vault_hdr {};
@@ -479,6 +482,14 @@ int main(int argc, char* argv[]) {
             sq_tail = 0;
         }
 
+        static float hidden[2048];
+        const float* emb = scout.get_embed() + heavy_cur_token * 2048;
+        std::memcpy(hidden, emb, 2048 * sizeof(float));
+
+        if (n == 0 && g_debug) {
+            std::fprintf(stderr, "\n[Token %u] emb = %.4f %.4f %.4f %.4f\n", heavy_cur_token, hidden[0], hidden[1], hidden[2], hidden[3]);
+        }
+
         // Clean up any leaked/discarded slots in the streamer
         {
             ActiveExpertsContext act_ctx { scout_queue, sq_head, sq_size };
@@ -509,7 +520,6 @@ int main(int argc, char* argv[]) {
         // ── Phase B: Heavy Model Execution ─────────────────────
         // Claim the routing map for the current step from the queue head
         smoe::scout::ScoutOutput scout_out = scout_queue[sq_head];
-        static float hidden[2048];
         static float normed[2048];
         static float qbuf[2048];
         static float kbuf[2048];
@@ -621,7 +631,13 @@ int main(int argc, char* argv[]) {
                 }
                 smoe::matvec(normed, scout.get_l0_down(), l0_gate_out, 2048, 10944);
                 for (uint32_t d = 0; d < 2048; ++d) hidden[d] += normed[d];
+                if (n == 0 && g_debug) {
+                    std::fprintf(stderr, "\n[L0] hidden = %.4f %.4f %.4f %.4f\n", hidden[0], hidden[1], hidden[2], hidden[3]);
+                }
             } else {
+                if (l == 1 && n == 0 && g_debug) {
+                    std::fprintf(stderr, "\n[L1] hidden before FFN = %.4f %.4f %.4f %.4f\n", hidden[0], hidden[1], hidden[2], hidden[3]);
+                }
                 // Shared Experts
                 static float shared_gate_out[2816];
                 static float shared_up_out[2816];
@@ -690,6 +706,9 @@ int main(int argc, char* argv[]) {
 
                         // Accumulate
                         float weight = pred.expert_weights[e];
+                        if (l == 1 && n == 0 && g_debug) {
+                            std::fprintf(stderr, "[L1] Routed Expert %d, weight = %.4f\n", pred.expert_ids[e], weight);
+                        }
                         for (uint32_t d = 0; d < 2048; ++d) {
                             routed_out[d] += weight * expert_output_vec[d];
                         }
@@ -699,9 +718,18 @@ int main(int argc, char* argv[]) {
                     }
                 }
 
+                if (l == 1 && n == 0 && g_debug) {
+                    std::fprintf(stderr, "\n[L1] shared_out = %.4f %.4f %.4f %.4f\n", shared_out[0], shared_out[1], shared_out[2], shared_out[3]);
+                    std::fprintf(stderr, "[L1] routed_out = %.4f %.4f %.4f %.4f\n", routed_out[0], routed_out[1], routed_out[2], routed_out[3]);
+                }
+
                 // Add FFN residuals
                 for (uint32_t d = 0; d < 2048; ++d) {
                     hidden[d] += shared_out[d] + routed_out[d];
+                }
+
+                if (l == 1 && n == 0 && g_debug) {
+                    std::fprintf(stderr, "\n[L1] hidden after FFN = %.4f %.4f %.4f %.4f\n", hidden[0], hidden[1], hidden[2], hidden[3]);
                 }
             }
         }
@@ -744,6 +772,11 @@ int main(int argc, char* argv[]) {
                     best_score = scores[v];
                     best_tok   = v;
                 }
+            }
+            if (g_debug && ((prompt_len == 0) || (n >= prompt_len - 1))) {
+                float h_sum2 = 0.0f;
+                for(uint32_t i=0; i<2048; i++) h_sum2 += hidden[i]*hidden[i];
+                std::fprintf(stderr, "\n[n=%u] hidden_L2 = %f, Top score = %f for tok = %u\n", n, std::sqrt(h_sum2), best_score, best_tok);
             }
         } else {
             // Temperature + Top-p
@@ -833,6 +866,10 @@ int main(int argc, char* argv[]) {
         // ── Step 6: Emit token ────────────────────────────────
         is_generating = (prompt_len == 0) || (n >= prompt_len - 1);
         if (is_generating) {
+            if (heavy_cur_token == 100001) {
+                if (g_debug) std::fprintf(stderr, "\n[EOS reached]\n");
+                break;
+            }
             if (g_vocab_loaded && heavy_cur_token < 102400) {
                 std::fputs(g_vocab[heavy_cur_token].c_str(), stdout);
             } else {

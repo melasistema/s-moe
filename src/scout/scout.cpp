@@ -200,6 +200,7 @@ static uint32_t top_k(const float* scores, uint32_t n, uint32_t k,
     }
 
     // Top-k selection
+    float topk_sum = 0.0f;
     for (uint32_t s = 0; s < count; ++s) {
         uint32_t best = s;
         for (uint32_t i = s + 1; i < n; ++i) {
@@ -212,6 +213,7 @@ static uint32_t top_k(const float* scores, uint32_t n, uint32_t k,
         out_indices[s] = idx[s];
         if (out_weights) {
             out_weights[s] = tmp[s];
+            topk_sum += tmp[s];
         }
     }
 
