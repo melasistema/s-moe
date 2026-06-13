@@ -3,6 +3,8 @@
 /.antigravitycli
 
 /references/
+/scratch/
+test_*.py
 
 # Agents
 GEMINI.md

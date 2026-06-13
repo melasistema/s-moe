@@ -100,10 +100,8 @@ def main():
             # Append to conversational history
             messages.append({"role": "user", "content": prompt})
 
-            # 1. BPE Tokenise input prompt. DeepSeek-MoE is highly sensitive
-            # to formatting. We use a double newline before Assistant: to prevent degradation.
-            prompt_str = f"User: {prompt}\n\nAssistant:"
-            token_ids = tokenizer.encode(prompt_str, add_special_tokens=True)
+            # 1. BPE Tokenise input prompt using the official chat template
+            token_ids = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
             token_str = ",".join(map(str, token_ids))
 
             console.print("\n[bold cyan]S-MoE Engine[/bold cyan] ❯", end="")

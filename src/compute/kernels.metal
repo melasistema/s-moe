@@ -310,13 +310,14 @@ kernel void scout_matvec(
     constant     uint2&  dims         [[buffer(3)]], // x = rows, y = cols
     uint                 row          [[thread_position_in_grid]],
     uint                 tid          [[thread_index_in_threadgroup]],
+    uint                 threads_per_tg [[threads_per_threadgroup]],
     threadgroup  float*  tg_input     [[threadgroup(0)]])
 {
     uint rows = dims.x;
     uint cols = dims.y;
 
     // Load input_vec into threadgroup memory
-    for (uint i = tid; i < cols; i += TGROUP_SIZE) {
+    for (uint i = tid; i < cols; i += threads_per_tg) {
         tg_input[i] = input_vec[i];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);

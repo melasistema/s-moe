@@ -85,6 +85,7 @@ static void print_usage(const char* argv0) {
         "    --ring    <N>       Ring buffer slot count  (default: %u)\n"
         "    --workers <N>       I/O worker thread count (default: %u)\n"
         "    --slot-mb <N>       Bytes per ring slot, MB (default: %llu)\n"
+        "    --raw-ids           Print raw token IDs as integers instead of text\n"
         "\n"
         "  Example:\n"
         "    %s --vault vault/deepseek.smoe --prompt \"Explain MoE routing\" --tokens 200\n"
@@ -222,6 +223,7 @@ static bool read_expert_layout(const char* vault_path, const smoe::SmoeHeader& h
 static bool g_vocab_loaded = false;
 static std::string g_vocab[102400];
 static bool g_debug = false;
+static bool g_raw_ids = false;
 
 static void load_vocab(const char* vocab_bin_path) {
     FILE* f = std::fopen(vocab_bin_path, "rb");
@@ -300,6 +302,7 @@ int main(int argc, char* argv[]) {
         else if (arg("--top-p"))     { top_p       = static_cast<float>(std::atof(argv[++i])); }
         else if (arg("--rep-penalty")){ rep_penalty = static_cast<float>(std::atof(argv[++i])); }
         else if (std::strcmp(argv[i], "--debug") == 0) { g_debug = true; }
+        else if (std::strcmp(argv[i], "--raw-ids") == 0) { g_raw_ids = true; }
         else if (std::strcmp(argv[i], "--help") == 0 ||
                  std::strcmp(argv[i], "-h")     == 0) {
             print_usage(argv[0]);
@@ -408,7 +411,11 @@ int main(int argc, char* argv[]) {
         for (uint32_t i = 0; i < prompt_len; ++i) {
             uint32_t tok = prompt_tokens[i];
             if (g_vocab_loaded && tok < 102400) {
-                std::fputs(g_vocab[tok].c_str(), stdout);
+                std::string s = g_vocab[tok];
+                size_t pos;
+                while ((pos = s.find("Ġ")) != std::string::npos) s.replace(pos, 2, " ");
+                while ((pos = s.find("Ċ")) != std::string::npos) s.replace(pos, 2, "\n");
+                std::fputs(s.c_str(), stdout);
             } else {
                 unsigned char c = static_cast<unsigned char>(tok & 0xFF);
                 std::fputc(c, stdout);
@@ -840,9 +847,9 @@ int main(int argc, char* argv[]) {
         if (heavy_cur_token != expected_scout_token) {
             // Divergence! Scout guessed wrong.
             // Rollback scout KV-cache by the number of steps it is currently ahead.
-            // The Scout evaluated the current token (valid) + (sq_size - 1) speculative tokens.
-            if (sq_size > 1) {
-                scout.rollback(sq_size - 1);
+            // The Scout evaluated the current token (valid) + sq_size speculative tokens.
+            if (sq_size > 0) {
+                scout.rollback(sq_size);
             }
             
             // Flush the lookahead queue
@@ -864,14 +871,19 @@ int main(int argc, char* argv[]) {
         }
 
         // ── Step 6: Emit token ────────────────────────────────
-        is_generating = (prompt_len == 0) || (n >= prompt_len - 1);
         if (is_generating) {
             if (heavy_cur_token == 100001) {
                 if (g_debug) std::fprintf(stderr, "\n[EOS reached]\n");
                 break;
             }
-            if (g_vocab_loaded && heavy_cur_token < 102400) {
-                std::fputs(g_vocab[heavy_cur_token].c_str(), stdout);
+            if (g_raw_ids) {
+                std::printf("%u ", heavy_cur_token);
+            } else if (g_vocab_loaded && heavy_cur_token < 102400) {
+                std::string s = g_vocab[heavy_cur_token];
+                size_t pos;
+                while ((pos = s.find("Ġ")) != std::string::npos) s.replace(pos, 2, " ");
+                while ((pos = s.find("Ċ")) != std::string::npos) s.replace(pos, 2, "\n");
+                std::fputs(s.c_str(), stdout);
             } else {
                 unsigned char c = static_cast<unsigned char>(heavy_cur_token & 0xFF);
                 std::fputc(c, stdout);

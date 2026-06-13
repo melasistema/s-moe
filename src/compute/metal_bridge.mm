@@ -220,8 +220,8 @@ kernel void smoe_gate_up(
                 for (uint b = 0; b < 2; ++b) {
                     float gcode = float((gbyte >> (b * 4)) & 0xFu);
                     float ucode = float((ubyte >> (b * 4)) & 0xFu);
-                    float gw    = (gcode - 7.5f) * (1.0f / 7.5f) * gs;
-                    float uw    = (ucode - 7.5f) * (1.0f / 7.5f) * us;
+                    float gw    = (gcode - 8.0f) * gs;
+                    float uw    = (ucode - 8.0f) * us;
                     float x_k   = tg_input[k + b];
                     gate_acc   += gw * x_k;
                     up_acc     += uw * x_k;
@@ -257,10 +257,8 @@ kernel void smoe_gate_up(
                 gate_acc += smoeq2_dequant(gate_packed, gate_scales, wi, params.group_size) * tg_input[k];
                 up_acc   += smoeq2_dequant(up_packed,   up_scales,   wi, params.group_size) * tg_input[k];
             }
-        }
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
+        } // end of bits == 2 branch
+        } // end of if (row < params.rows)
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -316,7 +314,7 @@ kernel void smoe_down(
 
                 for (uint b = 0; b < 2; ++b) {
                     float dcode = float((dbyte >> (b * 4)) & 0xFu);
-                    float dw    = (dcode - 7.5f) * (1.0f / 7.5f) * ds;
+                    float dw    = (dcode - 8.0f) * ds;
                     acc        += dw * tg_hidden[k + b];
                 }
             }
@@ -340,10 +338,8 @@ kernel void smoe_down(
                 uint wi = wi_base + k;
                 acc += smoeq2_dequant(down_packed, down_scales, wi, params.group_size) * tg_hidden[k];
             }
-        }
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
+        } // end of bits == 2 branch
+        } // end of if (row < params.cols)
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -361,13 +357,14 @@ kernel void scout_matvec(
     constant     uint2&  dims         [[buffer(3)]], // x = rows, y = cols
     uint                 row          [[thread_position_in_grid]],
     uint                 tid          [[thread_index_in_threadgroup]],
+    uint                 threads_per_tg [[threads_per_threadgroup]],
     threadgroup  float*  tg_input     [[threadgroup(0)]])
 {
     uint rows = dims.x;
     uint cols = dims.y;
 
     // Load input_vec into threadgroup memory
-    for (uint i = tid; i < cols; i += TGROUP_SIZE) {
+    for (uint i = tid; i < cols; i += threads_per_tg) {
         tg_input[i] = input_vec[i];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
