@@ -8,6 +8,7 @@ test_*.py
 
 # Agents
 GEMINI.md
+CLAUDE.md
 AGENTS.md
 
 # ── Python virtual environment ────────────────────────────────
