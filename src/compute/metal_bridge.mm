@@ -138,7 +138,7 @@ inline float smoeq4_dequant(
     float   scale = float(scales[group_idx]);
 
     // Affine mapping: centre 0-3 around 1.5, then scale
-    return ((float(code) - 1.5f) * 0.666666667f) * scale;
+    return (float(code) - 1.5f) * scale;
 }
 
 // ── Fused Gate+Up+Down FFN kernel ────────────────────────────
