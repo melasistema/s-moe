@@ -79,7 +79,8 @@ size_t smoe_metal_slot_bytes(const SmoeMetalCtx* ctx);
 //   rows         — number of rows (intermediate / output dim)
 //   cols         — number of cols (input dim)
 //   group_size   — SMOE-Q2 group size (always 64)
-void smoe_metal_fused_ffn(SmoeMetalCtx*   ctx,
+// Returns a handle to wait on.
+void* smoe_metal_fused_ffn(SmoeMetalCtx*   ctx,
                            const uint8_t*  packed_gate,
                            const uint16_t* scales_gate,
                            const uint8_t*  packed_up,
@@ -92,7 +93,10 @@ void smoe_metal_fused_ffn(SmoeMetalCtx*   ctx,
                            uint32_t        rows,
                            uint32_t        cols,
                            uint32_t        group_size,
-                           uint32_t        bits);
+                           uint32_t        bits,
+                           uint32_t        expert_index);
+
+void smoe_metal_wait(SmoeMetalCtx* ctx, void* handle, float* output_vec, uint32_t expert_index, uint32_t cols);
 
 // Perform a float32 matrix-vector multiplication on the GPU for Scout projections.
 void smoe_metal_scout_matvec(SmoeMetalCtx* ctx,

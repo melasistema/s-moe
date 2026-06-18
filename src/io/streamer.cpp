@@ -535,6 +535,15 @@ uint32_t Streamer::ready_count() const noexcept {
 const void* Streamer::pool_data() const noexcept { return impl_->data_pool; }
 uint64_t Streamer::pool_size() const noexcept { return static_cast<uint64_t>(impl_->ring_sz) * impl_->slot_cap; }
 
+const void* Streamer::get_slot_ptr(uint32_t index) const noexcept {
+    if (index >= impl_->ring_sz) return nullptr;
+    return impl_->slots[index].data;
+}
+
+uint64_t Streamer::get_slot_bytes() const noexcept {
+    return impl_->slot_cap;
+}
+
 void Streamer::print_debug_states() const noexcept {
     uint32_t states[4] = {0};
     for (uint32_t i = 0; i < impl_->ring_sz; ++i) {

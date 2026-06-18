@@ -361,7 +361,9 @@ int main(int argc, char* argv[]) {
 
     // ── Phase 2: Streamer init ────────────────────────────────
     smoe::io::Streamer streamer(vault_path, ring_size, num_workers, slot_bytes);
-    smoe_metal_register_buffer(metal, streamer.pool_data(), streamer.pool_size());
+    for (uint32_t i = 0; i < ring_size; ++i) {
+        smoe_metal_register_buffer(metal, streamer.get_slot_ptr(i), streamer.get_slot_bytes());
+    }
 
     // ── Phase 4: Scout init ───────────────────────────────────
     smoe::scout::Scout scout(scout_path, metal);  // scout_path may be nullptr (heuristic only)
@@ -677,6 +679,11 @@ int main(int argc, char* argv[]) {
                 bool executed[8] = {false};
                 uint32_t num_executed = 0;
                 uint64_t spin = 0;
+                
+                void* wait_handles[8] = {nullptr};
+                smoe::io::RingSlot* active_slots[8] = {nullptr};
+                static float expert_hidden_scratch[8][4096];
+                static float expert_output_vec[8][4096];
 
                 while (num_executed < pred.count) {
                     bool made_progress = false;
@@ -686,6 +693,7 @@ int main(int argc, char* argv[]) {
                         smoe::io::RingSlot* slot = streamer.claim_specific(pred.layer_id, pred.expert_ids[e]);
                         
                         if (slot) {
+                            active_slots[e] = slot;
                             if (slot->data_size > 0) {
                                 const uint8_t*  packed_gate = slot->data + expert_layout.gate_packed_offset;
                                 const uint16_t* scales_gate = reinterpret_cast<const uint16_t*>(slot->data + expert_layout.gate_scales_offset);
@@ -694,37 +702,24 @@ int main(int argc, char* argv[]) {
                                 const uint8_t*  packed_down = slot->data + expert_layout.down_packed_offset;
                                 const uint16_t* scales_down = reinterpret_cast<const uint16_t*>(slot->data + expert_layout.down_scales_offset);
 
-                                static float expert_hidden_scratch[4096];
-                                static float expert_output_vec[4096];
-                                std::memset(expert_hidden_scratch, 0, sizeof(expert_hidden_scratch));
-                                std::memset(expert_output_vec, 0, sizeof(expert_output_vec));
+                                std::memset(expert_hidden_scratch[e], 0, sizeof(expert_hidden_scratch[e]));
+                                std::memset(expert_output_vec[e], 0, sizeof(expert_output_vec[e]));
 
-                                smoe_metal_fused_ffn(
+                                wait_handles[e] = smoe_metal_fused_ffn(
                                     metal,
                                     packed_gate, scales_gate,
                                     packed_up,   scales_up,
                                     packed_down, scales_down,
                                     normed,
-                                    expert_hidden_scratch,
-                                    expert_output_vec,
+                                    expert_hidden_scratch[e],
+                                    expert_output_vec[e],
                                     expert_layout.gate_rows,
                                     expert_layout.gate_cols,
                                     vault_hdr.group_size,
-                                    vault_hdr.bits
+                                    vault_hdr.bits,
+                                    e // expert_index
                                 );
-
-                                // Accumulate
-                                float weight = pred.expert_weights[e];
-                                if (l == 1 && n == 0 && g_debug) {
-                                    std::fprintf(stderr, "[L1] Routed Expert %d, weight = %.4f\n", pred.expert_ids[e], weight);
-                                }
-                                for (uint32_t d = 0; d < 2048; ++d) {
-                                    routed_out[d] += weight * expert_output_vec[d];
-                                }
-                                
-                                smoe_metal_swap_buffers(metal);
                             }
-                            streamer.release(slot);
                             executed[e] = true;
                             num_executed++;
                             made_progress = true;
@@ -749,6 +744,24 @@ int main(int argc, char* argv[]) {
                         }
                     }
                 }
+
+                // Wait for GPU and accumulate
+                for (uint32_t e = 0; e < pred.count; ++e) {
+                    if (wait_handles[e]) {
+                        smoe_metal_wait(metal, wait_handles[e], expert_output_vec[e], e, 2048);
+                        float weight = pred.expert_weights[e];
+                        if (l == 1 && n == 0 && g_debug) {
+                            std::fprintf(stderr, "[L1] Routed Expert %d, weight = %.4f\n", pred.expert_ids[e], weight);
+                        }
+                        for (uint32_t d = 0; d < 2048; ++d) {
+                            routed_out[d] += weight * expert_output_vec[e][d];
+                        }
+                    }
+                    if (active_slots[e]) {
+                        streamer.release(active_slots[e]);
+                    }
+                }
+                smoe_metal_swap_buffers(metal);
 
                 if (l == 1 && n == 0 && g_debug) {
                     std::fprintf(stderr, "\n[L1] shared_out = %.4f %.4f %.4f %.4f\n", shared_out[0], shared_out[1], shared_out[2], shared_out[3]);
@@ -786,12 +799,16 @@ int main(int argc, char* argv[]) {
         
         // Repetition penalty
         if (rep_penalty != 1.0f) {
+            bool penalized[102400] = {false};
             for (uint32_t i = 0; i < history_len; ++i) {
                 uint32_t tok = token_history[i];
-                if (scores[tok] <= 0) {
-                    scores[tok] *= rep_penalty;
-                } else {
-                    scores[tok] /= rep_penalty;
+                if (!penalized[tok]) {
+                    if (scores[tok] <= 0) {
+                        scores[tok] *= rep_penalty;
+                    } else {
+                        scores[tok] /= rep_penalty;
+                    }
+                    penalized[tok] = true;
                 }
             }
         }

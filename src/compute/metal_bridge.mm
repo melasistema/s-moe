@@ -31,6 +31,7 @@
 #include <vector>
 #include <cstdlib>
 #include <cstdarg>
+#include <thread>
 
 static void info_printf(const char* format, ...) {
     const char* sm_dbg = std::getenv("SMOE_DEBUG");
@@ -422,6 +423,10 @@ struct SmoeMetalCtx {
     // Telemetry
     std::atomic<uint64_t>       dispatch_count { 0 };
 
+    // Shared event for async GPU/CPU synchronisation
+    id<MTLSharedEvent>          shared_event = nil;
+    uint64_t                    signaled_value = 0;
+
     struct RegisteredBuffer {
         const void* ptr;
         size_t length;
@@ -545,14 +550,12 @@ SmoeMetalCtx* smoe_metal_init(size_t slot_bytes) {
     }
 
     // ── Step 5: allocate hidden-vector scratch buffer ─────────
-    // Sized for the worst-case intermediate dim.
-    // max_rows heuristic: slot_bytes / 4 bytes-per-float, capped
-    // at 32768 (generous upper bound for any DeepSeek expert dim).
+    // Sized for the worst-case intermediate dim x 8 concurrent experts.
     uint32_t max_rows    = static_cast<uint32_t>(
         std::min(slot_bytes / sizeof(float), size_t(32768)));
-    id<MTLBuffer> hidden = [dev newBufferWithLength:max_rows * sizeof(float)
+    id<MTLBuffer> hidden = [dev newBufferWithLength:8 * max_rows * sizeof(float)
                                             options:uma];
-    id<MTLBuffer> output_b = [dev newBufferWithLength:max_rows * sizeof(float)
+    id<MTLBuffer> output_b = [dev newBufferWithLength:8 * max_rows * sizeof(float)
                                             options:uma];
     id<MTLBuffer> input_b = [dev newBufferWithLength:8192 * sizeof(float)
                                             options:uma];
@@ -562,12 +565,13 @@ SmoeMetalCtx* smoe_metal_init(size_t slot_bytes) {
         return nullptr;
     }
 
-    // ── Step 6: create command queue ─────────────────────────
+    // ── Step 6: create command queue & shared event ──────────
     id<MTLCommandQueue> queue = [dev newCommandQueue];
     if (!queue) {
         std::fprintf(stderr, "[smoe_metal] ERROR: Failed to create command queue.\n");
         return nullptr;
     }
+    id<MTLSharedEvent> shared_ev = [dev newSharedEvent];
 
     // ── Step 7: assemble context ──────────────────────────────
     SmoeMetalCtx* ctx = new SmoeMetalCtx();
@@ -584,6 +588,8 @@ SmoeMetalCtx* smoe_metal_init(size_t slot_bytes) {
     ctx->input_buf   = input_b;
     ctx->slot_bytes  = slot_bytes;
     ctx->max_rows    = max_rows;
+    ctx->shared_event = shared_ev;
+    ctx->signaled_value = 0;
     ctx->passive_ready.store(true, std::memory_order_release);
     ctx->dispatch_count.store(0, std::memory_order_relaxed);
 
@@ -609,7 +615,7 @@ size_t smoe_metal_slot_bytes(const SmoeMetalCtx* ctx) {
     return ctx ? ctx->slot_bytes : 0;
 }
 
-void smoe_metal_fused_ffn(SmoeMetalCtx*   ctx,
+void* smoe_metal_fused_ffn(SmoeMetalCtx*   ctx,
                            const uint8_t*  packed_gate,
                            const uint16_t* scales_gate,
                            const uint8_t*  packed_up,
@@ -622,9 +628,10 @@ void smoe_metal_fused_ffn(SmoeMetalCtx*   ctx,
                            uint32_t        rows,
                            uint32_t        cols,
                            uint32_t        group_size,
-                           uint32_t        bits)
+                           uint32_t        bits,
+                           uint32_t        expert_index)
 {
-    if (!ctx) return;
+    if (!ctx) return nullptr;
 
     // ── Build FusedFFNParams ──────────────────────────────────
     // Stack allocation — not in hot-path alloc-banned zone because
@@ -653,6 +660,9 @@ void smoe_metal_fused_ffn(SmoeMetalCtx*   ctx,
         id<MTLBuffer> buf_in = ctx->input_buf;
         id<MTLBuffer> buf_hd = ctx->hidden_buf;
         id<MTLBuffer> buf_ou = ctx->output_buf;
+        
+        NSUInteger hd_offset = expert_index * ctx->max_rows * sizeof(float);
+        NSUInteger ou_offset = expert_index * ctx->max_rows * sizeof(float);
 
         std::memcpy([buf_in contents], input_vec, input_bytes);
 
@@ -672,7 +682,7 @@ void smoe_metal_fused_ffn(SmoeMetalCtx*   ctx,
         [enc setBuffer:buf_up offset:off_up atIndex:2];
         [enc setBuffer:buf_us offset:off_us atIndex:3];
         [enc setBuffer:buf_in offset:0      atIndex:6];
-        [enc setBuffer:buf_hd offset:0      atIndex:7];
+        [enc setBuffer:buf_hd offset:hd_offset atIndex:7];
         [enc setBuffer:buf_pa offset:0      atIndex:9];
     // Threadgroup SRAM: TGROUP_SIZE floats for the input tile
     [enc setThreadgroupMemoryLength:256 * sizeof(float) atIndex:0];
@@ -689,8 +699,8 @@ void smoe_metal_fused_ffn(SmoeMetalCtx*   ctx,
     [enc setComputePipelineState:ctx->down_pso];
     [enc setBuffer:buf_dp offset:off_dp atIndex:4];
     [enc setBuffer:buf_ds offset:off_ds atIndex:5];
-    [enc setBuffer:buf_hd offset:0 atIndex:7];
-    [enc setBuffer:buf_ou offset:0 atIndex:8];
+    [enc setBuffer:buf_hd offset:hd_offset atIndex:7];
+    [enc setBuffer:buf_ou offset:ou_offset atIndex:8];
     [enc setBuffer:buf_pa offset:0 atIndex:9];
     [enc setThreadgroupMemoryLength:256 * sizeof(float) atIndex:0];
 
@@ -705,20 +715,31 @@ void smoe_metal_fused_ffn(SmoeMetalCtx*   ctx,
     [enc endEncoding];
 
     // Asynchronous commit - use completion handler to signal when done
-    __block bool completed = false;
     __block uint64_t local_dispatch_count = 0;
 
     [cmd addCompletedHandler:^(id<MTLCommandBuffer> buffer) {
         // This is called asynchronously when the command buffer completes
-        std::memcpy(output_vec, [buf_ou contents], cols * sizeof(float));
         local_dispatch_count = ctx->dispatch_count.fetch_add(1, std::memory_order_relaxed);
-        completed = true;
     }];
 
+    ctx->signaled_value++;
+    uint64_t wait_val = ctx->signaled_value;
+    [cmd encodeSignalEvent:ctx->shared_event value:wait_val];
+
     [cmd commit];
-    [cmd waitUntilCompleted];
+
+    return (void*)(uintptr_t)wait_val;
 
     } // end @autoreleasepool
+}
+
+void smoe_metal_wait(SmoeMetalCtx* ctx, void* handle, float* output_vec, uint32_t expert_index, uint32_t cols) {
+    if (!ctx || !handle) return;
+    uint64_t val = (uint64_t)(uintptr_t)handle;
+    while (ctx->shared_event.signaledValue < val) {
+        std::this_thread::yield();
+    }
+    std::memcpy(output_vec, ((float*)[ctx->output_buf contents]) + expert_index * ctx->max_rows, cols * sizeof(float));
 }
 
 void smoe_metal_swap_buffers(SmoeMetalCtx* ctx) {

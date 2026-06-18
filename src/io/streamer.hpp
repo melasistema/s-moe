@@ -131,6 +131,9 @@ public:
     // ── Memory Pool access (for Metal registration) ──
     [[nodiscard]] const void* pool_data() const noexcept;
     [[nodiscard]] uint64_t    pool_size() const noexcept;
+    
+    [[nodiscard]] const void* get_slot_ptr(uint32_t index) const noexcept;
+    [[nodiscard]] uint64_t    get_slot_bytes() const noexcept;
 
     Streamer(const Streamer&)            = delete;
     Streamer& operator=(const Streamer&) = delete;

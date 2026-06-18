@@ -59,9 +59,9 @@ def main():
             "--tokens", "256",
             "--ring", ring_size,
             "--workers", "4",
-            "--temperature", "0.3",
+            "--temperature", "0.6",
             "--top-p", "0.95",
-            "--rep-penalty", "1.0",
+            "--rep-penalty", "1.1",
             "--raw-ids" # Most robust decoding via python
         ]
         
