@@ -935,6 +935,7 @@ ScoutOutput Scout::Impl::neural_forward(uint32_t token_id) noexcept {
                 // Collect all gate predictions for this forward pass
                 for (uint32_t layer_idx = 0; layer_idx < NUM_MOE_LAYERS; ++layer_idx) {
                     batch_weights[layer_idx] = gate_w[layer_idx];
+                    batch_inputs[layer_idx]  = normed;
                     batch_outputs[layer_idx] = gate_scores_batch + layer_idx * GATE_ROWS;
                     batch_rows[layer_idx] = GATE_ROWS;
                     batch_cols[layer_idx] = D_MODEL;

@@ -478,12 +478,22 @@ int main(int argc, char* argv[]) {
         return false;
     };
 
+    uint32_t next_heavy_token = 0;
+
     for (uint32_t n = 0; n < total_steps; ++n) {
+        uint32_t heavy_cur_token;
         bool is_prompt = (n < prompt_len);
 
         if (is_prompt) {
             heavy_cur_token = prompt_tokens[n];
-            scout_cur_token = heavy_cur_token;
+            // CRITICAL: Force the Scout to follow the prompt sequence exactly.
+            // Otherwise, it hallucinates its own tokens and scrambles its KV cache!
+            scout_cur_token = prompt_tokens[n];
+        } else {
+            heavy_cur_token = next_heavy_token;
+        }
+
+        if (is_prompt) {
             // During prompt, we do not lookahead. We only evaluate the exact token.
             sq_size = 0;
             sq_head = 0;
@@ -839,6 +849,7 @@ int main(int argc, char* argv[]) {
         }
         
         heavy_cur_token = best_tok;
+        next_heavy_token = best_tok; // Save for the next contiguous iteration
         bool is_generating = (prompt_len == 0) || (n >= prompt_len - 1);
         if (is_generating && history_len < 8192) {
             token_history[history_len++] = heavy_cur_token;
@@ -853,9 +864,9 @@ int main(int argc, char* argv[]) {
         if (heavy_cur_token != expected_scout_token) {
             // Divergence! Scout guessed wrong.
             // Rollback scout KV-cache by the number of steps it is currently ahead.
-            // The Scout evaluated the current token (valid) + sq_size speculative tokens.
-            if (sq_size > 0) {
-                scout.rollback(sq_size);
+            // We must NOT rollback the current step which was valid! Only the (sq_size - 1) speculative steps.
+            if (sq_size > 1) {
+                scout.rollback(sq_size - 1);
             }
             
             // Flush the lookahead queue

@@ -716,12 +716,7 @@ void smoe_metal_fused_ffn(SmoeMetalCtx*   ctx,
     }];
 
     [cmd commit];
-
-    // For now we still wait for completion in debug mode to maintain compatibility
-    // In production this would be removed or replaced with proper async handling
-    #ifdef SMOE_DEBUG
     [cmd waitUntilCompleted];
-    #endif
 
     } // end @autoreleasepool
 }
@@ -807,12 +802,7 @@ void smoe_metal_scout_matvec(SmoeMetalCtx* ctx,
     }];
 
     [cmd commit];
-
-    // For now we still wait for completion in debug mode to maintain compatibility
-    // In production this would be removed or replaced with proper async handling
-    #ifdef SMOE_DEBUG
     [cmd waitUntilCompleted];
-    #endif
 }
 
 void smoe_metal_scout_matvec_batch(SmoeMetalCtx* ctx,
