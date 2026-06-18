@@ -43,7 +43,7 @@ def main():
     parser.add_argument("--scout", type=str, default="vault/deepseek-chat.scout.safetensors", help="Path to scout safetensors")
     parser.add_argument("--model", type=str, default="deepseek-ai/DeepSeek-MoE-16B-chat", help="HuggingFace model ID for tokenizer")
     parser.add_argument("--tokens", type=int, default=100, help="Max tokens to generate per response")
-    parser.add_argument("--ring", type=int, default=1024, help="Ring buffer slot count")
+    parser.add_argument("--ring", type=int, default=64, help="Ring buffer slot count")
     parser.add_argument("--workers", type=int, default=4, help="I/O worker thread count")
     parser.add_argument("--temperature", type=float, default=0.6, help="Sampling temperature")
     parser.add_argument("--top-p", type=float, default=0.95, help="Top-p sampling")

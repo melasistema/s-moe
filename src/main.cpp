@@ -361,6 +361,7 @@ int main(int argc, char* argv[]) {
 
     // ── Phase 2: Streamer init ────────────────────────────────
     smoe::io::Streamer streamer(vault_path, ring_size, num_workers, slot_bytes);
+    smoe_metal_register_buffer(metal, streamer.pool_data(), streamer.pool_size());
 
     // ── Phase 4: Scout init ───────────────────────────────────
     smoe::scout::Scout scout(scout_path, metal);  // scout_path may be nullptr (heuristic only)
@@ -670,6 +671,11 @@ int main(int argc, char* argv[]) {
                     while (!slot) {
                         slot = streamer.claim_specific(pred.layer_id, pred.expert_ids[e]);
                         if (!slot) {
+                            // If the expert was dropped due to a full ring buffer earlier,
+                            // we must lazily re-request it now that previous layers have freed slots!
+                            if (spin % 100000 == 0) {
+                                streamer.prefetch(pred.layer_id, pred.expert_ids[e]);
+                            }
                             std::this_thread::yield();
                             spin++;
                             if (spin == 5000000) {

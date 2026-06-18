@@ -923,14 +923,37 @@ ScoutOutput Scout::Impl::neural_forward(uint32_t token_id) noexcept {
 
         // g. Heavy Expert Gate Prediction (for l >= 1)
         if (l >= 1) {
+            // For the first layer that requires gate prediction, we'll batch all predictions together
+            if (l == 1) {
+                // Batch all 27 gate predictions into a single Metal call
+                const float* batch_weights[NUM_MOE_LAYERS];
+                const float* batch_inputs[NUM_MOE_LAYERS] = { normed }; // Same input for all layers
+                float* batch_outputs[NUM_MOE_LAYERS];
+                uint32_t batch_rows[NUM_MOE_LAYERS];
+                uint32_t batch_cols[NUM_MOE_LAYERS];
+
+                // Collect all gate predictions for this forward pass
+                for (uint32_t layer_idx = 0; layer_idx < NUM_MOE_LAYERS; ++layer_idx) {
+                    batch_weights[layer_idx] = gate_w[layer_idx];
+                    batch_outputs[layer_idx] = gate_scores_batch + layer_idx * GATE_ROWS;
+                    batch_rows[layer_idx] = GATE_ROWS;
+                    batch_cols[layer_idx] = D_MODEL;
+                }
+
+                if (metal_ctx) {
+                    smoe_metal_scout_matvec_batch(metal_ctx, batch_weights, batch_inputs, batch_outputs, batch_rows, batch_cols, NUM_MOE_LAYERS);
+                } else {
+                    for (uint32_t layer_idx = 0; layer_idx < NUM_MOE_LAYERS; ++layer_idx) {
+                        float* scores = gate_scores_batch + layer_idx * GATE_ROWS;
+                        matvec(scores, gate_w[layer_idx], normed, GATE_ROWS, D_MODEL);
+                    }
+                }
+            }
+
+            // Extract results for this specific layer
             ExpertPrediction& pred = out.routing[l - 1];
             pred.layer_id = l;
             float* scores = gate_scores_batch + (l - 1) * GATE_ROWS;
-            if (metal_ctx) {
-                smoe_metal_scout_matvec(metal_ctx, gate_w[l - 1], normed, scores, GATE_ROWS, D_MODEL);
-            } else {
-                matvec(scores, gate_w[l - 1], normed, GATE_ROWS, D_MODEL);
-            }
             pred.count = top_k(scores, GATE_ROWS, MAX_ACTIVE, pred.expert_ids, pred.expert_weights);
         }
 

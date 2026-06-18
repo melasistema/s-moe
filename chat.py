@@ -1,71 +1,89 @@
+#!/usr/bin/env python3
 import os
 import sys
 import subprocess
-import signal
 from transformers import AutoTokenizer
 
-print("Loading tokenizer...", end="", flush=True)
-tokenizer = AutoTokenizer.from_pretrained("deepseek-ai/DeepSeek-MoE-16B-chat", trust_remote_code=True)
-print(" OK")
+# ANSI aesthetic colors for the Utopian experience
+CYAN = '\033[96m'
+MAGENTA = '\033[95m'
+GREEN = '\033[92m'
+RESET = '\033[0m'
+BOLD = '\033[1m'
 
-def chat_loop():
-    messages = []
-    print("\nS-MoE Chat Console (DeepSeek-MoE-16B)")
-    print("Type 'quit' or 'exit' to leave.")
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+def main():
+    print(f"{CYAN}{BOLD}=== S-MoE Utopia Console ==={RESET}")
+    print(f"{CYAN}Initializing DeepSeek-MoE-16B tokenizer...{RESET}", end="", flush=True)
+    tokenizer = AutoTokenizer.from_pretrained("deepseek-ai/DeepSeek-MoE-16B-chat", trust_remote_code=True)
+    print(f" {GREEN}[OK]{RESET}\n")
+    
+    print(f"{MAGENTA}Welcome to the democratic frontier of AI.{RESET}")
+    print(f"{MAGENTA}Type 'quit' or 'exit' to escape.{RESET}")
     print("-" * 50)
+    
+    messages = []
     
     while True:
         try:
-            user_input = input("\nYou: ")
-        except (KeyboardInterrupt, EOFError):
+            user_input = input(f"\n{BOLD}You:{RESET} ")
+        except (EOFError, KeyboardInterrupt):
+            print()
             break
             
         if user_input.strip().lower() in ['quit', 'exit']:
             break
+        if not user_input.strip():
+            continue
             
         messages.append({"role": "user", "content": user_input})
         
-        prompt_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        tokens = tokenizer.encode(prompt_text)
-        tokens_str = ",".join(map(str, tokens))
+        token_ids = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
+        token_str = ",".join(map(str, token_ids))
         
         cmd = [
-            "./build/smoe-engine",
-            "--vault", "./vault/deepseek-chat.smoe",
-            "--scout", "./vault/deepseek-chat.scout.safetensors",
-            "--tokens-in", tokens_str,
+            "build/smoe-engine",
+            "--vault", "vault/deepseek-chat.smoe",
+            "--scout", "vault/deepseek-chat.scout.safetensors",
+            "--tokens-in", token_str,
             "--tokens", "256",
-            "--raw-ids"
+            "--ring", "512",
+            "--workers", "4",
+            "--temperature", "0.6",
+            "--top-p", "0.95",
+            "--raw-ids" # Most robust decoding via python
         ]
         
-        print("S-MoE: ", end="", flush=True)
+        print(f"{CYAN}{BOLD}S-MoE:{RESET} ", end="", flush=True)
         
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         
         response_tokens = []
-        token_str = ""
+        token_buffer = ""
         try:
             while True:
-                output = process.stdout.read(1)
-                if output == '' and process.poll() is not None:
+                char = process.stdout.read(1)
+                if not char and process.poll() is not None:
                     break
-                if output:
-                    if output.isspace():
-                        if token_str:
-                            tok_id = int(token_str)
-                            token_str = ""
+                if char:
+                    if char.isspace():
+                        if token_buffer:
+                            tok_id = int(token_buffer)
+                            token_buffer = ""
                             response_tokens.append(tok_id)
-                            # decode only the last token and print
-                            print(tokenizer.decode([tok_id]), end="", flush=True)
+                            # Decode and print safely
+                            print(tokenizer.decode([tok_id], skip_special_tokens=True), end="", flush=True)
                     else:
-                        token_str += output
+                        token_buffer += char
         except KeyboardInterrupt:
             process.kill()
-            print("\n[Interrupted]")
+            print(f"\n{MAGENTA}[Generation Interrupted]{RESET}")
             continue
             
         print()
-        response_text = tokenizer.decode(response_tokens)
-        messages.append({"role": "assistant", "content": response_text})
-            
-chat_loop()
+        response_text = tokenizer.decode(response_tokens, skip_special_tokens=True)
+        messages.append({"role": "assistant", "content": response_text.strip()})
+
+if __name__ == "__main__":
+    main()

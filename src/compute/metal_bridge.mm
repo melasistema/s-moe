@@ -424,6 +424,7 @@ struct SmoeMetalCtx {
 
     struct RegisteredBuffer {
         const void* ptr;
+        size_t length;
         id<MTLBuffer> buffer;
     };
     std::vector<RegisteredBuffer> registered_buffers;
@@ -431,20 +432,23 @@ struct SmoeMetalCtx {
 
 static id<MTLBuffer> get_registered_buffer(SmoeMetalCtx* ctx, const void* ptr, size_t sz, NSUInteger& out_offset) {
     uintptr_t p = reinterpret_cast<uintptr_t>(ptr);
+    for (const auto& reg : ctx->registered_buffers) {
+        uintptr_t base = reinterpret_cast<uintptr_t>(reg.ptr);
+        if (p >= base && (p + sz) <= (base + reg.length)) {
+            out_offset = p - base;
+            return reg.buffer;
+        }
+    }
+    
     uintptr_t aligned_p = p & ~(smoe::PAGE_SIZE - 1);
     out_offset = p - aligned_p;
-    const void* aligned_ptr = reinterpret_cast<const void*>(aligned_p);
-
-    for (const auto& reg : ctx->registered_buffers) {
-        if (reg.ptr == aligned_ptr) return reg.buffer;
-    }
     size_t aligned_sz = ((p + sz + (smoe::PAGE_SIZE - 1)) & ~(smoe::PAGE_SIZE - 1)) - aligned_p;
-    id<MTLBuffer> buf = [ctx->device newBufferWithBytesNoCopy:const_cast<void*>(aligned_ptr)
+    id<MTLBuffer> buf = [ctx->device newBufferWithBytesNoCopy:reinterpret_cast<void*>(aligned_p)
                                           length:aligned_sz
                                          options:MTLResourceStorageModeShared
                                      deallocator:nil];
     if (buf) {
-        ctx->registered_buffers.push_back({aligned_ptr, buf});
+        ctx->registered_buffers.push_back({reinterpret_cast<const void*>(aligned_p), aligned_sz, buf});
     }
     return buf;
 }
@@ -632,33 +636,20 @@ void smoe_metal_fused_ffn(SmoeMetalCtx*   ctx,
     MTLResourceOptions uma = MTLResourceStorageModeShared;
 
     @autoreleasepool {
-        auto wrap = [&](const void* ptr, size_t sz, NSUInteger& out_offset) -> id<MTLBuffer> {
-            uintptr_t p = reinterpret_cast<uintptr_t>(ptr);
-            uintptr_t aligned_p = p & ~(smoe::PAGE_SIZE - 1);
-            out_offset = p - aligned_p;
-            
-            size_t aligned_sz = ((p + sz + (smoe::PAGE_SIZE - 1)) & ~(smoe::PAGE_SIZE - 1)) - aligned_p;
-            
-            return [ctx->device newBufferWithBytesNoCopy:reinterpret_cast<void*>(aligned_p)
-                                                  length:aligned_sz
-                                                 options:uma
-                                             deallocator:nil];
-        };
-
         // Compute byte sizes for each sub-tensor
         uint64_t packed_bytes = static_cast<uint64_t>(rows) * cols * bits / 8;
         uint64_t scale_bytes  = static_cast<uint64_t>(rows) * cols / group_size * sizeof(uint16_t);
         uint64_t input_bytes  = static_cast<uint64_t>(cols)  * sizeof(float);
         uint64_t output_bytes = static_cast<uint64_t>(rows)  * sizeof(float);
 
-        NSUInteger off_gp = 0, off_gs = 0, off_up = 0, off_us = 0, off_dp = 0, off_ds = 0, off_in = 0, off_ou = 0, off_hd = 0;
-        id<MTLBuffer> buf_gp = wrap(packed_gate,  packed_bytes, off_gp);
-        id<MTLBuffer> buf_gs = wrap(scales_gate,  scale_bytes,  off_gs);
-        id<MTLBuffer> buf_up = wrap(packed_up,    packed_bytes, off_up);
-        id<MTLBuffer> buf_us = wrap(scales_up,    scale_bytes,  off_us);
-        id<MTLBuffer> buf_dp = wrap(packed_down,  packed_bytes, off_dp);
-        id<MTLBuffer> buf_ds = wrap(scales_down,  scale_bytes,  off_ds);
-        
+        NSUInteger off_gp = 0, off_gs = 0, off_up = 0, off_us = 0, off_dp = 0, off_ds = 0;
+        id<MTLBuffer> buf_gp = get_registered_buffer(ctx, packed_gate,  packed_bytes, off_gp);
+        id<MTLBuffer> buf_gs = get_registered_buffer(ctx, scales_gate,  scale_bytes,  off_gs);
+        id<MTLBuffer> buf_up = get_registered_buffer(ctx, packed_up,    packed_bytes, off_up);
+        id<MTLBuffer> buf_us = get_registered_buffer(ctx, scales_up,    scale_bytes,  off_us);
+        id<MTLBuffer> buf_dp = get_registered_buffer(ctx, packed_down,  packed_bytes, off_dp);
+        id<MTLBuffer> buf_ds = get_registered_buffer(ctx, scales_down,  scale_bytes,  off_ds);
+
         id<MTLBuffer> buf_in = ctx->input_buf;
         id<MTLBuffer> buf_hd = ctx->hidden_buf;
         id<MTLBuffer> buf_ou = ctx->output_buf;
@@ -713,15 +704,25 @@ void smoe_metal_fused_ffn(SmoeMetalCtx*   ctx,
 
     [enc endEncoding];
 
-    // Synchronous commit for Phase 3 validation.
-    // Phase 4 will convert this to async with a completion handler
-    // that signals the Streamer's ring via atomic flag.
+    // Asynchronous commit - use completion handler to signal when done
+    __block bool completed = false;
+    __block uint64_t local_dispatch_count = 0;
+
+    [cmd addCompletedHandler:^(id<MTLCommandBuffer> buffer) {
+        // This is called asynchronously when the command buffer completes
+        std::memcpy(output_vec, [buf_ou contents], cols * sizeof(float));
+        local_dispatch_count = ctx->dispatch_count.fetch_add(1, std::memory_order_relaxed);
+        completed = true;
+    }];
+
     [cmd commit];
+
+    // For now we still wait for completion in debug mode to maintain compatibility
+    // In production this would be removed or replaced with proper async handling
+    #ifdef SMOE_DEBUG
     [cmd waitUntilCompleted];
+    #endif
 
-    std::memcpy(output_vec, [buf_ou contents], cols * sizeof(float));
-
-    ctx->dispatch_count.fetch_add(1, std::memory_order_relaxed);
     } // end @autoreleasepool
 }
 
@@ -794,10 +795,24 @@ void smoe_metal_scout_matvec(SmoeMetalCtx* ctx,
     [enc dispatchThreads:gridSize threadsPerThreadgroup:tgSize];
 
     [enc endEncoding];
-    [cmd commit];
-    [cmd waitUntilCompleted];
 
-    ctx->dispatch_count.fetch_add(1, std::memory_order_relaxed);
+    // Asynchronous commit - use completion handler to signal when done
+    __block bool completed = false;
+    __block uint64_t local_dispatch_count = 0;
+
+    [cmd addCompletedHandler:^(id<MTLCommandBuffer> buffer) {
+        // This is called asynchronously when the command buffer completes
+        local_dispatch_count = ctx->dispatch_count.fetch_add(1, std::memory_order_relaxed);
+        completed = true;
+    }];
+
+    [cmd commit];
+
+    // For now we still wait for completion in debug mode to maintain compatibility
+    // In production this would be removed or replaced with proper async handling
+    #ifdef SMOE_DEBUG
+    [cmd waitUntilCompleted];
+    #endif
 }
 
 void smoe_metal_scout_matvec_batch(SmoeMetalCtx* ctx,
@@ -864,8 +879,10 @@ void smoe_metal_scout_matvec_batch(SmoeMetalCtx* ctx,
 void smoe_metal_register_buffer(SmoeMetalCtx* ctx, const void* ptr, size_t size_in_bytes) {
     if (!ctx || !ptr) return;
 
+    uintptr_t p = reinterpret_cast<uintptr_t>(ptr);
     for (const auto& reg : ctx->registered_buffers) {
-        if (reg.ptr == ptr) return;
+        uintptr_t base = reinterpret_cast<uintptr_t>(reg.ptr);
+        if (p >= base && (p + size_in_bytes) <= (base + reg.length)) return;
     }
 
     size_t aligned = (size_in_bytes + (smoe::PAGE_SIZE - 1)) & ~(smoe::PAGE_SIZE - 1);
@@ -874,7 +891,7 @@ void smoe_metal_register_buffer(SmoeMetalCtx* ctx, const void* ptr, size_t size_
                                                       options:MTLResourceStorageModeShared
                                                   deallocator:nil];
     if (buf) {
-        ctx->registered_buffers.push_back({ptr, buf});
+        ctx->registered_buffers.push_back({ptr, aligned, buf});
     } else {
         std::fprintf(stderr, "[smoe_metal] ERROR: failed to register buffer at %p (%zu bytes)\n", ptr, size_in_bytes);
     }

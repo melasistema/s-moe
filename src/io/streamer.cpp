@@ -523,13 +523,17 @@ uint32_t Streamer::ring_size() const noexcept {
 }
 
 uint32_t Streamer::ready_count() const noexcept {
-    uint32_t n = 0;
+    uint32_t count = 0;
     for (uint32_t i = 0; i < impl_->ring_sz; ++i) {
-        if (impl_->slots[i].state.load(std::memory_order_relaxed) == SlotState::READY)
-            ++n;
+        if (impl_->slots[i].state.load(std::memory_order_relaxed) == SlotState::READY) {
+            count++;
+        }
     }
-    return n;
+    return count;
 }
+
+const void* Streamer::pool_data() const noexcept { return impl_->data_pool; }
+uint64_t Streamer::pool_size() const noexcept { return static_cast<uint64_t>(impl_->ring_sz) * impl_->slot_cap; }
 
 void Streamer::print_debug_states() const noexcept {
     uint32_t states[4] = {0};

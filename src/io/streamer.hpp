@@ -127,6 +127,10 @@ public:
     [[nodiscard]] uint32_t ring_size()    const noexcept;
     [[nodiscard]] uint32_t ready_count()  const noexcept;
     void print_debug_states()             const noexcept;
+    
+    // ── Memory Pool access (for Metal registration) ──
+    [[nodiscard]] const void* pool_data() const noexcept;
+    [[nodiscard]] uint64_t    pool_size() const noexcept;
 
     Streamer(const Streamer&)            = delete;
     Streamer& operator=(const Streamer&) = delete;
