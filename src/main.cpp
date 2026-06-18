@@ -674,70 +674,79 @@ int main(int argc, char* argv[]) {
                 std::memset(routed_out, 0, 2048 * sizeof(float));
 
                 const smoe::scout::ExpertPrediction& pred = scout_out.routing[l - 1];
-                for (uint32_t e = 0; e < pred.count; ++e) {
-                    smoe::io::RingSlot* slot = nullptr;
-                    // Wait indefinitely for specific slot to become READY (SSD can take ~100ms)
-                    uint64_t spin = 0;
-                    while (!slot) {
-                        slot = streamer.claim_specific(pred.layer_id, pred.expert_ids[e]);
-                        if (!slot) {
-                            // If the expert was dropped due to a full ring buffer earlier,
-                            // we must lazily re-request it now that previous layers have freed slots!
+                bool executed[8] = {false};
+                uint32_t num_executed = 0;
+                uint64_t spin = 0;
+
+                while (num_executed < pred.count) {
+                    bool made_progress = false;
+                    for (uint32_t e = 0; e < pred.count; ++e) {
+                        if (executed[e]) continue;
+
+                        smoe::io::RingSlot* slot = streamer.claim_specific(pred.layer_id, pred.expert_ids[e]);
+                        
+                        if (slot) {
+                            if (slot->data_size > 0) {
+                                const uint8_t*  packed_gate = slot->data + expert_layout.gate_packed_offset;
+                                const uint16_t* scales_gate = reinterpret_cast<const uint16_t*>(slot->data + expert_layout.gate_scales_offset);
+                                const uint8_t*  packed_up   = slot->data + expert_layout.up_packed_offset;
+                                const uint16_t* scales_up   = reinterpret_cast<const uint16_t*>(slot->data + expert_layout.up_scales_offset);
+                                const uint8_t*  packed_down = slot->data + expert_layout.down_packed_offset;
+                                const uint16_t* scales_down = reinterpret_cast<const uint16_t*>(slot->data + expert_layout.down_scales_offset);
+
+                                static float expert_hidden_scratch[4096];
+                                static float expert_output_vec[4096];
+                                std::memset(expert_hidden_scratch, 0, sizeof(expert_hidden_scratch));
+                                std::memset(expert_output_vec, 0, sizeof(expert_output_vec));
+
+                                smoe_metal_fused_ffn(
+                                    metal,
+                                    packed_gate, scales_gate,
+                                    packed_up,   scales_up,
+                                    packed_down, scales_down,
+                                    normed,
+                                    expert_hidden_scratch,
+                                    expert_output_vec,
+                                    expert_layout.gate_rows,
+                                    expert_layout.gate_cols,
+                                    vault_hdr.group_size,
+                                    vault_hdr.bits
+                                );
+
+                                // Accumulate
+                                float weight = pred.expert_weights[e];
+                                if (l == 1 && n == 0 && g_debug) {
+                                    std::fprintf(stderr, "[L1] Routed Expert %d, weight = %.4f\n", pred.expert_ids[e], weight);
+                                }
+                                for (uint32_t d = 0; d < 2048; ++d) {
+                                    routed_out[d] += weight * expert_output_vec[d];
+                                }
+                                
+                                smoe_metal_swap_buffers(metal);
+                            }
+                            streamer.release(slot);
+                            executed[e] = true;
+                            num_executed++;
+                            made_progress = true;
+                        } else {
                             if (spin % 100000 == 0) {
                                 streamer.prefetch(pred.layer_id, pred.expert_ids[e]);
-                            }
-                            std::this_thread::yield();
-                            spin++;
-                            if (spin == 5000000) {
-                                std::fprintf(stderr, "\n[HANG] Waiting for L%u E%u (ready_count=%u, hits=%llu, misses=%llu)\n",
-                                             pred.layer_id, pred.expert_ids[e],
-                                             streamer.ready_count(),
-                                             streamer.hit_count(),
-                                             streamer.miss_count());
-                                streamer.print_debug_states();
-                                std::fflush(stderr);
                             }
                         }
                     }
 
-                    if (slot && slot->data_size > 0) {
-                        const uint8_t*  packed_gate = slot->data + expert_layout.gate_packed_offset;
-                        const uint16_t* scales_gate = reinterpret_cast<const uint16_t*>(slot->data + expert_layout.gate_scales_offset);
-                        const uint8_t*  packed_up   = slot->data + expert_layout.up_packed_offset;
-                        const uint16_t* scales_up   = reinterpret_cast<const uint16_t*>(slot->data + expert_layout.up_scales_offset);
-                        const uint8_t*  packed_down = slot->data + expert_layout.down_packed_offset;
-                        const uint16_t* scales_down = reinterpret_cast<const uint16_t*>(slot->data + expert_layout.down_scales_offset);
-
-                        static float expert_hidden_scratch[4096];
-                        static float expert_output_vec[4096];
-                        std::memset(expert_hidden_scratch, 0, sizeof(expert_hidden_scratch));
-                        std::memset(expert_output_vec, 0, sizeof(expert_output_vec));
-
-                        smoe_metal_fused_ffn(
-                            metal,
-                            packed_gate, scales_gate,
-                            packed_up,   scales_up,
-                            packed_down, scales_down,
-                            normed,
-                            expert_hidden_scratch,
-                            expert_output_vec,
-                            expert_layout.gate_rows,
-                            expert_layout.gate_cols,
-                            vault_hdr.group_size,
-                            vault_hdr.bits
-                        );
-
-                        // Accumulate
-                        float weight = pred.expert_weights[e];
-                        if (l == 1 && n == 0 && g_debug) {
-                            std::fprintf(stderr, "[L1] Routed Expert %d, weight = %.4f\n", pred.expert_ids[e], weight);
+                    if (!made_progress) {
+                        std::this_thread::yield();
+                        spin++;
+                        if (spin == 5000000) {
+                            std::fprintf(stderr, "\n[HANG] Waiting for L%u remaining experts (ready_count=%u, hits=%llu, misses=%llu)\n",
+                                         pred.layer_id,
+                                         streamer.ready_count(),
+                                         streamer.hit_count(),
+                                         streamer.miss_count());
+                            streamer.print_debug_states();
+                            std::fflush(stderr);
                         }
-                        for (uint32_t d = 0; d < 2048; ++d) {
-                            routed_out[d] += weight * expert_output_vec[d];
-                        }
-                        
-                        streamer.release(slot);
-                        smoe_metal_swap_buffers(metal);
                     }
                 }
 

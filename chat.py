@@ -42,13 +42,22 @@ def main():
         token_ids = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
         token_str = ",".join(map(str, token_ids))
         
+        # Auto-tune ring size based on system RAM
+        ram_gb = os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES') / (1024**3)
+        if ram_gb > 36:
+            ring_size = "4096"
+        elif ram_gb > 20:
+            ring_size = "2048"
+        else:
+            ring_size = "512"
+
         cmd = [
             "build/smoe-engine",
             "--vault", "vault/deepseek-chat.smoe",
             "--scout", "vault/deepseek-chat.scout.safetensors",
             "--tokens-in", token_str,
             "--tokens", "256",
-            "--ring", "512",
+            "--ring", ring_size,
             "--workers", "4",
             "--temperature", "0.3",
             "--top-p", "0.95",
@@ -56,7 +65,7 @@ def main():
             "--raw-ids" # Most robust decoding via python
         ]
         
-        print(f"{CYAN}{BOLD}S-MoE:{RESET} ", end="", flush=True)
+        print(f"{CYAN}{BOLD}S-MoE [RAM: {ram_gb:.1f}GB | Ring: {ring_size}]:{RESET} ", end="", flush=True)
         
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         
