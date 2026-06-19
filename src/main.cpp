@@ -490,8 +490,6 @@ int main(int argc, char* argv[]) {
 
         if (is_prompt) {
             heavy_cur_token = prompt_tokens[n];
-            // CRITICAL: Force the Scout to follow the prompt sequence exactly.
-            // Otherwise, it hallucinates its own tokens and scrambles its KV cache!
             scout_cur_token = prompt_tokens[n];
         } else {
             heavy_cur_token = next_heavy_token;
@@ -516,6 +514,12 @@ int main(int argc, char* argv[]) {
         {
             ActiveExpertsContext act_ctx { scout_queue, sq_head, sq_size };
             streamer.prune_slots(is_expert_active, &act_ctx);
+        }
+
+        // If the lookahead queue is empty (due to prompt, divergence, or heavy catching up),
+        // the Scout MUST sync with the Heavy model's current token to provide accurate routing.
+        if (sq_size == 0) {
+            scout_cur_token = heavy_cur_token;
         }
 
         // ── Phase A: Scout Speculative Lookahead ──────────────
@@ -905,10 +909,9 @@ int main(int argc, char* argv[]) {
         }
 
         // ── Phase C: Speculative Divergence Check ─────────────
-        if (heavy_cur_token != expected_scout_token) {
+        if (!is_prompt && heavy_cur_token != expected_scout_token) {
             // Divergence! Scout guessed wrong.
             // Rollback scout KV-cache by the number of steps it is currently ahead.
-            // We must NOT rollback the current step which was valid! Only the (sq_size - 1) speculative steps.
             if (sq_size > 1) {
                 scout.rollback(sq_size - 1);
             }
@@ -918,15 +921,12 @@ int main(int argc, char* argv[]) {
             sq_head = 0;
             sq_tail = 0;
             
-            // Force the scout back to the true heavy token
-            scout_cur_token = heavy_cur_token;
-
             // Immediately prune discarded experts
             ActiveExpertsContext act_ctx { scout_queue, sq_head, sq_size };
             streamer.prune_slots(is_expert_active, &act_ctx);
         } else {
-            // Scout guessed correctly!
-            // Consume the head of the queue. The scout is still ahead!
+            // Scout guessed correctly (or we are in prompt phase)
+            // Consume the head of the queue.
             sq_head = (sq_head + 1) % LOOKAHEAD_K;
             sq_size--;
         }
