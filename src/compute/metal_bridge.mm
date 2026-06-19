@@ -695,6 +695,14 @@ void* smoe_metal_fused_ffn(SmoeMetalCtx*   ctx,
         [enc dispatchThreads:gridSize threadsPerThreadgroup:tgSize];
     }
 
+    // Explicit barrier to ensure gate_up finishes writing to buf_hd before down reads it
+    if (@available(macOS 10.14, *)) {
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    } else {
+        [enc endEncoding];
+        enc = [cmd computeCommandEncoder];
+    }
+
     // ── Pass 2: smoe_down ─────────────────────────────────────
     [enc setComputePipelineState:ctx->down_pso];
     [enc setBuffer:buf_dp offset:off_dp atIndex:4];

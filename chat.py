@@ -61,6 +61,7 @@ def main():
             "--workers", "4",
             "--temperature", "0.6",
             "--top-p", "0.95",
+            "--top-k", "50",
             "--rep-penalty", "1.1",
             "--raw-ids" # Most robust decoding via python
         ]

@@ -283,8 +283,9 @@ int main(int argc, char* argv[]) {
     uint32_t    num_workers = DEFAULT_WORKERS;
     uint64_t    slot_mb     = DEFAULT_SLOT_MB;
     float       temperature = 0.6f;
-    float       top_p       = 0.95f;
-    float       rep_penalty = 1.1f;
+    float       top_p       = 0.9f;
+    uint32_t    top_k       = 50;
+    float       rep_penalty = 1.0f;
 
     for (int i = 1; i < argc; ++i) {
         auto arg = [&](const char* flag) {
@@ -299,7 +300,8 @@ int main(int argc, char* argv[]) {
         else if (arg("--workers"))   { num_workers = static_cast<uint32_t>(std::atoi(argv[++i])); }
         else if (arg("--slot-mb"))   { slot_mb     = static_cast<uint64_t>(std::atoll(argv[++i])); }
         else if (arg("--temperature")){ temperature = static_cast<float>(std::atof(argv[++i])); }
-        else if (arg("--top-p"))     { top_p       = static_cast<float>(std::atof(argv[++i])); }
+        else if (arg("--top-p"))      { top_p = static_cast<float>(std::atof(argv[++i])); }
+        else if (arg("--top-k"))      { top_k = static_cast<uint32_t>(std::atoi(argv[++i])); }
         else if (arg("--rep-penalty")){ rep_penalty = static_cast<float>(std::atof(argv[++i])); }
         else if (std::strcmp(argv[i], "--debug") == 0) { g_debug = true; }
         else if (std::strcmp(argv[i], "--raw-ids") == 0) { g_raw_ids = true; }
@@ -800,8 +802,16 @@ int main(int argc, char* argv[]) {
         // Repetition penalty
         if (rep_penalty != 1.0f) {
             bool penalized[102400] = {false};
-            for (uint32_t i = 0; i < history_len; ++i) {
+            uint32_t penalty_last_n = 64;
+            uint32_t start_idx = (history_len > penalty_last_n) ? (history_len - penalty_last_n) : 0;
+            
+            for (uint32_t i = start_idx; i < history_len; ++i) {
                 uint32_t tok = token_history[i];
+                // Exempt common punctuation and special tokens from penalty
+                // 13: '.', 11: ',', 185: '\n', 30: '?', 0: '!', 100000: BOS, 100001: EOS
+                if (tok == 13 || tok == 11 || tok == 185 || tok == 30 || tok == 0 || tok == 100000 || tok == 100001) {
+                    continue;
+                }
                 if (!penalized[tok]) {
                     if (scores[tok] <= 0) {
                         scores[tok] *= rep_penalty;
@@ -858,7 +868,7 @@ int main(int argc, char* argv[]) {
             for (uint32_t v = 0; v < 102400; ++v) {
                 cumsum += probs[v].p;
                 top_k_len++;
-                if (cumsum >= top_p) break;
+                if (cumsum >= top_p || top_k_len >= top_k) break;
             }
             
             std::uniform_real_distribution<float> dist(0.0f, cumsum);
