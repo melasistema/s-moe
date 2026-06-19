@@ -1,22 +1,30 @@
 # S-MoE: Seismic Mixture of Experts Engine
 
-> **Utopia on consumer hardware.** High-fidelity local frontier LLM inference running completely within the democratic boundaries of a standard 16GB/32GB Apple Silicon MacBook.
+> **Rock, Paper, Silicon.** A rebellious attempt to shatter the "Monolithic Delusion" of Silicon Valley gatekeepers. S-MoE enables high-fidelity frontier LLM inference completely within the democratic boundaries of a standard 16GB/32GB Apple Silicon MacBook.
 
 ---
 
-## The Vision
-Traditional local LLM deployment is trapped behind a financial paywall. Running a 284-billion parameter frontier model natively requires an enterprise machine with hundreds of gigabytes of Unified Memory.
+## The Monolithic Delusion
 
-**S-MoE** breaks this paradigm by rethinking the computational medium. Instead of holding the entire model graph statically in memory, S-MoE treats your Mac’s ultra-fast NVMe flash storage ($~7.4\text{ GB/s}$) as the primary model repository, using predictive streaming mechanics to pipe weights into a tiny, hyper-active memory buffer fractions of a second before they are executed by the GPU.
+Silicon Valley has a bucket problem. 
+
+To run a modern frontier AI model—like DeepSeek with its **284 billion parameters**—the corporate high priests of compute insist that you must worship at the altar of the unified memory wall. They tell us we must host the entire mathematical mountain in RAM simultaneously, forcing developers to rent $15,000 H100 cloud instances or buy half-terabyte workstations.
+
+**The truth they hide:** In a true Mixture of Experts (MoE) architecture, 95% of the model is completely silent at any given millisecond. The weights are just cold stone; only a tiny fraction of "experts" fire for any single word. Yet, standard runtimes keep gigabytes of dead parameters sitting in precious RAM just in case.
+
+Co-designed with an AI pair-programming agent, **S-MoE** breaks this paradigm. We don't fight the memory wall by trying to cram a massive model into RAM. Instead, we treat your Mac’s ultra-fast NVMe SSD ($~7.4\text{ GB/s}$) as the primary solid repository, and turn unified memory into a transient, fluid execution medium.
 
 ---
 
-## How It Works: The Phonon Metaphor
-S-MoE splits monolithic models into two distinct, high-performance layers:
+## The Phonon Metaphor: Acoustic JIT Streaming
 
-1. **The Surface Scout:** A lightweight, highly efficient 1.5B parameter model sitting permanently in memory (~3GB). As it begins processing your prompt, it listens to the semantic trajectory of the text and projects a "seismic map" forecasting exactly which specialized experts will be needed up to 10 tokens into the future.
-2. **The Sub-Surface Core:** The massive collection of hundreds of deep experts rests cold on the SSD, shattered into custom page-aligned binary segments.
-3. **The Asynchronous JIT Pump:** Guided by the Scout's predictive map, specialized background workers read data asynchronously from the storage controller using Direct I/O (`F_NOCACHE`), packing the upcoming experts into a cyclic execution ring buffer. The GPU processes the weights, flushes them instantly, and hops to the next incoming wave.
+Standard models blast inputs into monolithic weights and hope they fit in RAM. We took inspiration from Filippo Biondi's unorthodox application of Synthetic Aperture Radar (SAR) for deep subsurface tomography. When an electromagnetic wave strikes a pyramid's surface, it generates mechanical sound waves (phonons) that ripple through the rock, revealing the hidden voids beneath.
+
+S-MoE splits monolithic models into a similar acoustic sensor array:
+
+1. **The Surface Scout (The EM Strike):** A lightweight, highly efficient 1.5B parameter model sitting permanently in memory (~3GB). As it processes your prompt, it acts as a temporal oracle—calculating the semantic trajectory to predict exactly which specialized experts will be needed 5 to 10 tokens into the future. It computes the "sound" the model will make before the generation loop even gets there.
+2. **The Deep Strata (The Rock):** The massive 284B parameters rest cold on the SSD, shattered into custom page-aligned binary segments perfectly aligned to the Apple Silicon 16KB hardware boundary.
+3. **The Acoustic Receiver (The JIT Pump):** Guided by the Scout's phonon map, specialized background workers read data asynchronously using Direct I/O (`F_NOCACHE`), completely bypassing sluggish OS page caches. The incoming experts are packed into a cyclic ring buffer fractions of a second before the Metal GPU executes them, keeping total system RAM footprint incredibly low.
 
 ---
 
