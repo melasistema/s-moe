@@ -283,9 +283,10 @@ int main(int argc, char* argv[]) {
     uint32_t    num_workers = DEFAULT_WORKERS;
     uint64_t    slot_mb     = DEFAULT_SLOT_MB;
     float       temperature = 0.6f;
-    float       top_p       = 0.9f;
+    float       top_p       = 0.95f;
     uint32_t    top_k       = 50;
     float       rep_penalty = 1.0f;
+    std::vector<uint32_t> eos_ids = {100001};
 
     for (int i = 1; i < argc; ++i) {
         auto arg = [&](const char* flag) {
@@ -303,6 +304,16 @@ int main(int argc, char* argv[]) {
         else if (arg("--top-p"))      { top_p = static_cast<float>(std::atof(argv[++i])); }
         else if (arg("--top-k"))      { top_k = static_cast<uint32_t>(std::atoi(argv[++i])); }
         else if (arg("--rep-penalty")){ rep_penalty = static_cast<float>(std::atof(argv[++i])); }
+        else if (arg("--eos-ids")) {
+            eos_ids.clear();
+            std::string ids_str = argv[++i];
+            size_t pos = 0;
+            while ((pos = ids_str.find(',')) != std::string::npos) {
+                if (pos > 0) eos_ids.push_back(std::stoul(ids_str.substr(0, pos)));
+                ids_str.erase(0, pos + 1);
+            }
+            if (!ids_str.empty()) eos_ids.push_back(std::stoul(ids_str));
+        }
         else if (std::strcmp(argv[i], "--debug") == 0) { g_debug = true; }
         else if (std::strcmp(argv[i], "--raw-ids") == 0) { g_raw_ids = true; }
         else if (std::strcmp(argv[i], "--help") == 0 ||
@@ -365,12 +376,17 @@ int main(int argc, char* argv[]) {
     smoe::io::Streamer streamer(vault_path, ring_size, num_workers, slot_bytes);
     smoe_metal_register_buffer(metal, streamer.pool_data(), streamer.pool_size());
 
+    // ── Phase 4: Scout init ───────────────────────────────────
+    smoe::scout::Scout scout(scout_path, metal);  // scout_path may be nullptr (heuristic only)
+    const auto& cfg = scout.config();
+    const uint32_t num_layers = cfg.num_moe_layers + 1;
+
     // ── Cache Pre-Warming (Stealth Background Load) ───────────
-    std::thread prewarm_thread([&streamer, vault_hdr]() {
+    std::thread prewarm_thread([&streamer, vault_hdr, &cfg]() {
         uint32_t count = 0;
         // Leave 256 slots empty for speculative execution
         uint32_t max_prewarm = (streamer.ring_size() > 256) ? streamer.ring_size() - 256 : 0;
-        for (uint32_t l = 0; l < smoe::NUM_MOE_LAYERS && count < max_prewarm; ++l) {
+        for (uint32_t l = 0; l < cfg.num_moe_layers && count < max_prewarm; ++l) {
             for (uint32_t e = 0; e < vault_hdr.max_experts_per_layer && count < max_prewarm; ++e) {
                 if (streamer.prefetch(l, e)) count++;
                 // Sleep to trickle-load the cache, keeping the MPMC queue empty 
@@ -381,11 +397,7 @@ int main(int argc, char* argv[]) {
     });
     prewarm_thread.detach();
 
-    // ── Phase 4: Scout init ───────────────────────────────────
-    smoe::scout::Scout scout(scout_path, metal);  // scout_path may be nullptr (heuristic only)
-    const auto& cfg = scout.config();
     const uint32_t d_model = cfg.d_model;
-    const uint32_t num_layers = cfg.num_moe_layers + 1;
     const uint32_t ffn_dim = cfg.ffn_dim;
     const uint32_t shared_dim = 2816; // TODO: dynamically load shared expert dim if needed
     const uint32_t moe_start_layer = cfg.has_dense_layer_0 ? 1 : 0;
@@ -476,6 +488,8 @@ int main(int argc, char* argv[]) {
     float* heavy_kbuf = nullptr;
     float* heavy_vbuf = nullptr;
     float* heavy_attn_out = nullptr;
+    float* routed_out = smoe::allocate_aligned_float(d_model);
+    float* shared_out = smoe::allocate_aligned_float(d_model);
     
     // Allocate all on 16KB boundaries to guarantee Metal zero-copy wrapping works perfectly
     size_t heavy_hidden_aligned = (d_model * sizeof(float) + 16383) & ~16383; ::posix_memalign((void**)&heavy_hidden, 16384, heavy_hidden_aligned);
@@ -502,7 +516,7 @@ int main(int argc, char* argv[]) {
     uint32_t scout_cur_token = heavy_cur_token;
 
     // Speculative lookahead queue
-    static constexpr uint32_t GEN_LOOKAHEAD_K = 3;
+    static constexpr uint32_t GEN_LOOKAHEAD_K = 1;
     static constexpr uint32_t MAX_LOOKAHEAD = 64;
     static smoe::scout::ScoutOutput scout_queue[MAX_LOOKAHEAD];
     uint32_t sq_head = 0;
@@ -513,6 +527,7 @@ int main(int argc, char* argv[]) {
         const smoe::scout::ScoutOutput* queue;
         uint32_t head;
         uint32_t size;
+        uint32_t num_layers;
     };
 
     auto is_expert_active = [](uint32_t layer_id, uint32_t expert_id, void* ctx) -> bool {
@@ -521,7 +536,7 @@ int main(int argc, char* argv[]) {
             uint32_t idx = (c->head + i) % MAX_LOOKAHEAD;
             const auto& scout_out = c->queue[idx];
             if (layer_id == 0) continue;
-            if (layer_id - 1 < smoe::NUM_MOE_LAYERS) {
+            if (layer_id - 1 < c->num_layers) {
                 const auto& pred = scout_out.routing[layer_id - 1];
                 for (uint32_t e = 0; e < pred.count; ++e) {
                     if (pred.expert_ids[e] == expert_id) {
@@ -562,7 +577,7 @@ int main(int argc, char* argv[]) {
 
         // Clean up any leaked/discarded slots in the streamer
         {
-            ActiveExpertsContext act_ctx { scout_queue, sq_head, sq_size };
+            ActiveExpertsContext act_ctx { scout_queue, sq_head, sq_size, cfg.num_moe_layers };
             streamer.prune_slots(is_expert_active, &act_ctx);
         }
 
@@ -573,7 +588,11 @@ int main(int argc, char* argv[]) {
         }
 
         // ── Phase A: Scout Speculative Lookahead ──────────────
-        uint32_t target_sq_size = is_prompt ? std::min<uint32_t>(prompt_len - n, MAX_LOOKAHEAD) : GEN_LOOKAHEAD_K;
+        // During prompt: prefetch exactly 1 token's experts at a time (serial, safe).
+        // During generation: keep GEN_LOOKAHEAD_K steps ahead for speculative execution.
+        // The previous value of MIN(prompt_len-n, 64) during prompt exhausted the ring
+        // (64 × ~162 experts >> ring=256 slots) causing a deadlock after the first token.
+        uint32_t target_sq_size = is_prompt ? 1 : GEN_LOOKAHEAD_K;
 
         while (sq_size < target_sq_size) {
             uint32_t scout_input;
@@ -588,7 +607,7 @@ int main(int argc, char* argv[]) {
             sq_size++;
 
             // Prefetch the experts predicted by the Scout for this step
-            for (uint32_t l = 0; l < smoe::NUM_MOE_LAYERS; ++l) {
+            for (uint32_t l = 0; l < cfg.num_moe_layers; ++l) {
                 const smoe::scout::ExpertPrediction& pred = sout.routing[l];
                 for (uint32_t e = 0; e < pred.count; ++e) {
                     (void)streamer.prefetch(pred.layer_id, pred.expert_ids[e]);
@@ -606,7 +625,7 @@ int main(int argc, char* argv[]) {
 
         std::memcpy(heavy_hidden, scout.get_embed() + static_cast<size_t>(heavy_cur_token) * d_model, d_model * sizeof(float));
 
-        for (uint32_t l = 0; l <= smoe::NUM_MOE_LAYERS; ++l) {
+        for (uint32_t l = 0; l <= cfg.num_moe_layers; ++l) {
             std::memcpy(heavy_normed, heavy_hidden, d_model * sizeof(float));
             smoe::rms_norm(heavy_normed, scout.get_input_norm(l), d_model);
 
@@ -711,7 +730,6 @@ int main(int argc, char* argv[]) {
                 }
             } else {
                 // ── Phase 1: Dispatch Currently Available Routed Experts to GPU ──
-                float* routed_out = (float*)__builtin_alloca(d_model * sizeof(float));
                 std::memset(routed_out, 0, d_model * sizeof(float));
 
                 const smoe::scout::ExpertPrediction& pred = scout_out.routing[l - moe_start_layer];
@@ -754,7 +772,7 @@ int main(int argc, char* argv[]) {
                 }
 
                 // ── Phase 2: Compute Shared Expert on CPU while GPU/SSD works ──
-                float* shared_out = (float*)__builtin_alloca(d_model * sizeof(float));
+                std::memset(shared_out, 0, d_model * sizeof(float));
                 
                 smoe::matvec(shared_gate_out, scout.get_shared_gate(l), heavy_normed, shared_dim, d_model);
                 smoe::matvec(shared_up_out, scout.get_shared_up(l), heavy_normed, shared_dim, d_model);
@@ -969,7 +987,7 @@ int main(int argc, char* argv[]) {
             sq_tail = 0;
             
             // Immediately prune discarded experts
-            ActiveExpertsContext act_ctx { scout_queue, sq_head, sq_size };
+            ActiveExpertsContext act_ctx { scout_queue, sq_head, sq_size, cfg.num_moe_layers };
             streamer.prune_slots(is_expert_active, &act_ctx);
         } else {
             // Scout guessed correctly (or we are in prompt phase)
@@ -980,7 +998,7 @@ int main(int argc, char* argv[]) {
 
         // ── Step 6: Emit token ────────────────────────────────
         if (is_generating) {
-            if (heavy_cur_token == 100001) {
+            if (std::find(eos_ids.begin(), eos_ids.end(), heavy_cur_token) != eos_ids.end()) {
                 if (g_debug) std::fprintf(stderr, "\n[EOS reached]\n");
                 break;
             }

@@ -43,13 +43,21 @@ def main():
         token_str = ",".join(map(str, token_ids))
         
         # Auto-tune ring size based on system RAM
+        # Note: macOS often caps single `newBufferWithBytesNoCopy` allocations at ~50-60% of RAM.
+        # 4096 slots = 34GB, which fails on 48GB Macs. 2048 slots = 16GB, which is safe.
         ram_gb = os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES') / (1024**3)
-        if ram_gb > 36:
-            ring_size = "4096"
-        elif ram_gb > 20:
+        if ram_gb > 20:
             ring_size = "2048"
         else:
             ring_size = "512"
+            
+        eos_ids = tokenizer.eos_token_id
+        if isinstance(eos_ids, int):
+            eos_ids_str = str(eos_ids)
+        elif isinstance(eos_ids, list):
+            eos_ids_str = ",".join(map(str, eos_ids))
+        else:
+            eos_ids_str = "100001"
 
         cmd = [
             "build/smoe-engine",
@@ -58,6 +66,7 @@ def main():
             "--tokens-in", token_str,
             "--tokens", "256",
             "--ring", ring_size,
+            "--eos-ids", eos_ids_str,
             "--workers", "4",
             "--temperature", "0.6",
             "--top-p", "0.95",
