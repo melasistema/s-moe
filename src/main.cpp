@@ -452,8 +452,9 @@ int main(int argc, char* argv[]) {
     uint32_t scout_cur_token = heavy_cur_token;
 
     // Speculative lookahead queue
-    static constexpr uint32_t LOOKAHEAD_K = 3;
-    static smoe::scout::ScoutOutput scout_queue[LOOKAHEAD_K];
+    static constexpr uint32_t GEN_LOOKAHEAD_K = 3;
+    static constexpr uint32_t MAX_LOOKAHEAD = 64;
+    static smoe::scout::ScoutOutput scout_queue[MAX_LOOKAHEAD];
     uint32_t sq_head = 0;
     uint32_t sq_tail = 0;
     uint32_t sq_size = 0;
@@ -467,7 +468,7 @@ int main(int argc, char* argv[]) {
     auto is_expert_active = [](uint32_t layer_id, uint32_t expert_id, void* ctx) -> bool {
         auto* c = static_cast<ActiveExpertsContext*>(ctx);
         for (uint32_t i = 0; i < c->size; ++i) {
-            uint32_t idx = (c->head + i) % 3; // LOOKAHEAD_K
+            uint32_t idx = (c->head + i) % MAX_LOOKAHEAD;
             const auto& scout_out = c->queue[idx];
             if (layer_id == 0) continue;
             if (layer_id - 1 < smoe::NUM_MOE_LAYERS) {
@@ -523,12 +524,18 @@ int main(int argc, char* argv[]) {
         }
 
         // ── Phase A: Scout Speculative Lookahead ──────────────
-        uint32_t target_sq_size = is_prompt ? 1 : LOOKAHEAD_K;
+        uint32_t target_sq_size = is_prompt ? std::min<uint32_t>(prompt_len - n, MAX_LOOKAHEAD) : GEN_LOOKAHEAD_K;
 
         while (sq_size < target_sq_size) {
-            smoe::scout::ScoutOutput sout = scout.forward(scout_cur_token);
+            uint32_t scout_input;
+            if (is_prompt && (n + sq_size < prompt_len)) {
+                scout_input = prompt_tokens[n + sq_size];
+            } else {
+                scout_input = scout_cur_token;
+            }
+            smoe::scout::ScoutOutput sout = scout.forward(scout_input);
             scout_queue[sq_tail] = sout;
-            sq_tail = (sq_tail + 1) % LOOKAHEAD_K;
+            sq_tail = (sq_tail + 1) % MAX_LOOKAHEAD;
             sq_size++;
 
             // Prefetch the experts predicted by the Scout for this step
@@ -539,7 +546,7 @@ int main(int argc, char* argv[]) {
                 }
             }
             
-            // Assume the scout is correct and advance it
+            // Advance the scout for the next speculative step
             scout_cur_token = sout.next_token_id;
         }
 
@@ -814,7 +821,7 @@ int main(int argc, char* argv[]) {
         // Repetition penalty
         if (rep_penalty != 1.0f) {
             bool penalized[102400] = {false};
-            uint32_t penalty_last_n = 64;
+            uint32_t penalty_last_n = 8192; // Full history
             uint32_t start_idx = (history_len > penalty_last_n) ? (history_len - penalty_last_n) : 0;
             
             for (uint32_t i = start_idx; i < history_len; ++i) {
@@ -927,7 +934,7 @@ int main(int argc, char* argv[]) {
         } else {
             // Scout guessed correctly (or we are in prompt phase)
             // Consume the head of the queue.
-            sq_head = (sq_head + 1) % LOOKAHEAD_K;
+            sq_head = (sq_head + 1) % MAX_LOOKAHEAD;
             sq_size--;
         }
 
