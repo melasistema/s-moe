@@ -41,11 +41,13 @@ struct ExpertPrediction {
     uint32_t count;   // actual active count ≤ MAX_ACTIVE
 };
 
+inline constexpr uint32_t MAX_MOE_LAYERS = 128;
+
 // ── Scout forward-pass result ────────────────────────────────
 struct ScoutOutput {
     uint32_t next_token_id;
-    // Predicted experts for the current token for all 27 MoE layers
-    ExpertPrediction routing[27];
+    // Predicted experts for the current token for all MoE layers
+    ExpertPrediction routing[MAX_MOE_LAYERS];
 };
 
 // ── Surface Scout — Week 4 interface stub ────────────────────
@@ -68,6 +70,9 @@ public:
 
     // Write key/value directly to the Scout's KV cache to keep it in sync with Heavy model.
     void write_kv_cache(uint32_t layer, uint32_t slot, const float* k, const float* v);
+
+    // Get the dynamically parsed model configuration
+    const SmoeModelConfig& config() const noexcept;
 
     // ── Getters for full-model execution ────────────────────────
     const float* get_embed() const noexcept;

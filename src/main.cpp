@@ -383,18 +383,24 @@ int main(int argc, char* argv[]) {
 
     // ── Phase 4: Scout init ───────────────────────────────────
     smoe::scout::Scout scout(scout_path, metal);  // scout_path may be nullptr (heuristic only)
+    const auto& cfg = scout.config();
+    const uint32_t d_model = cfg.d_model;
+    const uint32_t num_layers = cfg.num_moe_layers + 1;
+    const uint32_t ffn_dim = cfg.ffn_dim;
+    const uint32_t shared_dim = 2816; // TODO: dynamically load shared expert dim if needed
+
 
     // ── Load vocabulary ───────────────────────────────────────
     load_vocab("vault/vocab.bin");
 
     // ── Tokenise prompt ───────────────────────────────────────
     // Pre-allocate on the stack — no heap in the loop.
-    static uint32_t prompt_tokens[2048];
+    uint32_t* prompt_tokens = (uint32_t*)__builtin_alloca(4096 * sizeof(uint32_t));
     uint32_t        prompt_len = 0;
     if (tokens_in) {
         std::string s(tokens_in);
         size_t pos = 0;
-        while (pos < s.size() && prompt_len < 2048) {
+        while (pos < s.size() && prompt_len < 4096) {
             size_t next_comma = s.find(',', pos);
             if (next_comma == std::string::npos) {
                 prompt_tokens[prompt_len++] = std::stoul(s.substr(pos));
@@ -405,7 +411,7 @@ int main(int argc, char* argv[]) {
         }
     } else {
         tokenise_prompt(prompt_text, prompt_tokens, prompt_len,
-                        std::min(max_tokens, uint32_t(2048)));
+                        std::min(max_tokens, uint32_t(4096)));
     }
 
     // ── Pre-generate telemetry state ──────────────────────────
@@ -455,7 +461,7 @@ int main(int argc, char* argv[]) {
 
     // Multi-layer KV cache (static to avoid heap allocation)
     static constexpr uint32_t ATTN_CTX = 4096;
-    static float* full_kv_cache = smoe::allocate_aligned_float(28 * 2 * ATTN_CTX * 2048);
+    float* full_kv_cache = smoe::allocate_aligned_float(num_layers * 2 * ATTN_CTX * d_model);
     uint32_t ctx_pos = 0;
     uint32_t ctx_fill = 0;
 
@@ -471,19 +477,25 @@ int main(int argc, char* argv[]) {
     float* heavy_attn_out = nullptr;
     
     // Allocate all on 16KB boundaries to guarantee Metal zero-copy wrapping works perfectly
-    ::posix_memalign((void**)&heavy_hidden, 16384, 16384);
-    ::posix_memalign((void**)&heavy_normed, 16384, 16384);
+    size_t heavy_hidden_aligned = (d_model * sizeof(float) + 16383) & ~16383; ::posix_memalign((void**)&heavy_hidden, 16384, heavy_hidden_aligned);
+    size_t heavy_normed_aligned = (d_model * sizeof(float) + 16383) & ~16383; ::posix_memalign((void**)&heavy_normed, 16384, heavy_normed_aligned);
     ::posix_memalign((void**)&heavy_qbuf,   16384, 16384);
     ::posix_memalign((void**)&heavy_kbuf,   16384, 16384);
     ::posix_memalign((void**)&heavy_vbuf,   16384, 16384);
-    ::posix_memalign((void**)&heavy_attn_out, 16384, 16384);
+    size_t heavy_attn_out_aligned = (d_model * sizeof(float) + 16383) & ~16383; ::posix_memalign((void**)&heavy_attn_out, 16384, heavy_attn_out_aligned);
     
-    smoe_metal_register_buffer(metal, heavy_hidden, 16384);
-    smoe_metal_register_buffer(metal, heavy_normed, 16384);
+    // Allocate heuristic dense/shared FFN intermediate buffers
+    float* l0_gate_out = smoe::allocate_aligned_float(ffn_dim);
+    float* l0_up_out   = smoe::allocate_aligned_float(ffn_dim);
+    float* shared_gate_out = smoe::allocate_aligned_float(shared_dim);
+    float* shared_up_out   = smoe::allocate_aligned_float(shared_dim);
+
+    smoe_metal_register_buffer(metal, heavy_hidden, heavy_hidden_aligned);
+    smoe_metal_register_buffer(metal, heavy_normed, heavy_normed_aligned);
     smoe_metal_register_buffer(metal, heavy_qbuf,   16384);
     smoe_metal_register_buffer(metal, heavy_kbuf,   16384);
     smoe_metal_register_buffer(metal, heavy_vbuf,   16384);
-    smoe_metal_register_buffer(metal, heavy_attn_out, 16384);
+    smoe_metal_register_buffer(metal, heavy_attn_out, heavy_attn_out_aligned);
 
     uint32_t heavy_cur_token = (prompt_len > 0) ? prompt_tokens[0] : 0;
     uint32_t scout_cur_token = heavy_cur_token;
@@ -540,8 +552,8 @@ int main(int argc, char* argv[]) {
             sq_tail = 0;
         }
 
-        const float* emb = scout.get_embed() + heavy_cur_token * 2048;
-        std::memcpy(heavy_hidden, emb, 2048 * sizeof(float));
+        const float* emb = scout.get_embed() + heavy_cur_token * d_model;
+        std::memcpy(heavy_hidden, emb, d_model * sizeof(float));
 
         if (n == 0 && g_debug) {
             std::fprintf(stderr, "\n[Token %u] emb = %.4f %.4f %.4f %.4f\n", heavy_cur_token, heavy_hidden[0], heavy_hidden[1], heavy_hidden[2], heavy_hidden[3]);
@@ -591,15 +603,15 @@ int main(int argc, char* argv[]) {
         smoe::scout::ScoutOutput scout_out = scout_queue[sq_head];
         static float attn_scores[ATTN_CTX];
 
-        std::memcpy(heavy_hidden, scout.get_embed() + static_cast<size_t>(heavy_cur_token) * 2048, 2048 * sizeof(float));
+        std::memcpy(heavy_hidden, scout.get_embed() + static_cast<size_t>(heavy_cur_token) * d_model, d_model * sizeof(float));
 
         for (uint32_t l = 0; l <= smoe::NUM_MOE_LAYERS; ++l) {
-            std::memcpy(heavy_normed, heavy_hidden, 2048 * sizeof(float));
-            smoe::rms_norm(heavy_normed, scout.get_input_norm(l), 2048);
+            std::memcpy(heavy_normed, heavy_hidden, d_model * sizeof(float));
+            smoe::rms_norm(heavy_normed, scout.get_input_norm(l), d_model);
 
-            smoe::matvec(heavy_qbuf, scout.get_q_proj(l), heavy_normed, 2048, 2048);
-            smoe::matvec(heavy_kbuf, scout.get_k_proj(l), heavy_normed, 2048, 2048);
-            smoe::matvec(heavy_vbuf, scout.get_v_proj(l), heavy_normed, 2048, 2048);
+            smoe::matvec(heavy_qbuf, scout.get_q_proj(l), heavy_normed, d_model, d_model);
+            smoe::matvec(heavy_kbuf, scout.get_k_proj(l), heavy_normed, d_model, d_model);
+            smoe::matvec(heavy_vbuf, scout.get_v_proj(l), heavy_normed, d_model, d_model);
 
             // Apply RoPE to Q and K (16 heads, 128 dim) - Half-split pairing
             for (uint32_t h = 0; h < 16; ++h) {
@@ -621,24 +633,24 @@ int main(int argc, char* argv[]) {
                 }
             }
 
-            float* k_cache = full_kv_cache + (l * 2 * ATTN_CTX + 0 * ATTN_CTX) * 2048;
-            float* v_cache = full_kv_cache + (l * 2 * ATTN_CTX + 1 * ATTN_CTX) * 2048;
+            float* k_cache = full_kv_cache + (l * 2 * ATTN_CTX + 0 * ATTN_CTX) * d_model;
+            float* v_cache = full_kv_cache + (l * 2 * ATTN_CTX + 1 * ATTN_CTX) * d_model;
             
             const uint32_t slot = ctx_pos % ATTN_CTX;
-            std::memcpy(k_cache + slot * 2048, heavy_kbuf, 2048 * sizeof(float));
-            std::memcpy(v_cache + slot * 2048, heavy_vbuf, 2048 * sizeof(float));
+            std::memcpy(k_cache + slot * d_model, heavy_kbuf, d_model * sizeof(float));
+            std::memcpy(v_cache + slot * d_model, heavy_vbuf, d_model * sizeof(float));
             scout.write_kv_cache(l, slot, heavy_kbuf, heavy_vbuf);
 
             // Multi-Head Attention CPU
             const float scale = 1.0f / std::sqrt(128.0f);
             const uint32_t valid = (ctx_fill < ATTN_CTX) ? ctx_fill + 1 : ATTN_CTX;
-            std::memset(heavy_attn_out, 0, 2048 * sizeof(float));
+            std::memset(heavy_attn_out, 0, d_model * sizeof(float));
 
             for (uint32_t h = 0; h < 16; ++h) {
                 for (uint32_t i = 0; i < valid; ++i) {
                     uint32_t ki = (ctx_pos - i + ATTN_CTX) % ATTN_CTX;
                     float dot_qk = 0.0f;
-                    const float* krow = k_cache + ki * 2048 + h * 128;
+                    const float* krow = k_cache + ki * d_model + h * 128;
                     const float* qhead = heavy_qbuf + h * 128;
                     for (uint32_t d = 0; d < 128; ++d) {
                         dot_qk += qhead[d] * krow[d];
@@ -663,7 +675,7 @@ int main(int argc, char* argv[]) {
                 for (uint32_t i = 0; i < valid; ++i) {
                     uint32_t vi = (ctx_pos - i + ATTN_CTX) % ATTN_CTX;
                     const float alpha = attn_scores[i];
-                    const float* vrow = v_cache + vi * 2048 + h * 128;
+                    const float* vrow = v_cache + vi * d_model + h * 128;
                     float* out_head = heavy_attn_out + h * 128;
                     for (uint32_t d = 0; d < 128; ++d) {
                         out_head[d] += alpha * vrow[d];
@@ -672,36 +684,34 @@ int main(int argc, char* argv[]) {
             }
 
             // O Proj and Residual
-            smoe::matvec(heavy_normed, scout.get_o_proj(l), heavy_attn_out, 2048, 2048);
-            for (uint32_t i = 0; i < 2048; ++i) {
+            smoe::matvec(heavy_normed, scout.get_o_proj(l), heavy_attn_out, d_model, d_model);
+            for (uint32_t i = 0; i < d_model; ++i) {
                 heavy_hidden[i] += heavy_normed[i];
             }
 
             // FFN Norm
-            std::memcpy(heavy_normed, heavy_hidden, 2048 * sizeof(float));
-            smoe::rms_norm(heavy_normed, scout.get_post_norm(l), 2048);
+            std::memcpy(heavy_normed, heavy_hidden, d_model * sizeof(float));
+            smoe::rms_norm(heavy_normed, scout.get_post_norm(l), d_model);
 
             // FFN
             if (l == 0) {
                 // Dense MLP for Layer 0
-                static float l0_gate_out[10944];
-                static float l0_up_out[10944];
-                smoe::matvec(l0_gate_out, scout.get_l0_gate(), heavy_normed, 10944, 2048);
-                smoe::matvec(l0_up_out, scout.get_l0_up(), heavy_normed, 10944, 2048);
-                for (uint32_t i = 0; i < 10944; ++i) {
+                smoe::matvec(l0_gate_out, scout.get_l0_gate(), heavy_normed, ffn_dim, d_model);
+                smoe::matvec(l0_up_out, scout.get_l0_up(), heavy_normed, ffn_dim, d_model);
+                for (uint32_t i = 0; i < ffn_dim; ++i) {
                     // Silu
                     float val = l0_gate_out[i];
                     l0_gate_out[i] = (val / (1.0f + std::exp(-val))) * l0_up_out[i];
                 }
-                smoe::matvec(heavy_normed, scout.get_l0_down(), l0_gate_out, 2048, 10944);
-                for (uint32_t d = 0; d < 2048; ++d) heavy_hidden[d] += heavy_normed[d];
+                smoe::matvec(heavy_normed, scout.get_l0_down(), l0_gate_out, d_model, ffn_dim);
+                for (uint32_t d = 0; d < d_model; ++d) heavy_hidden[d] += heavy_normed[d];
                 if (n == 0 && g_debug) {
                     std::fprintf(stderr, "\n[L0] hidden = %.4f %.4f %.4f %.4f\n", heavy_hidden[0], heavy_hidden[1], heavy_hidden[2], heavy_hidden[3]);
                 }
             } else {
                 // ── Phase 1: Dispatch Currently Available Routed Experts to GPU ──
-                static float routed_out[2048];
-                std::memset(routed_out, 0, 2048 * sizeof(float));
+                float* routed_out = (float*)__builtin_alloca(d_model * sizeof(float));
+                std::memset(routed_out, 0, d_model * sizeof(float));
 
                 const smoe::scout::ExpertPrediction& pred = scout_out.routing[l - 1];
                 bool executed[8] = {false};
@@ -743,17 +753,15 @@ int main(int argc, char* argv[]) {
                 }
 
                 // ── Phase 2: Compute Shared Expert on CPU while GPU/SSD works ──
-                static float shared_gate_out[2816];
-                static float shared_up_out[2816];
-                static float shared_out[2048];
+                float* shared_out = (float*)__builtin_alloca(d_model * sizeof(float));
                 
-                smoe::matvec(shared_gate_out, scout.get_shared_gate(l), heavy_normed, 2816, 2048);
-                smoe::matvec(shared_up_out, scout.get_shared_up(l), heavy_normed, 2816, 2048);
-                for (uint32_t i = 0; i < 2816; ++i) {
+                smoe::matvec(shared_gate_out, scout.get_shared_gate(l), heavy_normed, shared_dim, d_model);
+                smoe::matvec(shared_up_out, scout.get_shared_up(l), heavy_normed, shared_dim, d_model);
+                for (uint32_t i = 0; i < shared_dim; ++i) {
                     float val = shared_gate_out[i];
                     shared_gate_out[i] = (val / (1.0f + std::exp(-val))) * shared_up_out[i];
                 }
-                smoe::matvec(shared_out, scout.get_shared_down(l), shared_gate_out, 2048, 2816);
+                smoe::matvec(shared_out, scout.get_shared_down(l), shared_gate_out, d_model, shared_dim);
 
                 // ── Phase 3: Spin-wait for any remaining missing experts ──
                 while (num_executed < pred.count) {
@@ -800,12 +808,12 @@ int main(int argc, char* argv[]) {
                 // ── Phase 4: Wait for GPU and accumulate ──
                 for (uint32_t e = 0; e < pred.count; ++e) {
                     if (wait_handles[e]) {
-                        smoe_metal_wait(metal, wait_handles[e], expert_output_vec[e], e, 2048);
+                        smoe_metal_wait(metal, wait_handles[e], expert_output_vec[e], e, d_model);
                         float weight = pred.expert_weights[e];
                         if (l == 1 && n == 0 && g_debug) {
                             std::fprintf(stderr, "[L1] Routed Expert %d, weight = %.4f\n", pred.expert_ids[e], weight);
                         }
-                        for (uint32_t d = 0; d < 2048; ++d) {
+                        for (uint32_t d = 0; d < d_model; ++d) {
                             routed_out[d] += weight * expert_output_vec[e][d];
                         }
                     }
@@ -821,7 +829,7 @@ int main(int argc, char* argv[]) {
                 }
 
                 // Add FFN residuals
-                for (uint32_t d = 0; d < 2048; ++d) {
+                for (uint32_t d = 0; d < d_model; ++d) {
                     heavy_hidden[d] += shared_out[d] + routed_out[d];
                 }
 
@@ -835,14 +843,14 @@ int main(int argc, char* argv[]) {
         if (ctx_fill < ATTN_CTX) ++ctx_fill;
 
         // ── Step 5: Final Model Norm and LM Head ──────────────
-        smoe::rms_norm(heavy_hidden, scout.get_model_norm(), 2048);
+        smoe::rms_norm(heavy_hidden, scout.get_model_norm(), d_model);
         
         // Execute LM Head on GPU
         const float* weights[1] = { scout.get_lm_head() };
         const float* inputs[1]  = { heavy_hidden };
         float* outputs[1]       = { scout.get_lm_head_scores() };
         uint32_t rows[1]        = { 102400 };
-        uint32_t cols[1]        = { 2048 };
+        uint32_t cols[1]        = { d_model };
         smoe_metal_scout_matvec_batch(metal, weights, inputs, outputs, rows, cols, 1);
 
         // Process lm_head result
@@ -884,7 +892,7 @@ int main(int argc, char* argv[]) {
             }
             if (g_debug && ((prompt_len == 0) || (n >= prompt_len - 1))) {
                 float h_sum2 = 0.0f;
-                for(uint32_t i=0; i<2048; i++) h_sum2 += heavy_hidden[i]*heavy_hidden[i];
+                for(uint32_t i=0; i<d_model; i++) h_sum2 += heavy_hidden[i]*heavy_hidden[i];
                 std::fprintf(stderr, "\n[n=%u] hidden_L2 = %f, Top score = %f for tok = %u\n", n, std::sqrt(h_sum2), best_score, best_tok);
             }
         } else {

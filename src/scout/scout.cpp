@@ -86,11 +86,8 @@ static void info_printf(const char* format, ...) {
 // §1  Compile-time constants
 // ═══════════════════════════════════════════════════════════════
 
-// ── Model dimensions ──────────────────────────────────────────
-inline constexpr uint32_t D_MODEL        = 2048;    // hidden dimension
-inline constexpr uint32_t VOCAB_SIZE     = 102400;  // lm_head / embed rows
-
-inline constexpr uint32_t GATE_ROWS      = 64;      // experts per gate
+// ── Model dimensions (Dynamic now, stored in config) ─────────
+// Removed cfg.d_model, cfg.vocab_size, cfg.gate_rows().
 
 // Context ring depth for the single-layer attention
 inline constexpr uint32_t ATTN_CTX       = 4096;
@@ -178,8 +175,8 @@ static void softmax(float* x, uint32_t n) noexcept {
 static uint32_t top_k(const float* scores, uint32_t n, uint32_t k,
                        uint32_t* out_indices, float* out_weights = nullptr) noexcept {
     uint32_t count = std::min(k, n);
-    float   tmp[GATE_ROWS];
-    uint32_t idx[GATE_ROWS];
+    float* tmp = (float*)__builtin_alloca(n * sizeof(float));
+    uint32_t* idx = (uint32_t*)__builtin_alloca(n * sizeof(uint32_t));
 
     // DeepSeek MoE requires Softmax over all experts to compute proper routing weights
     float max_val = scores[0];
@@ -367,6 +364,8 @@ struct LayerRecency {
 // ═══════════════════════════════════════════════════════════════
 
 struct Scout::Impl {
+    // ── Model configuration ───────────────────────────────────
+    SmoeModelConfig cfg {};
 
     // ── Mode flag ──────────────────────────────────────────────
     bool neural_mode { false };   // true ↔ safetensors loaded
@@ -382,43 +381,40 @@ struct Scout::Impl {
     // Each array is large enough for the tensor it represents.
     // All allocated as flat C arrays — no std::vector, no new[].
 
-    // Embedding table: [VOCAB_SIZE × D_MODEL]
+    // Embedding table: [cfg.vocab_size × cfg.d_model]
     // ~800 MB for 102400 × 2048 × 4 bytes — huge but fits in 16 GB UMA.
     // We use a pointer into a heap allocation done ONCE at constructor time.
-    float* w_embed      { nullptr };   // [VOCAB_SIZE × D_MODEL]
-    float* w_lm_head    { nullptr };   // [VOCAB_SIZE × D_MODEL]
+    float* w_embed      { nullptr };   // [cfg.vocab_size × cfg.d_model]
+    float* w_lm_head    { nullptr };   // [cfg.vocab_size × cfg.d_model]
 
-    // Layers 0..27 attention weights: [D_MODEL × D_MODEL]
-    float* w_q_proj[28]     {};
-    float* w_k_proj[28]     {};
-    float* w_v_proj[28]     {};
-    float* w_o_proj[28]     {};
+    // Layers 0..N attention weights
+    float* w_q_proj[MAX_MOE_LAYERS] {};
+    float* w_k_proj[MAX_MOE_LAYERS] {};
+    float* w_v_proj[MAX_MOE_LAYERS] {};
+    float* w_o_proj[MAX_MOE_LAYERS] {};
 
-    // Layers 0..27 norms: [D_MODEL]
-    float* w_input_norm[28] {};
-    float* w_post_norm[28]  {};
+    // Layers 0..N norms
+    float* w_input_norm[MAX_MOE_LAYERS] {};
+    float* w_post_norm[MAX_MOE_LAYERS]  {};
 
     // Layer 0 dense MLP
     float* w_l0_gate { nullptr };
     float* w_l0_up   { nullptr };
     float* w_l0_down { nullptr };
 
-    // Layers 1..27 shared experts
-    float* w_shared_gate[28] {};
-    float* w_shared_up[28]   {};
-    float* w_shared_down[28] {};
+    // Layers 1..N shared experts
+    float* w_shared_gate[MAX_MOE_LAYERS] {};
+    float* w_shared_up[MAX_MOE_LAYERS]   {};
+    float* w_shared_down[MAX_MOE_LAYERS] {};
 
-    // Final norm: [D_MODEL]
+    // Final norm: [cfg.d_model]
     float* w_model_norm { nullptr };
 
-    // Gate weights for MoE layers 1..27: [NUM_MOE_LAYERS × GATE_ROWS × D_MODEL]
-    // gate[l] points to gate_weights_storage + l*GATE_ROWS*D_MODEL
-    static constexpr size_t GATE_STORAGE_ELEMS =
-        static_cast<size_t>(NUM_MOE_LAYERS) * GATE_ROWS * D_MODEL;
-    float* gate_weights_storage { nullptr };   // flat [27 × 64 × 2048]
-    // Convenience: gate_w[l] = row-major [GATE_ROWS × D_MODEL] for MoE layer l+1
-    // (index 0 = layer 1, ..., index 26 = layer 27)
-    float* gate_w[NUM_MOE_LAYERS] {};
+    // Gate weights for MoE layers 1..N
+    // gate[l] points to gate_weights_storage + l * gate_rows * d_model
+    float* gate_weights_storage { nullptr };
+    // Convenience: gate_w[l] for MoE layer l+1
+    float* gate_w[MAX_MOE_LAYERS] {};
 
     // ── Pre-allocated compute buffers (forward(), zero alloc) ─
     float* hidden       { nullptr };       // current hidden state
@@ -429,8 +425,8 @@ struct Scout::Impl {
     float* attn_out     { nullptr };
 
     // Attention context ring: full 28-layer K/V caches
-    float* k_cache  { nullptr }; // [28 × ATTN_CTX × D_MODEL]
-    float* v_cache  { nullptr }; // [28 × ATTN_CTX × D_MODEL]
+    float* k_cache  { nullptr }; // [28 × ATTN_CTX × cfg.d_model]
+    float* v_cache  { nullptr }; // [28 × ATTN_CTX × cfg.d_model]
     uint32_t ctx_pos  { 0 };   // write head into ring
     uint32_t ctx_fill { 0 };   // number of valid entries
 
@@ -438,12 +434,12 @@ struct Scout::Impl {
     // Attention score buffer [ATTN_CTX]
     float attn_scores[ATTN_CTX] {};
 
-    // Gate score buffer [GATE_ROWS]
+    // Gate score buffer [cfg.gate_rows()]
     float* gate_scores  { nullptr };
-    float* gate_scores_batch { nullptr }; // [LOOKAHEAD_K * GATE_ROWS] for GPU batching
+    float* gate_scores_batch { nullptr }; // [LOOKAHEAD_K * cfg.gate_rows()] for GPU batching
 
     // LM head score buffer — we compute via GPU matvec and scan.
-    float* lm_head_scores { nullptr };     // [VOCAB_SIZE]
+    float* lm_head_scores { nullptr };     // [cfg.vocab_size]
 
     // ── Heuristic fallback state (Week 4, preserved) ──────────
     NgramBucket ngram_table[NGRAM_TABLE] {};
@@ -554,16 +550,37 @@ Scout::Impl::Impl(const char* path, SmoeMetalCtx* metal_ctx) {
         "[scout] Safetensors header: %llu bytes\n",
         static_cast<unsigned long long>(header_len));
 
+    // ── Parse Safetensors Metadata to configure Scout ────────────────
+    TensorMeta embed_meta = parse_tensor_meta(json_start, json_end, "model.embed_tokens.weight");
+    if (embed_meta.valid) {
+        cfg.vocab_size = embed_meta.shape[0];
+        cfg.d_model = embed_meta.shape[1];
+    } else {
+        std::fprintf(stderr, "[scout] ✗ Failed to extract model dimensions.\n");
+        ::munmap(mmap_base, mmap_size); mmap_base = nullptr;
+        return;
+    }
+
+    TensorMeta l0_gate_meta = parse_tensor_meta(json_start, json_end, "model.layers.0.mlp.gate_proj.weight");
+    if (l0_gate_meta.valid) cfg.ffn_dim = l0_gate_meta.shape[0];
+    else cfg.ffn_dim = 10944; // Fallback
+
+    TensorMeta router_meta = parse_tensor_meta(json_start, json_end, "model.layers.1.mlp.gate.weight");
+    if (router_meta.valid) cfg.max_experts_per_layer = router_meta.shape[0];
+    else cfg.max_experts_per_layer = 64; // Fallback
+
+    cfg.num_moe_layers = 27; // Fallback to DeepSeek hardcode if not passed from Vault yet
+
     // ── Allocate float32 weight arrays (ONE-TIME, in constructor) ──
-    static constexpr size_t EMBED_ELEMS  = static_cast<size_t>(VOCAB_SIZE) * D_MODEL;
-    static constexpr size_t ATTN_W_ELEMS = static_cast<size_t>(D_MODEL)    * D_MODEL;
-    static constexpr size_t L0_DENSE_ELEMS = static_cast<size_t>(10944) * D_MODEL;
-    static constexpr size_t SHARED_EXPERT_ELEMS = static_cast<size_t>(2816) * D_MODEL;
+    const size_t EMBED_ELEMS  = static_cast<size_t>(cfg.vocab_size) * cfg.d_model;
+    const size_t ATTN_W_ELEMS = static_cast<size_t>(cfg.d_model)    * cfg.d_model;
+    const size_t L0_DENSE_ELEMS = static_cast<size_t>(cfg.ffn_dim) * cfg.d_model;
+    const size_t SHARED_EXPERT_ELEMS = static_cast<size_t>(2816) * cfg.d_model;
 
     bool ok = true;
     w_embed              = allocate_aligned_float(EMBED_ELEMS);
     w_lm_head            = allocate_aligned_float(EMBED_ELEMS);
-    w_model_norm         = allocate_aligned_float(D_MODEL);
+    w_model_norm         = allocate_aligned_float(cfg.d_model);
     
     w_l0_gate            = allocate_aligned_float(L0_DENSE_ELEMS);
     w_l0_up              = allocate_aligned_float(L0_DENSE_ELEMS);
@@ -574,31 +591,31 @@ Scout::Impl::Impl(const char* path, SmoeMetalCtx* metal_ctx) {
         w_k_proj[l]     = allocate_aligned_float(ATTN_W_ELEMS);
         w_v_proj[l]     = allocate_aligned_float(ATTN_W_ELEMS);
         w_o_proj[l]     = allocate_aligned_float(ATTN_W_ELEMS);
-        w_input_norm[l] = allocate_aligned_float(D_MODEL);
-        w_post_norm[l]  = allocate_aligned_float(D_MODEL);
+        w_input_norm[l] = allocate_aligned_float(cfg.d_model);
+        w_post_norm[l]  = allocate_aligned_float(cfg.d_model);
         
-        if (l >= 1 && l <= NUM_MOE_LAYERS) {
+        if (l >= 1 && l <= cfg.num_moe_layers) {
             w_shared_gate[l] = allocate_aligned_float(SHARED_EXPERT_ELEMS);
             w_shared_up[l]   = allocate_aligned_float(SHARED_EXPERT_ELEMS);
             w_shared_down[l] = allocate_aligned_float(SHARED_EXPERT_ELEMS);
         }
     }
 
-    gate_weights_storage = allocate_aligned_float(GATE_STORAGE_ELEMS);
+    gate_weights_storage = allocate_aligned_float(cfg.num_moe_layers * cfg.gate_rows() * cfg.d_model);
 
     // ── Allocate compute scratch vectors ──────────────────────
-    hidden               = allocate_aligned_float(D_MODEL);
-    normed               = allocate_aligned_float(D_MODEL);
-    qbuf                 = allocate_aligned_float(D_MODEL);
-    kbuf                 = allocate_aligned_float(D_MODEL);
-    vbuf                 = allocate_aligned_float(D_MODEL);
-    attn_out             = allocate_aligned_float(D_MODEL);
-    gate_scores          = allocate_aligned_float(GATE_ROWS);
-    gate_scores_batch    = allocate_aligned_float(LOOKAHEAD_K * GATE_ROWS);
-    lm_head_scores       = allocate_aligned_float(VOCAB_SIZE);
+    hidden               = allocate_aligned_float(cfg.d_model);
+    normed               = allocate_aligned_float(cfg.d_model);
+    qbuf                 = allocate_aligned_float(cfg.d_model);
+    kbuf                 = allocate_aligned_float(cfg.d_model);
+    vbuf                 = allocate_aligned_float(cfg.d_model);
+    attn_out             = allocate_aligned_float(cfg.d_model);
+    gate_scores          = allocate_aligned_float(cfg.gate_rows());
+    gate_scores_batch    = allocate_aligned_float(LOOKAHEAD_K * cfg.gate_rows());
+    lm_head_scores       = allocate_aligned_float(cfg.vocab_size);
     
-    k_cache              = allocate_aligned_float(28 * ATTN_CTX * D_MODEL);
-    v_cache              = allocate_aligned_float(28 * ATTN_CTX * D_MODEL);
+    k_cache              = allocate_aligned_float(28 * ATTN_CTX * cfg.d_model);
+    v_cache              = allocate_aligned_float(28 * ATTN_CTX * cfg.d_model);
 
     if (!w_embed || !w_lm_head || !w_model_norm || !w_l0_gate || !w_l0_up || !w_l0_down || !gate_weights_storage ||
         !hidden || !normed || !qbuf || !kbuf || !vbuf || !attn_out || !gate_scores || !gate_scores_batch || !lm_head_scores || !k_cache || !v_cache) {
@@ -611,8 +628,8 @@ Scout::Impl::Impl(const char* path, SmoeMetalCtx* metal_ctx) {
 
     // Wire up gate_w convenience pointers
     if (ok) {
-        for (uint32_t l = 0; l < NUM_MOE_LAYERS; ++l) {
-            gate_w[l] = gate_weights_storage + static_cast<size_t>(l) * GATE_ROWS * D_MODEL;
+        for (uint32_t l = 0; l < cfg.num_moe_layers; ++l) {
+            gate_w[l] = gate_weights_storage + static_cast<size_t>(l) * cfg.gate_rows() * cfg.d_model;
         }
     }
 
@@ -641,14 +658,14 @@ Scout::Impl::Impl(const char* path, SmoeMetalCtx* metal_ctx) {
         info_printf("[scout] Loading backbone weights for 28 layers ...\n");
         ok &= load_tensor("model.embed_tokens.weight", w_embed,   EMBED_ELEMS);
         ok &= load_tensor("lm_head.weight",            w_lm_head, EMBED_ELEMS);
-        ok &= load_tensor("model.norm.weight",         w_model_norm, D_MODEL);
+        ok &= load_tensor("model.norm.weight",         w_model_norm, cfg.d_model);
 
         ok &= load_tensor("model.layers.0.mlp.gate_proj.weight", w_l0_gate, L0_DENSE_ELEMS);
         ok &= load_tensor("model.layers.0.mlp.up_proj.weight", w_l0_up, L0_DENSE_ELEMS);
         ok &= load_tensor("model.layers.0.mlp.down_proj.weight", w_l0_down, L0_DENSE_ELEMS);
 
         char tensor_name[128];
-        for (uint32_t l = 0; l <= NUM_MOE_LAYERS; ++l) {
+        for (uint32_t l = 0; l <= cfg.num_moe_layers; ++l) {
             std::snprintf(tensor_name, sizeof(tensor_name), "model.layers.%u.self_attn.q_proj.weight", l);
             ok &= load_tensor(tensor_name, w_q_proj[l], ATTN_W_ELEMS);
             std::snprintf(tensor_name, sizeof(tensor_name), "model.layers.%u.self_attn.k_proj.weight", l);
@@ -658,13 +675,13 @@ Scout::Impl::Impl(const char* path, SmoeMetalCtx* metal_ctx) {
             std::snprintf(tensor_name, sizeof(tensor_name), "model.layers.%u.self_attn.o_proj.weight", l);
             ok &= load_tensor(tensor_name, w_o_proj[l], ATTN_W_ELEMS);
             std::snprintf(tensor_name, sizeof(tensor_name), "model.layers.%u.input_layernorm.weight", l);
-            ok &= load_tensor(tensor_name, w_input_norm[l], D_MODEL);
+            ok &= load_tensor(tensor_name, w_input_norm[l], cfg.d_model);
             std::snprintf(tensor_name, sizeof(tensor_name), "model.layers.%u.post_attention_layernorm.weight", l);
-            ok &= load_tensor(tensor_name, w_post_norm[l], D_MODEL);
+            ok &= load_tensor(tensor_name, w_post_norm[l], cfg.d_model);
 
-            if (l >= 1 && l <= NUM_MOE_LAYERS) {
+            if (l >= 1 && l <= cfg.num_moe_layers) {
                 std::snprintf(tensor_name, sizeof(tensor_name), "model.layers.%u.mlp.gate.weight", l);
-                ok &= load_tensor(tensor_name, gate_w[l - 1], static_cast<size_t>(GATE_ROWS) * D_MODEL);
+                ok &= load_tensor(tensor_name, gate_w[l - 1], static_cast<size_t>(cfg.gate_rows()) * cfg.d_model);
 
                 std::snprintf(tensor_name, sizeof(tensor_name), "model.layers.%u.mlp.shared_experts.gate_proj.weight", l);
                 ok &= load_tensor(tensor_name, w_shared_gate[l], SHARED_EXPERT_ELEMS);
@@ -726,22 +743,22 @@ Scout::Impl::Impl(const char* path, SmoeMetalCtx* metal_ctx) {
         // I will omit registering q,k,v,o for all 28 layers as that's > 100 buffers and Metal might have a limit.
         // Actually, main.cpp's generation loop will use smoe_metal_scout_matvec which might need them registered.
         // I'll register just the 27 gate buffers and the scratch buffers.
-        smoe_metal_register_buffer(metal_ctx, gate_weights_storage, GATE_STORAGE_ELEMS * sizeof(float));
+        smoe_metal_register_buffer(metal_ctx, gate_weights_storage, cfg.num_moe_layers * cfg.gate_rows() * cfg.d_model * sizeof(float));
 
-        smoe_metal_register_buffer(metal_ctx, hidden, D_MODEL * sizeof(float));
-        smoe_metal_register_buffer(metal_ctx, normed, D_MODEL * sizeof(float));
-        smoe_metal_register_buffer(metal_ctx, qbuf, D_MODEL * sizeof(float));
-        smoe_metal_register_buffer(metal_ctx, kbuf, D_MODEL * sizeof(float));
-        smoe_metal_register_buffer(metal_ctx, vbuf, D_MODEL * sizeof(float));
-        smoe_metal_register_buffer(metal_ctx, attn_out, D_MODEL * sizeof(float));
-        smoe_metal_register_buffer(metal_ctx, gate_scores_batch, LOOKAHEAD_K * GATE_ROWS * sizeof(float));
-        smoe_metal_register_buffer(metal_ctx, lm_head_scores, VOCAB_SIZE * sizeof(float));
+        smoe_metal_register_buffer(metal_ctx, hidden, cfg.d_model * sizeof(float));
+        smoe_metal_register_buffer(metal_ctx, normed, cfg.d_model * sizeof(float));
+        smoe_metal_register_buffer(metal_ctx, qbuf, cfg.d_model * sizeof(float));
+        smoe_metal_register_buffer(metal_ctx, kbuf, cfg.d_model * sizeof(float));
+        smoe_metal_register_buffer(metal_ctx, vbuf, cfg.d_model * sizeof(float));
+        smoe_metal_register_buffer(metal_ctx, attn_out, cfg.d_model * sizeof(float));
+        smoe_metal_register_buffer(metal_ctx, gate_scores_batch, LOOKAHEAD_K * cfg.gate_rows() * sizeof(float));
+        smoe_metal_register_buffer(metal_ctx, lm_head_scores, cfg.vocab_size * sizeof(float));
     }
 
     neural_mode = true;
     info_printf(
         "[scout] ✓ Neural scout ready (Week 5 · D=%u · vocab=%u · %u MoE gates)\n",
-        D_MODEL, VOCAB_SIZE, NUM_MOE_LAYERS);
+        cfg.d_model, cfg.vocab_size, cfg.num_moe_layers);
 }
 
 // ── Impl destructor ───────────────────────────────────────────
@@ -785,6 +802,10 @@ Scout::Impl::~Impl() {
 }
 
 // ── Getters for full-model execution ────────────────────────
+const SmoeModelConfig& Scout::config() const noexcept {
+    return impl_->cfg;
+}
+
 const float* Scout::get_embed() const noexcept { return impl_->w_embed; }
 const float* Scout::get_lm_head() const noexcept { return impl_->w_lm_head; }
 const float* Scout::get_model_norm() const noexcept { return impl_->w_model_norm; }
@@ -815,29 +836,29 @@ ScoutOutput Scout::Impl::neural_forward(uint32_t token_id) noexcept {
     ScoutOutput out {};
 
     // ── 1. Token embedding lookup ─────────────────────────────
-    const uint32_t safe_id = (token_id < VOCAB_SIZE) ? token_id : 0;
-    const float*   emb_row = w_embed + static_cast<size_t>(safe_id) * D_MODEL;
-    std::memcpy(hidden, emb_row, D_MODEL * sizeof(float));
+    const uint32_t safe_id = (token_id < cfg.vocab_size) ? token_id : 0;
+    const float*   emb_row = w_embed + static_cast<size_t>(safe_id) * cfg.d_model;
+    std::memcpy(hidden, emb_row, cfg.d_model * sizeof(float));
 
     // ── 2. Full 28-Layer Backbone Execution ───────────────────
-    for (uint32_t l = 0; l <= NUM_MOE_LAYERS; ++l) {
+    for (uint32_t l = 0; l <= cfg.num_moe_layers; ++l) {
         
         // a. Input RMS LayerNorm
-        std::memcpy(normed, hidden, D_MODEL * sizeof(float));
-        rms_norm(normed, w_input_norm[l], D_MODEL);
+        std::memcpy(normed, hidden, cfg.d_model * sizeof(float));
+        rms_norm(normed, w_input_norm[l], cfg.d_model);
 
         // b. Q/K/V projections
         if (metal_ctx) {
             const float* weights[3] = { w_q_proj[l], w_k_proj[l], w_v_proj[l] };
             const float* inputs[3]  = { normed, normed, normed };
             float* outputs[3]       = { qbuf, kbuf, vbuf };
-            uint32_t rows[3]        = { D_MODEL, D_MODEL, D_MODEL };
-            uint32_t cols[3]        = { D_MODEL, D_MODEL, D_MODEL };
+            uint32_t rows[3]        = { cfg.d_model, cfg.d_model, cfg.d_model };
+            uint32_t cols[3]        = { cfg.d_model, cfg.d_model, cfg.d_model };
             smoe_metal_scout_matvec_batch(metal_ctx, weights, inputs, outputs, rows, cols, 3);
         } else {
-            matvec(qbuf, w_q_proj[l], normed, D_MODEL, D_MODEL);
-            matvec(kbuf, w_k_proj[l], normed, D_MODEL, D_MODEL);
-            matvec(vbuf, w_v_proj[l], normed, D_MODEL, D_MODEL);
+            matvec(qbuf, w_q_proj[l], normed, cfg.d_model, cfg.d_model);
+            matvec(kbuf, w_k_proj[l], normed, cfg.d_model, cfg.d_model);
+            matvec(vbuf, w_v_proj[l], normed, cfg.d_model, cfg.d_model);
         }
 
         // Apply RoPE
@@ -862,21 +883,21 @@ ScoutOutput Scout::Impl::neural_forward(uint32_t token_id) noexcept {
 
         // c. Write K/V into ring cache for this layer
         const uint32_t slot = ctx_pos % ATTN_CTX;
-        float* layer_k = k_cache + (l * ATTN_CTX + slot) * D_MODEL;
-        float* layer_v = v_cache + (l * ATTN_CTX + slot) * D_MODEL;
-        std::memcpy(layer_k, kbuf, D_MODEL * sizeof(float));
-        std::memcpy(layer_v, vbuf, D_MODEL * sizeof(float));
+        float* layer_k = k_cache + (l * ATTN_CTX + slot) * cfg.d_model;
+        float* layer_v = v_cache + (l * ATTN_CTX + slot) * cfg.d_model;
+        std::memcpy(layer_k, kbuf, cfg.d_model * sizeof(float));
+        std::memcpy(layer_v, vbuf, cfg.d_model * sizeof(float));
 
         // d. Scaled dot-product MHA
         const float scale = 1.0f / std::sqrt(128.0f);
         const uint32_t valid = (ctx_fill < ATTN_CTX) ? ctx_fill + 1 : ATTN_CTX;
-        std::memset(attn_out, 0, D_MODEL * sizeof(float));
+        std::memset(attn_out, 0, cfg.d_model * sizeof(float));
 
         for (uint32_t h = 0; h < 16; ++h) {
             for (uint32_t i = 0; i < valid; ++i) {
                 uint32_t ki = (ctx_pos - i + ATTN_CTX) % ATTN_CTX;
                 float dot_qk = 0.0f;
-                const float* krow = k_cache + (l * ATTN_CTX + ki) * D_MODEL + h * 128;
+                const float* krow = k_cache + (l * ATTN_CTX + ki) * cfg.d_model + h * 128;
                 const float* qhead = qbuf + h * 128;
                 for (uint32_t d = 0; d < 128; ++d) {
                     dot_qk += qhead[d] * krow[d];
@@ -900,7 +921,7 @@ ScoutOutput Scout::Impl::neural_forward(uint32_t token_id) noexcept {
             for (uint32_t i = 0; i < valid; ++i) {
                 uint32_t vi = (ctx_pos - i + ATTN_CTX) % ATTN_CTX;
                 const float alpha = attn_scores[i];
-                const float* vrow = v_cache + (l * ATTN_CTX + vi) * D_MODEL + h * 128;
+                const float* vrow = v_cache + (l * ATTN_CTX + vi) * cfg.d_model + h * 128;
                 float* out_head = attn_out + h * 128;
                 for (uint32_t d = 0; d < 128; ++d) {
                     out_head[d] += alpha * vrow[d];
@@ -909,44 +930,45 @@ ScoutOutput Scout::Impl::neural_forward(uint32_t token_id) noexcept {
         }
 
         if (metal_ctx) {
-            smoe_metal_scout_matvec(metal_ctx, w_o_proj[l], attn_out, normed, D_MODEL, D_MODEL);
+            smoe_metal_scout_matvec(metal_ctx, w_o_proj[l], attn_out, normed, cfg.d_model, cfg.d_model);
         } else {
-            matvec(normed, w_o_proj[l], attn_out, D_MODEL, D_MODEL);
+            matvec(normed, w_o_proj[l], attn_out, cfg.d_model, cfg.d_model);
         }
-        for (uint32_t i = 0; i < D_MODEL; ++i) {
+        for (uint32_t i = 0; i < cfg.d_model; ++i) {
             hidden[i] += normed[i];
         }
 
         // f. Post-attention RMS norm
-        std::memcpy(normed, hidden, D_MODEL * sizeof(float));
-        rms_norm(normed, w_post_norm[l], D_MODEL);
+        std::memcpy(normed, hidden, cfg.d_model * sizeof(float));
+        rms_norm(normed, w_post_norm[l], cfg.d_model);
 
         // g. Heavy Expert Gate Prediction (for l >= 1)
         if (l >= 1) {
             // For the first layer that requires gate prediction, we'll batch all predictions together
             if (l == 1) {
                 // Batch all 27 gate predictions into a single Metal call
-                const float* batch_weights[NUM_MOE_LAYERS];
-                const float* batch_inputs[NUM_MOE_LAYERS] = { normed }; // Same input for all layers
-                float* batch_outputs[NUM_MOE_LAYERS];
-                uint32_t batch_rows[NUM_MOE_LAYERS];
-                uint32_t batch_cols[NUM_MOE_LAYERS];
+                const float* batch_weights[MAX_MOE_LAYERS];
+                const float* batch_inputs[MAX_MOE_LAYERS];
+                for(uint32_t i = 0; i < cfg.num_moe_layers; i++) batch_inputs[i] = normed;
+                float* batch_outputs[MAX_MOE_LAYERS];
+                uint32_t batch_rows[MAX_MOE_LAYERS];
+                uint32_t batch_cols[MAX_MOE_LAYERS];
 
                 // Collect all gate predictions for this forward pass
-                for (uint32_t layer_idx = 0; layer_idx < NUM_MOE_LAYERS; ++layer_idx) {
+                for (uint32_t layer_idx = 0; layer_idx < cfg.num_moe_layers; ++layer_idx) {
                     batch_weights[layer_idx] = gate_w[layer_idx];
                     batch_inputs[layer_idx]  = normed;
-                    batch_outputs[layer_idx] = gate_scores_batch + layer_idx * GATE_ROWS;
-                    batch_rows[layer_idx] = GATE_ROWS;
-                    batch_cols[layer_idx] = D_MODEL;
+                    batch_outputs[layer_idx] = gate_scores_batch + layer_idx * cfg.gate_rows();
+                    batch_rows[layer_idx] = cfg.gate_rows();
+                    batch_cols[layer_idx] = cfg.d_model;
                 }
 
                 if (metal_ctx) {
-                    smoe_metal_scout_matvec_batch(metal_ctx, batch_weights, batch_inputs, batch_outputs, batch_rows, batch_cols, NUM_MOE_LAYERS);
+                    smoe_metal_scout_matvec_batch(metal_ctx, batch_weights, batch_inputs, batch_outputs, batch_rows, batch_cols, cfg.num_moe_layers);
                 } else {
-                    for (uint32_t layer_idx = 0; layer_idx < NUM_MOE_LAYERS; ++layer_idx) {
-                        float* scores = gate_scores_batch + layer_idx * GATE_ROWS;
-                        matvec(scores, gate_w[layer_idx], normed, GATE_ROWS, D_MODEL);
+                    for (uint32_t layer_idx = 0; layer_idx < cfg.num_moe_layers; ++layer_idx) {
+                        float* scores = gate_scores_batch + layer_idx * cfg.gate_rows();
+                        matvec(scores, gate_w[layer_idx], normed, cfg.gate_rows(), cfg.d_model);
                     }
                 }
             }
@@ -954,8 +976,8 @@ ScoutOutput Scout::Impl::neural_forward(uint32_t token_id) noexcept {
             // Extract results for this specific layer
             ExpertPrediction& pred = out.routing[l - 1];
             pred.layer_id = l;
-            float* scores = gate_scores_batch + (l - 1) * GATE_ROWS;
-            pred.count = top_k(scores, GATE_ROWS, MAX_ACTIVE, pred.expert_ids, pred.expert_weights);
+            float* scores = gate_scores_batch + (l - 1) * cfg.gate_rows();
+            pred.count = top_k(scores, cfg.gate_rows(), MAX_ACTIVE, pred.expert_ids, pred.expert_weights);
         }
 
         // h. Dense / Shared Experts FFN
@@ -967,19 +989,19 @@ ScoutOutput Scout::Impl::neural_forward(uint32_t token_id) noexcept {
                 const float* inputs[2]  = { normed, normed };
                 float* outputs[2]       = { l0_gate_out, l0_up_out };
                 uint32_t rows[2]        = { 10944, 10944 };
-                uint32_t cols[2]        = { D_MODEL, D_MODEL };
+                uint32_t cols[2]        = { cfg.d_model, cfg.d_model };
                 smoe_metal_scout_matvec_batch(metal_ctx, weights, inputs, outputs, rows, cols, 2);
             } else {
-                matvec(l0_gate_out, w_l0_gate, normed, 10944, D_MODEL);
-                matvec(l0_up_out, w_l0_up, normed, 10944, D_MODEL);
+                matvec(l0_gate_out, w_l0_gate, normed, 10944, cfg.d_model);
+                matvec(l0_up_out, w_l0_up, normed, 10944, cfg.d_model);
             }
             for (uint32_t i = 0; i < 10944; ++i) {
                 float val = l0_gate_out[i];
                 l0_gate_out[i] = (val / (1.0f + std::exp(-val))) * l0_up_out[i];
             }
-            if (metal_ctx) smoe_metal_scout_matvec(metal_ctx, w_l0_down, l0_gate_out, normed, D_MODEL, 10944);
-            else matvec(normed, w_l0_down, l0_gate_out, D_MODEL, 10944);
-            for (uint32_t d = 0; d < D_MODEL; ++d) hidden[d] += normed[d];
+            if (metal_ctx) smoe_metal_scout_matvec(metal_ctx, w_l0_down, l0_gate_out, normed, cfg.d_model, 10944);
+            else matvec(normed, w_l0_down, l0_gate_out, cfg.d_model, 10944);
+            for (uint32_t d = 0; d < cfg.d_model; ++d) hidden[d] += normed[d];
         } else {
             static float shared_gate_out[2816];
             static float shared_up_out[2816];
@@ -988,19 +1010,19 @@ ScoutOutput Scout::Impl::neural_forward(uint32_t token_id) noexcept {
                 const float* inputs[2]  = { normed, normed };
                 float* outputs[2]       = { shared_gate_out, shared_up_out };
                 uint32_t rows[2]        = { 2816, 2816 };
-                uint32_t cols[2]        = { D_MODEL, D_MODEL };
+                uint32_t cols[2]        = { cfg.d_model, cfg.d_model };
                 smoe_metal_scout_matvec_batch(metal_ctx, weights, inputs, outputs, rows, cols, 2);
             } else {
-                matvec(shared_gate_out, w_shared_gate[l], normed, 2816, D_MODEL);
-                matvec(shared_up_out, w_shared_up[l], normed, 2816, D_MODEL);
+                matvec(shared_gate_out, w_shared_gate[l], normed, 2816, cfg.d_model);
+                matvec(shared_up_out, w_shared_up[l], normed, 2816, cfg.d_model);
             }
             for (uint32_t i = 0; i < 2816; ++i) {
                 float val = shared_gate_out[i];
                 shared_gate_out[i] = (val / (1.0f + std::exp(-val))) * shared_up_out[i];
             }
-            if (metal_ctx) smoe_metal_scout_matvec(metal_ctx, w_shared_down[l], shared_gate_out, normed, D_MODEL, 2816);
-            else matvec(normed, w_shared_down[l], shared_gate_out, D_MODEL, 2816);
-            for (uint32_t d = 0; d < D_MODEL; ++d) hidden[d] += normed[d];
+            if (metal_ctx) smoe_metal_scout_matvec(metal_ctx, w_shared_down[l], shared_gate_out, normed, cfg.d_model, 2816);
+            else matvec(normed, w_shared_down[l], shared_gate_out, cfg.d_model, 2816);
+            for (uint32_t d = 0; d < cfg.d_model; ++d) hidden[d] += normed[d];
         }
     }
 
@@ -1008,23 +1030,23 @@ ScoutOutput Scout::Impl::neural_forward(uint32_t token_id) noexcept {
     if (ctx_fill < ATTN_CTX) ++ctx_fill;
 
     // ── 3. Final model norm ───────────────────────────────────
-    rms_norm(hidden, w_model_norm, D_MODEL);
+    rms_norm(hidden, w_model_norm, cfg.d_model);
 
     // ── 4. LM Head ────────────────────────────────────────────
     if (metal_ctx) {
-        smoe_metal_scout_matvec(metal_ctx, w_lm_head, hidden, lm_head_scores, VOCAB_SIZE, D_MODEL);
+        smoe_metal_scout_matvec(metal_ctx, w_lm_head, hidden, lm_head_scores, cfg.vocab_size, cfg.d_model);
     } else {
-        for (uint32_t v = 0; v < VOCAB_SIZE; ++v) {
-            const float* row = w_lm_head + static_cast<size_t>(v) * D_MODEL;
+        for (uint32_t v = 0; v < cfg.vocab_size; ++v) {
+            const float* row = w_lm_head + static_cast<size_t>(v) * cfg.d_model;
             float score = 0.0f;
-            for (uint32_t d = 0; d < D_MODEL; ++d) score += row[d] * hidden[d];
+            for (uint32_t d = 0; d < cfg.d_model; ++d) score += row[d] * hidden[d];
             lm_head_scores[v] = score;
         }
     }
 
     uint32_t best_tok   = 0;
     float    best_score = -1e38f;
-    for (uint32_t v = 0; v < VOCAB_SIZE; ++v) {
+    for (uint32_t v = 0; v < cfg.vocab_size; ++v) {
         if (lm_head_scores[v] > best_score) {
             best_score = lm_head_scores[v];
             best_tok   = v;
@@ -1149,7 +1171,7 @@ ScoutOutput Scout::Impl::heuristic_forward(uint32_t token_id) noexcept {
     ScoutOutput out {};
     push_token(token_id);
     out.next_token_id = next_token_heuristic(token_id);
-    for (uint32_t k = 0; k < NUM_MOE_LAYERS; ++k) {
+    for (uint32_t k = 0; k < cfg.num_moe_layers; ++k) {
         ExpertPrediction& pred = out.routing[k];
         pred.layer_id = k + 1;
         pred.count    = predict(pred.layer_id, pred.expert_ids);
@@ -1181,8 +1203,8 @@ void Scout::reset_context() {
     // Neural: reset KV-cache ring
     impl_->ctx_pos  = 0;
     impl_->ctx_fill = 0;
-    std::memset(impl_->k_cache, 0, 28 * ATTN_CTX * D_MODEL * sizeof(float));
-    std::memset(impl_->v_cache, 0, 28 * ATTN_CTX * D_MODEL * sizeof(float));
+    std::memset(impl_->k_cache, 0, 28 * ATTN_CTX * impl_->cfg.d_model * sizeof(float));
+    std::memset(impl_->v_cache, 0, 28 * ATTN_CTX * impl_->cfg.d_model * sizeof(float));
 
     // Heuristic: reset context ring + history (preserve learned freq tables)
     std::memset(impl_->context_ring, 0, sizeof(impl_->context_ring));
@@ -1217,10 +1239,10 @@ void Scout::rollback(uint32_t steps) {
 void Scout::write_kv_cache(uint32_t layer, uint32_t slot, const float* k, const float* v) {
     if (!impl_->neural_mode) return;
     if (layer >= 28 || slot >= ATTN_CTX) return;
-    float* layer_k = impl_->k_cache + (layer * ATTN_CTX + slot) * D_MODEL;
-    float* layer_v = impl_->v_cache + (layer * ATTN_CTX + slot) * D_MODEL;
-    std::memcpy(layer_k, k, D_MODEL * sizeof(float));
-    std::memcpy(layer_v, v, D_MODEL * sizeof(float));
+    float* layer_k = impl_->k_cache + (layer * ATTN_CTX + slot) * impl_->cfg.d_model;
+    float* layer_v = impl_->v_cache + (layer * ATTN_CTX + slot) * impl_->cfg.d_model;
+    std::memcpy(layer_k, k, impl_->cfg.d_model * sizeof(float));
+    std::memcpy(layer_v, v, impl_->cfg.d_model * sizeof(float));
 }
 
 } // namespace smoe::scout
