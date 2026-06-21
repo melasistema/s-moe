@@ -367,6 +367,22 @@ int main(int argc, char* argv[]) {
         smoe_metal_register_buffer(metal, streamer.get_slot_ptr(i), streamer.get_slot_bytes());
     }
 
+    // ── Cache Pre-Warming (Stealth Background Load) ───────────
+    std::thread prewarm_thread([&streamer, vault_hdr]() {
+        uint32_t count = 0;
+        // Leave 256 slots empty for speculative execution
+        uint32_t max_prewarm = (streamer.ring_size() > 256) ? streamer.ring_size() - 256 : 0;
+        for (uint32_t l = 0; l < smoe::NUM_MOE_LAYERS && count < max_prewarm; ++l) {
+            for (uint32_t e = 0; e < vault_hdr.max_experts_per_layer && count < max_prewarm; ++e) {
+                if (streamer.prefetch(l, e)) count++;
+                // Sleep to trickle-load the cache, keeping the MPMC queue empty 
+                // and the NVMe SSD available for immediate priority prompt prefetching!
+                std::this_thread::sleep_for(std::chrono::milliseconds(4));
+            }
+        }
+    });
+    prewarm_thread.detach();
+
     // ── Phase 4: Scout init ───────────────────────────────────
     smoe::scout::Scout scout(scout_path, metal);  // scout_path may be nullptr (heuristic only)
 

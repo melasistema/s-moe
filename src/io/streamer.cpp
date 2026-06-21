@@ -490,7 +490,20 @@ void Streamer::release(RingSlot* slot) noexcept {
 
 void Streamer::prune_slots(bool (*is_active)(uint32_t, uint32_t, void*), void* ctx) noexcept {
     Impl& im = *impl_;
+    
+    uint32_t empty_count = 0;
     for (uint32_t i = 0; i < im.ring_sz; ++i) {
+        if (im.slots[i].state.load(std::memory_order_relaxed) == SlotState::EMPTY) {
+            empty_count++;
+        }
+    }
+    
+    // Retain a persistent cache: only prune when we run low on empty slots.
+    // Target 256 empty slots, or 25% of ring size for smaller rings.
+    uint32_t target_empty = std::min<uint32_t>(256, im.ring_sz / 4);
+    if (empty_count >= target_empty) return;
+    
+    for (uint32_t i = 0; i < im.ring_sz && empty_count < target_empty; ++i) {
         SlotState s = im.slots[i].state.load(std::memory_order_relaxed);
         if (s == SlotState::READY || s == SlotState::CONSUMED) {
             if (!is_active(im.slots[i].layer_id, im.slots[i].expert_id, ctx)) {
@@ -499,6 +512,7 @@ void Streamer::prune_slots(bool (*is_active)(uint32_t, uint32_t, void*), void* c
                 im.slots[i].layer_id = 0xFFFFFFFF;
                 im.slots[i].expert_id = 0xFFFFFFFF;
                 im.slots[i].state.store(SlotState::EMPTY, std::memory_order_release);
+                empty_count++;
             }
         }
     }
