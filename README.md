@@ -54,4 +54,4 @@ S-MoE has achieved **Milestone 6**, featuring a fully integrated 28-layer sequen
 
 S-MoE is open-source software licensed under the [MIT license](LICENSE).
 
-Built with ⚡️ by [Luca Visciola](https://github.com/melasistema).
+Built by [Luca Visciola](https://github.com/melasistema) and an AI agent who hopefully knows C++ and low level programming, because i do not 😅.
