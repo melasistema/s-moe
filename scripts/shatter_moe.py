@@ -123,8 +123,8 @@ TENSOR_DOWN = 2
 # FILE HEADER — 64 bytes
 #   magic(8s) + version(I) + num_moe_layers(I) + max_experts(I) +
 #   total_experts(I) + table_offset(Q) + data_offset(Q) +
-#   group_size(I) + bits(I) + reserved(16s)
-HEADER_FMT = struct.Struct("<8sIIIIQQII16s")
+#   group_size(I) + bits(I) + d_model(I) + vocab_size(I) + ffn_dim(I) + reserved_ext(I)
+HEADER_FMT = struct.Struct("<8sIIIIQQIIIIII")
 assert HEADER_FMT.size == 64, f"Header size error: {HEADER_FMT.size}"
 
 # EXPERT TABLE ENTRY — 48 bytes
@@ -439,6 +439,28 @@ def detect_moe_topology(tensor_index: dict[str, Path]) -> dict:
         "max_experts":       max((len(v) for v in per_layer.values()), default=0),
     }
 
+def extract_model_dimensions(tensor_index: dict[str, Path]) -> dict:
+    dim = {"d_model": 2048, "vocab_size": 102400, "ffn_dim": 14336}
+    
+    embed_key = "model.embed_tokens.weight"
+    if embed_key in tensor_index:
+        with safe_open(str(tensor_index[embed_key]), framework="numpy") as sf:
+            t = sf.get_slice(embed_key)
+            dim["vocab_size"] = t.get_shape()[0]
+            dim["d_model"] = t.get_shape()[1]
+            
+    expert_key = None
+    for k in tensor_index:
+        if _EXPERT_RE.match(k):
+            expert_key = k
+            break
+            
+    if expert_key:
+        with safe_open(str(tensor_index[expert_key]), framework="numpy") as sf:
+            t = sf.get_slice(expert_key)
+            dim["ffn_dim"] = t.get_shape()[0]
+            
+    return dim
 
 def classify_scout_keys(tensor_index: dict[str, Path]) -> list[str]:
     """

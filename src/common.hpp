@@ -60,11 +60,26 @@ struct SmoeHeader {
     uint64_t data_offset;            // [32]  byte offset to the first expert blob
     uint32_t group_size;             // [40]  SMOE quantisation group size (= 64)
     uint32_t bits;                   // [44]  quantisation bit depth (2 or 4)
-    uint8_t  reserved[16];           // [48]  must be zero
+    uint32_t d_model;                // [48]  hidden dimension
+    uint32_t vocab_size;             // [52]  number of tokens
+    uint32_t ffn_dim;                // [56]  dense/shared FFN intermediate dimension
+    uint32_t reserved_ext;           // [60]  padding to 64 bytes
 };                                   // [64]
 
 static_assert(sizeof(SmoeHeader) == 64,
     "SmoeHeader layout is broken — must be exactly 64 bytes.");
+
+struct SmoeModelConfig {
+    uint32_t d_model;
+    uint32_t vocab_size;
+    uint32_t ffn_dim;
+    uint32_t num_moe_layers;
+    uint32_t max_experts_per_layer;
+    uint32_t q2_group_size;
+    
+    // Derived configurations for DeepSeek compat
+    uint32_t gate_rows() const { return max_experts_per_layer; }
+};
 
 // ─────────────────────────────────────────────────────────────
 // EXPERT TABLE ENTRY — 48 bytes, immediately after the header
