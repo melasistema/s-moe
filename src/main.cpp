@@ -388,6 +388,7 @@ int main(int argc, char* argv[]) {
     const uint32_t num_layers = cfg.num_moe_layers + 1;
     const uint32_t ffn_dim = cfg.ffn_dim;
     const uint32_t shared_dim = 2816; // TODO: dynamically load shared expert dim if needed
+    const uint32_t moe_start_layer = cfg.has_dense_layer_0 ? 1 : 0;
 
 
     // ── Load vocabulary ───────────────────────────────────────
@@ -694,7 +695,7 @@ int main(int argc, char* argv[]) {
             smoe::rms_norm(heavy_normed, scout.get_post_norm(l), d_model);
 
             // FFN
-            if (l == 0) {
+            if (l == 0 && cfg.has_dense_layer_0) {
                 // Dense MLP for Layer 0
                 smoe::matvec(l0_gate_out, scout.get_l0_gate(), heavy_normed, ffn_dim, d_model);
                 smoe::matvec(l0_up_out, scout.get_l0_up(), heavy_normed, ffn_dim, d_model);
@@ -713,7 +714,7 @@ int main(int argc, char* argv[]) {
                 float* routed_out = (float*)__builtin_alloca(d_model * sizeof(float));
                 std::memset(routed_out, 0, d_model * sizeof(float));
 
-                const smoe::scout::ExpertPrediction& pred = scout_out.routing[l - 1];
+                const smoe::scout::ExpertPrediction& pred = scout_out.routing[l - moe_start_layer];
                 bool executed[8] = {false};
                 uint32_t num_executed = 0;
                 uint64_t spin = 0;

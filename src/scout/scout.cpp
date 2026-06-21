@@ -562,10 +562,19 @@ Scout::Impl::Impl(const char* path, SmoeMetalCtx* metal_ctx) {
     }
 
     TensorMeta l0_gate_meta = parse_tensor_meta(json_start, json_end, "model.layers.0.mlp.gate_proj.weight");
-    if (l0_gate_meta.valid) cfg.ffn_dim = l0_gate_meta.shape[0];
-    else cfg.ffn_dim = 10944; // Fallback
+    if (l0_gate_meta.valid) {
+        cfg.ffn_dim = l0_gate_meta.shape[0];
+        cfg.has_dense_layer_0 = true;
+    } else {
+        cfg.has_dense_layer_0 = false;
+        // In Qwen MoE, find ffn_dim from shared expert or expert 0
+        TensorMeta shared_meta = parse_tensor_meta(json_start, json_end, "model.layers.0.mlp.shared_expert.gate_proj.weight");
+        if (shared_meta.valid) cfg.ffn_dim = shared_meta.shape[0];
+        else cfg.ffn_dim = 10944; // Fallback
+    }
 
     TensorMeta router_meta = parse_tensor_meta(json_start, json_end, "model.layers.1.mlp.gate.weight");
+    if (!router_meta.valid) router_meta = parse_tensor_meta(json_start, json_end, "model.layers.0.mlp.gate.weight");
     if (router_meta.valid) cfg.max_experts_per_layer = router_meta.shape[0];
     else cfg.max_experts_per_layer = 64; // Fallback
 
@@ -582,9 +591,11 @@ Scout::Impl::Impl(const char* path, SmoeMetalCtx* metal_ctx) {
     w_lm_head            = allocate_aligned_float(EMBED_ELEMS);
     w_model_norm         = allocate_aligned_float(cfg.d_model);
     
-    w_l0_gate            = allocate_aligned_float(L0_DENSE_ELEMS);
-    w_l0_up              = allocate_aligned_float(L0_DENSE_ELEMS);
-    w_l0_down            = allocate_aligned_float(L0_DENSE_ELEMS);
+    if (cfg.has_dense_layer_0) {
+        w_l0_gate            = allocate_aligned_float(L0_DENSE_ELEMS);
+        w_l0_up              = allocate_aligned_float(L0_DENSE_ELEMS);
+        w_l0_down            = allocate_aligned_float(L0_DENSE_ELEMS);
+    }
 
     for (uint32_t l = 0; l < 28; ++l) {
         w_q_proj[l]     = allocate_aligned_float(ATTN_W_ELEMS);
@@ -594,7 +605,8 @@ Scout::Impl::Impl(const char* path, SmoeMetalCtx* metal_ctx) {
         w_input_norm[l] = allocate_aligned_float(cfg.d_model);
         w_post_norm[l]  = allocate_aligned_float(cfg.d_model);
         
-        if (l >= 1 && l <= cfg.num_moe_layers) {
+        uint32_t moe_start_layer = cfg.has_dense_layer_0 ? 1 : 0;
+            if (l >= moe_start_layer && l <= cfg.num_moe_layers) {
             w_shared_gate[l] = allocate_aligned_float(SHARED_EXPERT_ELEMS);
             w_shared_up[l]   = allocate_aligned_float(SHARED_EXPERT_ELEMS);
             w_shared_down[l] = allocate_aligned_float(SHARED_EXPERT_ELEMS);
@@ -679,16 +691,26 @@ Scout::Impl::Impl(const char* path, SmoeMetalCtx* metal_ctx) {
             std::snprintf(tensor_name, sizeof(tensor_name), "model.layers.%u.post_attention_layernorm.weight", l);
             ok &= load_tensor(tensor_name, w_post_norm[l], cfg.d_model);
 
-            if (l >= 1 && l <= cfg.num_moe_layers) {
+            uint32_t moe_start_layer = cfg.has_dense_layer_0 ? 1 : 0;
+            if (l >= moe_start_layer && l <= cfg.num_moe_layers) {
                 std::snprintf(tensor_name, sizeof(tensor_name), "model.layers.%u.mlp.gate.weight", l);
-                ok &= load_tensor(tensor_name, gate_w[l - 1], static_cast<size_t>(cfg.gate_rows()) * cfg.d_model);
+                ok &= load_tensor(tensor_name, gate_w[l - moe_start_layer], static_cast<size_t>(cfg.gate_rows()) * cfg.d_model);
 
+                // Try DeepSeek plural first, then Qwen singular
                 std::snprintf(tensor_name, sizeof(tensor_name), "model.layers.%u.mlp.shared_experts.gate_proj.weight", l);
-                ok &= load_tensor(tensor_name, w_shared_gate[l], SHARED_EXPERT_ELEMS);
-                std::snprintf(tensor_name, sizeof(tensor_name), "model.layers.%u.mlp.shared_experts.up_proj.weight", l);
-                ok &= load_tensor(tensor_name, w_shared_up[l], SHARED_EXPERT_ELEMS);
-                std::snprintf(tensor_name, sizeof(tensor_name), "model.layers.%u.mlp.shared_experts.down_proj.weight", l);
-                ok &= load_tensor(tensor_name, w_shared_down[l], SHARED_EXPERT_ELEMS);
+                if (!load_tensor(tensor_name, w_shared_gate[l], SHARED_EXPERT_ELEMS)) {
+                    std::snprintf(tensor_name, sizeof(tensor_name), "model.layers.%u.mlp.shared_expert.gate_proj.weight", l);
+                    ok &= load_tensor(tensor_name, w_shared_gate[l], SHARED_EXPERT_ELEMS);
+                    std::snprintf(tensor_name, sizeof(tensor_name), "model.layers.%u.mlp.shared_expert.up_proj.weight", l);
+                    ok &= load_tensor(tensor_name, w_shared_up[l], SHARED_EXPERT_ELEMS);
+                    std::snprintf(tensor_name, sizeof(tensor_name), "model.layers.%u.mlp.shared_expert.down_proj.weight", l);
+                    ok &= load_tensor(tensor_name, w_shared_down[l], SHARED_EXPERT_ELEMS);
+                } else {
+                    std::snprintf(tensor_name, sizeof(tensor_name), "model.layers.%u.mlp.shared_experts.up_proj.weight", l);
+                    ok &= load_tensor(tensor_name, w_shared_up[l], SHARED_EXPERT_ELEMS);
+                    std::snprintf(tensor_name, sizeof(tensor_name), "model.layers.%u.mlp.shared_experts.down_proj.weight", l);
+                    ok &= load_tensor(tensor_name, w_shared_down[l], SHARED_EXPERT_ELEMS);
+                }
             }
         }
     }
@@ -942,11 +964,12 @@ ScoutOutput Scout::Impl::neural_forward(uint32_t token_id) noexcept {
         std::memcpy(normed, hidden, cfg.d_model * sizeof(float));
         rms_norm(normed, w_post_norm[l], cfg.d_model);
 
-        // g. Heavy Expert Gate Prediction (for l >= 1)
-        if (l >= 1) {
+        // g. Heavy Expert Gate Prediction
+        uint32_t moe_start_layer = cfg.has_dense_layer_0 ? 1 : 0;
+        if (l >= moe_start_layer) {
             // For the first layer that requires gate prediction, we'll batch all predictions together
-            if (l == 1) {
-                // Batch all 27 gate predictions into a single Metal call
+            if (l == moe_start_layer) {
+                // Batch all gate predictions into a single Metal call
                 const float* batch_weights[MAX_MOE_LAYERS];
                 const float* batch_inputs[MAX_MOE_LAYERS];
                 for(uint32_t i = 0; i < cfg.num_moe_layers; i++) batch_inputs[i] = normed;
@@ -974,16 +997,16 @@ ScoutOutput Scout::Impl::neural_forward(uint32_t token_id) noexcept {
             }
 
             // Extract results for this specific layer
-            ExpertPrediction& pred = out.routing[l - 1];
+            ExpertPrediction& pred = out.routing[l - moe_start_layer];
             pred.layer_id = l;
-            float* scores = gate_scores_batch + (l - 1) * cfg.gate_rows();
+            float* scores = gate_scores_batch + (l - moe_start_layer) * cfg.gate_rows();
             pred.count = top_k(scores, cfg.gate_rows(), MAX_ACTIVE, pred.expert_ids, pred.expert_weights);
         }
 
         // h. Dense / Shared Experts FFN
-        if (l == 0) {
-            static float l0_gate_out[10944];
-            static float l0_up_out[10944];
+        if (l == 0 && cfg.has_dense_layer_0) {
+            float* l0_gate_out = (float*)__builtin_alloca(cfg.ffn_dim * sizeof(float));
+            float* l0_up_out = (float*)__builtin_alloca(cfg.ffn_dim * sizeof(float));
             if (metal_ctx) {
                 const float* weights[2] = { w_l0_gate, w_l0_up };
                 const float* inputs[2]  = { normed, normed };

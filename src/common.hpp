@@ -76,7 +76,7 @@ struct SmoeModelConfig {
     uint32_t num_moe_layers;
     uint32_t max_experts_per_layer;
     uint32_t q2_group_size;
-    
+    bool has_dense_layer_0 {true}; // DeepSeek = true, Qwen = false
     // Derived configurations for DeepSeek compat
     uint32_t gate_rows() const { return max_experts_per_layer; }
 };
