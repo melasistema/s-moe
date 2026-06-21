@@ -709,7 +709,7 @@ void* smoe_metal_fused_ffn(SmoeMetalCtx*   ctx,
     [enc setBuffer:buf_ds offset:off_ds atIndex:5];
     [enc setBuffer:buf_hd offset:hd_offset atIndex:7];
     [enc setBuffer:buf_ou offset:ou_offset atIndex:8];
-    [enc setBuffer:buf_pa offset:0 atIndex:9];
+    [enc setBytes:&params length:sizeof(params) atIndex:9];
     [enc setThreadgroupMemoryLength:256 * sizeof(float) atIndex:0];
 
     {
@@ -779,6 +779,7 @@ void smoe_metal_scout_matvec(SmoeMetalCtx* ctx,
 {
     if (!ctx) return;
 
+    @autoreleasepool {
     MTLResourceOptions uma = MTLResourceStorageModeShared;
 
     size_t weight_bytes = static_cast<size_t>(rows) * cols * sizeof(float);
@@ -797,9 +798,6 @@ void smoe_metal_scout_matvec(SmoeMetalCtx* ctx,
 
     struct Dims { uint32_t rows, cols; };
     Dims dims { rows, cols };
-    id<MTLBuffer> buf_dm = [ctx->device newBufferWithBytes:&dims
-                                                    length:sizeof(dims)
-                                                   options:uma];
 
     id<MTLCommandBuffer>         cmd = [ctx->queue commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
@@ -808,7 +806,7 @@ void smoe_metal_scout_matvec(SmoeMetalCtx* ctx,
     [enc setBuffer:buf_wt offset:off_wt atIndex:0];
     [enc setBuffer:buf_in offset:off_in atIndex:1];
     [enc setBuffer:buf_ou offset:off_ou atIndex:2];
-    [enc setBuffer:buf_dm offset:0 atIndex:3];
+    [enc setBytes:&dims length:sizeof(dims) atIndex:3];
 
     [enc setThreadgroupMemoryLength:cols * sizeof(float) atIndex:0];
 
@@ -832,6 +830,7 @@ void smoe_metal_scout_matvec(SmoeMetalCtx* ctx,
 
     [cmd commit];
     [cmd waitUntilCompleted];
+    }
 }
 
 void smoe_metal_scout_matvec_batch(SmoeMetalCtx* ctx,
@@ -844,6 +843,7 @@ void smoe_metal_scout_matvec_batch(SmoeMetalCtx* ctx,
 {
     if (!ctx || count == 0) return;
 
+    @autoreleasepool {
     MTLResourceOptions uma = MTLResourceStorageModeShared;
 
     id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
@@ -870,14 +870,11 @@ void smoe_metal_scout_matvec_batch(SmoeMetalCtx* ctx,
 
         struct Dims { uint32_t rows, cols; };
         Dims dims { r, c };
-        id<MTLBuffer> buf_dm = [ctx->device newBufferWithBytes:&dims
-                                                        length:sizeof(dims)
-                                                       options:uma];
 
         [enc setBuffer:buf_wt offset:off_wt atIndex:0];
         [enc setBuffer:buf_in offset:off_in atIndex:1];
         [enc setBuffer:buf_ou offset:off_ou atIndex:2];
-        [enc setBuffer:buf_dm offset:0 atIndex:3];
+        [enc setBytes:&dims length:sizeof(dims) atIndex:3];
 
         [enc setThreadgroupMemoryLength:c * sizeof(float) atIndex:0];
 
@@ -893,6 +890,7 @@ void smoe_metal_scout_matvec_batch(SmoeMetalCtx* ctx,
     [cmd waitUntilCompleted];
 
     ctx->dispatch_count.fetch_add(count, std::memory_order_relaxed);
+    }
 }
 
 void smoe_metal_register_buffer(SmoeMetalCtx* ctx, const void* ptr, size_t size_in_bytes) {

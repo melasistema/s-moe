@@ -363,9 +363,7 @@ int main(int argc, char* argv[]) {
 
     // ── Phase 2: Streamer init ────────────────────────────────
     smoe::io::Streamer streamer(vault_path, ring_size, num_workers, slot_bytes);
-    for (uint32_t i = 0; i < ring_size; ++i) {
-        smoe_metal_register_buffer(metal, streamer.get_slot_ptr(i), streamer.get_slot_bytes());
-    }
+    smoe_metal_register_buffer(metal, streamer.pool_data(), streamer.pool_size());
 
     // ── Cache Pre-Warming (Stealth Background Load) ───────────
     std::thread prewarm_thread([&streamer, vault_hdr]() {
@@ -464,6 +462,29 @@ int main(int argc, char* argv[]) {
     uint32_t total_steps = prompt_len + max_tokens;
     if (prompt_len > 0) total_steps -= 1;
 
+    // ── Pre-allocate and register Heavy Execution Buffers ───────
+    float* heavy_hidden = nullptr;
+    float* heavy_normed = nullptr;
+    float* heavy_qbuf = nullptr;
+    float* heavy_kbuf = nullptr;
+    float* heavy_vbuf = nullptr;
+    float* heavy_attn_out = nullptr;
+    
+    // Allocate all on 16KB boundaries to guarantee Metal zero-copy wrapping works perfectly
+    ::posix_memalign((void**)&heavy_hidden, 16384, 16384);
+    ::posix_memalign((void**)&heavy_normed, 16384, 16384);
+    ::posix_memalign((void**)&heavy_qbuf,   16384, 16384);
+    ::posix_memalign((void**)&heavy_kbuf,   16384, 16384);
+    ::posix_memalign((void**)&heavy_vbuf,   16384, 16384);
+    ::posix_memalign((void**)&heavy_attn_out, 16384, 16384);
+    
+    smoe_metal_register_buffer(metal, heavy_hidden, 16384);
+    smoe_metal_register_buffer(metal, heavy_normed, 16384);
+    smoe_metal_register_buffer(metal, heavy_qbuf,   16384);
+    smoe_metal_register_buffer(metal, heavy_kbuf,   16384);
+    smoe_metal_register_buffer(metal, heavy_vbuf,   16384);
+    smoe_metal_register_buffer(metal, heavy_attn_out, 16384);
+
     uint32_t heavy_cur_token = (prompt_len > 0) ? prompt_tokens[0] : 0;
     uint32_t scout_cur_token = heavy_cur_token;
 
@@ -519,12 +540,11 @@ int main(int argc, char* argv[]) {
             sq_tail = 0;
         }
 
-        static float hidden[2048];
         const float* emb = scout.get_embed() + heavy_cur_token * 2048;
-        std::memcpy(hidden, emb, 2048 * sizeof(float));
+        std::memcpy(heavy_hidden, emb, 2048 * sizeof(float));
 
         if (n == 0 && g_debug) {
-            std::fprintf(stderr, "\n[Token %u] emb = %.4f %.4f %.4f %.4f\n", heavy_cur_token, hidden[0], hidden[1], hidden[2], hidden[3]);
+            std::fprintf(stderr, "\n[Token %u] emb = %.4f %.4f %.4f %.4f\n", heavy_cur_token, heavy_hidden[0], heavy_hidden[1], heavy_hidden[2], heavy_hidden[3]);
         }
 
         // Clean up any leaked/discarded slots in the streamer
@@ -569,22 +589,17 @@ int main(int argc, char* argv[]) {
         // ── Phase B: Heavy Model Execution ─────────────────────
         // Claim the routing map for the current step from the queue head
         smoe::scout::ScoutOutput scout_out = scout_queue[sq_head];
-        static float normed[2048];
-        static float qbuf[2048];
-        static float kbuf[2048];
-        static float vbuf[2048];
-        static float attn_out[2048];
         static float attn_scores[ATTN_CTX];
 
-        std::memcpy(hidden, scout.get_embed() + static_cast<size_t>(heavy_cur_token) * 2048, 2048 * sizeof(float));
+        std::memcpy(heavy_hidden, scout.get_embed() + static_cast<size_t>(heavy_cur_token) * 2048, 2048 * sizeof(float));
 
         for (uint32_t l = 0; l <= smoe::NUM_MOE_LAYERS; ++l) {
-            std::memcpy(normed, hidden, 2048 * sizeof(float));
-            smoe::rms_norm(normed, scout.get_input_norm(l), 2048);
+            std::memcpy(heavy_normed, heavy_hidden, 2048 * sizeof(float));
+            smoe::rms_norm(heavy_normed, scout.get_input_norm(l), 2048);
 
-            smoe::matvec(qbuf, scout.get_q_proj(l), normed, 2048, 2048);
-            smoe::matvec(kbuf, scout.get_k_proj(l), normed, 2048, 2048);
-            smoe::matvec(vbuf, scout.get_v_proj(l), normed, 2048, 2048);
+            smoe::matvec(heavy_qbuf, scout.get_q_proj(l), heavy_normed, 2048, 2048);
+            smoe::matvec(heavy_kbuf, scout.get_k_proj(l), heavy_normed, 2048, 2048);
+            smoe::matvec(heavy_vbuf, scout.get_v_proj(l), heavy_normed, 2048, 2048);
 
             // Apply RoPE to Q and K (16 heads, 128 dim) - Half-split pairing
             for (uint32_t h = 0; h < 16; ++h) {
@@ -594,15 +609,15 @@ int main(int argc, char* argv[]) {
                     float cos_val = std::cos(angle);
                     float sin_val = std::sin(angle);
                     
-                    float q0 = qbuf[h * 128 + d];
-                    float q1 = qbuf[h * 128 + d + 64];
-                    qbuf[h * 128 + d]      = q0 * cos_val - q1 * sin_val;
-                    qbuf[h * 128 + d + 64] = q0 * sin_val + q1 * cos_val;
+                    float q0 = heavy_qbuf[h * 128 + d];
+                    float q1 = heavy_qbuf[h * 128 + d + 64];
+                    heavy_qbuf[h * 128 + d]      = q0 * cos_val - q1 * sin_val;
+                    heavy_qbuf[h * 128 + d + 64] = q0 * sin_val + q1 * cos_val;
                     
-                    float k0 = kbuf[h * 128 + d];
-                    float k1 = kbuf[h * 128 + d + 64];
-                    kbuf[h * 128 + d]      = k0 * cos_val - k1 * sin_val;
-                    kbuf[h * 128 + d + 64] = k0 * sin_val + k1 * cos_val;
+                    float k0 = heavy_kbuf[h * 128 + d];
+                    float k1 = heavy_kbuf[h * 128 + d + 64];
+                    heavy_kbuf[h * 128 + d]      = k0 * cos_val - k1 * sin_val;
+                    heavy_kbuf[h * 128 + d + 64] = k0 * sin_val + k1 * cos_val;
                 }
             }
 
@@ -610,21 +625,21 @@ int main(int argc, char* argv[]) {
             float* v_cache = full_kv_cache + (l * 2 * ATTN_CTX + 1 * ATTN_CTX) * 2048;
             
             const uint32_t slot = ctx_pos % ATTN_CTX;
-            std::memcpy(k_cache + slot * 2048, kbuf, 2048 * sizeof(float));
-            std::memcpy(v_cache + slot * 2048, vbuf, 2048 * sizeof(float));
-            scout.write_kv_cache(l, slot, kbuf, vbuf);
+            std::memcpy(k_cache + slot * 2048, heavy_kbuf, 2048 * sizeof(float));
+            std::memcpy(v_cache + slot * 2048, heavy_vbuf, 2048 * sizeof(float));
+            scout.write_kv_cache(l, slot, heavy_kbuf, heavy_vbuf);
 
             // Multi-Head Attention CPU
             const float scale = 1.0f / std::sqrt(128.0f);
             const uint32_t valid = (ctx_fill < ATTN_CTX) ? ctx_fill + 1 : ATTN_CTX;
-            std::memset(attn_out, 0, 2048 * sizeof(float));
+            std::memset(heavy_attn_out, 0, 2048 * sizeof(float));
 
             for (uint32_t h = 0; h < 16; ++h) {
                 for (uint32_t i = 0; i < valid; ++i) {
                     uint32_t ki = (ctx_pos - i + ATTN_CTX) % ATTN_CTX;
                     float dot_qk = 0.0f;
                     const float* krow = k_cache + ki * 2048 + h * 128;
-                    const float* qhead = qbuf + h * 128;
+                    const float* qhead = heavy_qbuf + h * 128;
                     for (uint32_t d = 0; d < 128; ++d) {
                         dot_qk += qhead[d] * krow[d];
                     }
@@ -649,7 +664,7 @@ int main(int argc, char* argv[]) {
                     uint32_t vi = (ctx_pos - i + ATTN_CTX) % ATTN_CTX;
                     const float alpha = attn_scores[i];
                     const float* vrow = v_cache + vi * 2048 + h * 128;
-                    float* out_head = attn_out + h * 128;
+                    float* out_head = heavy_attn_out + h * 128;
                     for (uint32_t d = 0; d < 128; ++d) {
                         out_head[d] += alpha * vrow[d];
                     }
@@ -657,31 +672,31 @@ int main(int argc, char* argv[]) {
             }
 
             // O Proj and Residual
-            smoe::matvec(normed, scout.get_o_proj(l), attn_out, 2048, 2048);
+            smoe::matvec(heavy_normed, scout.get_o_proj(l), heavy_attn_out, 2048, 2048);
             for (uint32_t i = 0; i < 2048; ++i) {
-                hidden[i] += normed[i];
+                heavy_hidden[i] += heavy_normed[i];
             }
 
             // FFN Norm
-            std::memcpy(normed, hidden, 2048 * sizeof(float));
-            smoe::rms_norm(normed, scout.get_post_norm(l), 2048);
+            std::memcpy(heavy_normed, heavy_hidden, 2048 * sizeof(float));
+            smoe::rms_norm(heavy_normed, scout.get_post_norm(l), 2048);
 
             // FFN
             if (l == 0) {
                 // Dense MLP for Layer 0
                 static float l0_gate_out[10944];
                 static float l0_up_out[10944];
-                smoe::matvec(l0_gate_out, scout.get_l0_gate(), normed, 10944, 2048);
-                smoe::matvec(l0_up_out, scout.get_l0_up(), normed, 10944, 2048);
+                smoe::matvec(l0_gate_out, scout.get_l0_gate(), heavy_normed, 10944, 2048);
+                smoe::matvec(l0_up_out, scout.get_l0_up(), heavy_normed, 10944, 2048);
                 for (uint32_t i = 0; i < 10944; ++i) {
                     // Silu
                     float val = l0_gate_out[i];
                     l0_gate_out[i] = (val / (1.0f + std::exp(-val))) * l0_up_out[i];
                 }
-                smoe::matvec(normed, scout.get_l0_down(), l0_gate_out, 2048, 10944);
-                for (uint32_t d = 0; d < 2048; ++d) hidden[d] += normed[d];
+                smoe::matvec(heavy_normed, scout.get_l0_down(), l0_gate_out, 2048, 10944);
+                for (uint32_t d = 0; d < 2048; ++d) heavy_hidden[d] += heavy_normed[d];
                 if (n == 0 && g_debug) {
-                    std::fprintf(stderr, "\n[L0] hidden = %.4f %.4f %.4f %.4f\n", hidden[0], hidden[1], hidden[2], hidden[3]);
+                    std::fprintf(stderr, "\n[L0] hidden = %.4f %.4f %.4f %.4f\n", heavy_hidden[0], heavy_hidden[1], heavy_hidden[2], heavy_hidden[3]);
                 }
             } else {
                 // ── Phase 1: Dispatch Currently Available Routed Experts to GPU ──
@@ -717,7 +732,7 @@ int main(int argc, char* argv[]) {
                             wait_handles[e] = smoe_metal_fused_ffn(
                                 metal,
                                 packed_gate, scales_gate, packed_up, scales_up, packed_down, scales_down,
-                                normed, expert_hidden_scratch[e], expert_output_vec[e],
+                                heavy_normed, expert_hidden_scratch[e], expert_output_vec[e],
                                 expert_layout.gate_rows, expert_layout.gate_cols,
                                 vault_hdr.group_size, vault_hdr.bits, e
                             );
@@ -732,8 +747,8 @@ int main(int argc, char* argv[]) {
                 static float shared_up_out[2816];
                 static float shared_out[2048];
                 
-                smoe::matvec(shared_gate_out, scout.get_shared_gate(l), normed, 2816, 2048);
-                smoe::matvec(shared_up_out, scout.get_shared_up(l), normed, 2816, 2048);
+                smoe::matvec(shared_gate_out, scout.get_shared_gate(l), heavy_normed, 2816, 2048);
+                smoe::matvec(shared_up_out, scout.get_shared_up(l), heavy_normed, 2816, 2048);
                 for (uint32_t i = 0; i < 2816; ++i) {
                     float val = shared_gate_out[i];
                     shared_gate_out[i] = (val / (1.0f + std::exp(-val))) * shared_up_out[i];
@@ -763,7 +778,7 @@ int main(int argc, char* argv[]) {
                                 wait_handles[e] = smoe_metal_fused_ffn(
                                     metal,
                                     packed_gate, scales_gate, packed_up, scales_up, packed_down, scales_down,
-                                    normed, expert_hidden_scratch[e], expert_output_vec[e],
+                                    heavy_normed, expert_hidden_scratch[e], expert_output_vec[e],
                                     expert_layout.gate_rows, expert_layout.gate_cols,
                                     vault_hdr.group_size, vault_hdr.bits, e
                                 );
@@ -807,11 +822,11 @@ int main(int argc, char* argv[]) {
 
                 // Add FFN residuals
                 for (uint32_t d = 0; d < 2048; ++d) {
-                    hidden[d] += shared_out[d] + routed_out[d];
+                    heavy_hidden[d] += shared_out[d] + routed_out[d];
                 }
 
                 if (l == 1 && n == 0 && g_debug) {
-                    std::fprintf(stderr, "\n[L1] hidden after FFN = %.4f %.4f %.4f %.4f\n", hidden[0], hidden[1], hidden[2], hidden[3]);
+                    std::fprintf(stderr, "\n[L1] hidden after FFN = %.4f %.4f %.4f %.4f\n", heavy_hidden[0], heavy_hidden[1], heavy_hidden[2], heavy_hidden[3]);
                 }
             }
         }
@@ -820,11 +835,11 @@ int main(int argc, char* argv[]) {
         if (ctx_fill < ATTN_CTX) ++ctx_fill;
 
         // ── Step 5: Final Model Norm and LM Head ──────────────
-        smoe::rms_norm(hidden, scout.get_model_norm(), 2048);
+        smoe::rms_norm(heavy_hidden, scout.get_model_norm(), 2048);
         
         // Execute LM Head on GPU
         const float* weights[1] = { scout.get_lm_head() };
-        const float* inputs[1]  = { hidden };
+        const float* inputs[1]  = { heavy_hidden };
         float* outputs[1]       = { scout.get_lm_head_scores() };
         uint32_t rows[1]        = { 102400 };
         uint32_t cols[1]        = { 2048 };
@@ -837,7 +852,7 @@ int main(int argc, char* argv[]) {
         // Repetition penalty
         if (rep_penalty != 1.0f) {
             bool penalized[102400] = {false};
-            uint32_t penalty_last_n = 8192; // Full history
+            uint32_t penalty_last_n = 256; // 256 tokens is enough to break loops without forcing language switches
             uint32_t start_idx = (history_len > penalty_last_n) ? (history_len - penalty_last_n) : 0;
             
             for (uint32_t i = start_idx; i < history_len; ++i) {
@@ -869,7 +884,7 @@ int main(int argc, char* argv[]) {
             }
             if (g_debug && ((prompt_len == 0) || (n >= prompt_len - 1))) {
                 float h_sum2 = 0.0f;
-                for(uint32_t i=0; i<2048; i++) h_sum2 += hidden[i]*hidden[i];
+                for(uint32_t i=0; i<2048; i++) h_sum2 += heavy_hidden[i]*heavy_hidden[i];
                 std::fprintf(stderr, "\n[n=%u] hidden_L2 = %f, Top score = %f for tok = %u\n", n, std::sqrt(h_sum2), best_score, best_tok);
             }
         } else {
