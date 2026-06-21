@@ -23,7 +23,9 @@ def main():
     print(f"{MAGENTA}Type 'quit' or 'exit' to escape.{RESET}")
     print("-" * 50)
     
-    messages = []
+    messages = [
+        {"role": "system", "content": "You are a helpful, respectful, and honest AI coding assistant named S-MoE."}
+    ]
     
     while True:
         try:
@@ -72,7 +74,7 @@ def main():
             "--top-p", "0.95",
             "--top-k", "50",
             "--rep-penalty", "1.1",
-            "--raw-ids" # Most robust decoding via python
+            "--raw-ids"
         ]
         
         print(f"{CYAN}{BOLD}S-MoE [RAM: {ram_gb:.1f}GB | Ring: {ring_size}]:{RESET} ", end="", flush=True)
