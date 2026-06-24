@@ -672,8 +672,10 @@ void* smoe_metal_fused_ffn(SmoeMetalCtx*   ctx,
                            const float*    input_vec,
                            float*          hidden_vec,
                            float*          output_vec,
-                           uint32_t        rows,
-                           uint32_t        cols,
+                           uint32_t        gate_rows,
+                           uint32_t        gate_cols,
+                           uint32_t        down_rows,
+                           uint32_t        down_cols,
                            uint32_t        group_size,
                            uint32_t        bits,
                            uint32_t        expert_index)
@@ -683,18 +685,18 @@ void* smoe_metal_fused_ffn(SmoeMetalCtx*   ctx,
     // ── Build FusedFFNParams ──────────────────────────────────
     // Stack allocation — not in hot-path alloc-banned zone because
     // this struct is tiny and compiler-stack-allocated.
-    struct FusedFFNParamsC { uint32_t rows, cols, group_size, bits; };
-    FusedFFNParamsC params { rows, cols, group_size, bits };
+    struct FusedFFNParamsC { uint32_t gate_rows, gate_cols, down_rows, down_cols, group_size, bits; };
+    FusedFFNParamsC params { gate_rows, gate_cols, down_rows, down_cols, group_size, bits };
 
     // ── Wrap raw pointers in MTLBuffers (no-copy) ─────────────
     MTLResourceOptions uma = MTLResourceStorageModeShared;
 
     @autoreleasepool {
-        // Compute byte sizes for each sub-tensor
-        uint64_t packed_bytes = static_cast<uint64_t>(rows) * cols * bits / 8;
-        uint64_t scale_bytes  = static_cast<uint64_t>(rows) * cols / group_size * sizeof(uint16_t);
-        uint64_t input_bytes  = static_cast<uint64_t>(cols)  * sizeof(float);
-        uint64_t output_bytes = static_cast<uint64_t>(rows)  * sizeof(float);
+        // Compute byte sizes for each sub-tensor (assuming gate/up are same shape and down is transpose)
+        uint64_t packed_bytes = static_cast<uint64_t>(gate_rows) * gate_cols * bits / 8;
+        uint64_t scale_bytes  = static_cast<uint64_t>(gate_rows) * gate_cols / group_size * sizeof(uint16_t);
+        uint64_t input_bytes  = static_cast<uint64_t>(gate_cols)  * sizeof(float);
+        uint64_t output_bytes = static_cast<uint64_t>(down_rows)  * sizeof(float);
 
         NSUInteger off_gp = 0, off_gs = 0, off_up = 0, off_us = 0, off_dp = 0, off_ds = 0;
         id<MTLBuffer> buf_gp = get_registered_buffer(ctx, packed_gate,  packed_bytes, off_gp);
@@ -737,7 +739,7 @@ void* smoe_metal_fused_ffn(SmoeMetalCtx*   ctx,
     {
         NSUInteger tgroup = 256;
         MTLSize tgSize    = MTLSizeMake(tgroup, 1, 1);
-        MTLSize gridGroups  = MTLSizeMake(rows,   1, 1);
+        MTLSize gridGroups  = MTLSizeMake(gate_rows,   1, 1);
         [enc dispatchThreadgroups:gridGroups threadsPerThreadgroup:tgSize];
     }
 
@@ -761,7 +763,7 @@ void* smoe_metal_fused_ffn(SmoeMetalCtx*   ctx,
     {
         NSUInteger tgroup = 256;
         MTLSize tgSize   = MTLSizeMake(tgroup, 1, 1);
-        MTLSize gridGroups = MTLSizeMake(cols,   1, 1);
+        MTLSize gridGroups = MTLSizeMake(down_rows,   1, 1);
         [enc dispatchThreadgroups:gridGroups threadsPerThreadgroup:tgSize];
     }
 

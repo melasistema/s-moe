@@ -888,6 +888,7 @@ int main(int argc, char* argv[]) {
                                 packed_gate, scales_gate, packed_up, scales_up, packed_down, scales_down,
                                 heavy_normed, expert_hidden_scratch[e], expert_output_vec[e],
                                 expert_layout.gate_rows, expert_layout.gate_cols,
+                                expert_layout.down_rows, expert_layout.down_cols,
                                 vault_hdr.group_size, vault_hdr.bits, e
                             );
                         }
@@ -934,6 +935,7 @@ int main(int argc, char* argv[]) {
                                     packed_gate, scales_gate, packed_up, scales_up, packed_down, scales_down,
                                     heavy_normed, expert_hidden_scratch[e], expert_output_vec[e],
                                     expert_layout.gate_rows, expert_layout.gate_cols,
+                                    expert_layout.down_rows, expert_layout.down_cols,
                                     vault_hdr.group_size, vault_hdr.bits, e
                                 );
                             }

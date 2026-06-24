@@ -90,8 +90,10 @@ void* smoe_metal_fused_ffn(SmoeMetalCtx*   ctx,
                            const float*    input_vec,
                            float*          hidden_vec,   // caller-allocated scratch
                            float*          output_vec,
-                           uint32_t        rows,
-                           uint32_t        cols,
+                           uint32_t        gate_rows,
+                           uint32_t        gate_cols,
+                           uint32_t        down_rows,
+                           uint32_t        down_cols,
                            uint32_t        group_size,
                            uint32_t        bits,
                            uint32_t        expert_index);

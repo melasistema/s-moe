@@ -37,8 +37,10 @@ constant uint TGROUP_SIZE = 256;
 
 // ── Kernel argument buffer layout ────────────────────────────
 struct FusedFFNParams {
-    uint rows;        // weight matrix rows  (= intermediate / hidden dim)
-    uint cols;        // weight matrix cols  (= input dim)
+    uint gate_rows;   // gate/up weight matrix rows  (= ffn_dim)
+    uint gate_cols;   // gate/up weight matrix cols  (= d_model)
+    uint down_rows;   // down weight matrix rows     (= d_model)
+    uint down_cols;   // down weight matrix cols     (= ffn_dim)
     uint group_size;  // SMOE quantisation group size (= 64)
     uint bits;        // bits per weight (2 or 4)
 };
@@ -135,7 +137,7 @@ kernel void smoe_gate_up(
     float gate_acc = 0.0f;
     float up_acc   = 0.0f;
 
-    uint tiles = (params.cols + TGROUP_SIZE - 1) / TGROUP_SIZE;
+    uint tiles = (params.gate_cols + TGROUP_SIZE - 1) / TGROUP_SIZE;
 
     for (uint t = 0; t < tiles; ++t) {
         uint col_base = t * TGROUP_SIZE;
@@ -143,17 +145,17 @@ kernel void smoe_gate_up(
         // Load this thread's element into shared memory
         for (uint i = tid; i < TGROUP_SIZE; i += threads_per_tg) {
             uint col = col_base + i;
-            tg_input[i] = (col < params.cols) ? input[col] : 0.0f;
+            tg_input[i] = (col < params.gate_cols) ? input[col] : 0.0f;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // Accumulate dot-products for all cols in this tile
-        uint tile_end = min(TGROUP_SIZE, params.cols - col_base);
+        uint tile_end = min(TGROUP_SIZE, params.gate_cols - col_base);
 
-        if (row < params.rows) {
+        if (row < params.gate_rows) {
 
         // Unroll x4 over the natural 4-codes-per-byte boundary
-        uint wi_base = row * params.cols + col_base;
+        uint wi_base = row * params.gate_cols + col_base;
 
         uint k = 0;
         if (params.bits == 4) {
@@ -215,7 +217,7 @@ kernel void smoe_gate_up(
     }
 
     // ── Phase B: fused SiLU gate ─────────────────────────────
-    if (row < params.rows) {
+    if (row < params.gate_rows) {
         hidden[row] = silu(gate_acc) * up_acc;
     }
 }
@@ -240,21 +242,21 @@ kernel void smoe_down(
     uint row = gid;
 
     float acc   = 0.0f;
-    uint  tiles = (params.rows + TGROUP_SIZE - 1) / TGROUP_SIZE;
+    uint  tiles = (params.down_cols + TGROUP_SIZE - 1) / TGROUP_SIZE;
 
     for (uint t = 0; t < tiles; ++t) {
         uint col_base = t * TGROUP_SIZE;
 
         for (uint i = tid; i < TGROUP_SIZE; i += threads_per_tg) {
             uint col = col_base + i;
-            tg_hidden[i] = (col < params.rows) ? hidden[col] : 0.0f;
+            tg_hidden[i] = (col < params.down_cols) ? hidden[col] : 0.0f;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        uint tile_end = min(TGROUP_SIZE, params.rows - col_base);
-        uint wi_base  = row * params.rows + col_base;
+        uint tile_end = min(TGROUP_SIZE, params.down_cols - col_base);
+        uint wi_base  = row * params.down_cols + col_base;
 
-        if (row < params.cols) {
+        if (row < params.down_rows) {
 
         uint k = 0;
         if (params.bits == 4) {
@@ -297,7 +299,7 @@ kernel void smoe_down(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    if (row < params.cols) {
+    if (row < params.down_rows) {
         output[row] = acc;
     }
 }
