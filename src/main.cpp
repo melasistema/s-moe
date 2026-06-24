@@ -33,11 +33,12 @@
 #include <unistd.h>
 #include <random>
 #include <algorithm>
+#include <vector>
 
 // ── Compile-time defaults ─────────────────────────────────────
-inline constexpr uint32_t DEFAULT_RING_SIZE    = 1024;
-inline constexpr uint32_t DEFAULT_WORKERS      = 64;
-inline constexpr uint64_t DEFAULT_SLOT_MB      = 8;
+inline constexpr uint32_t DEFAULT_RING_SIZE    = 0;     // 0 = auto-compute from available RAM
+inline constexpr uint32_t DEFAULT_WORKERS      = 16;
+inline constexpr uint64_t DEFAULT_SLOT_MB      = 0;     // 0 = auto-compute from vault expert size
 inline constexpr uint32_t DEFAULT_MAX_TOKENS   = 512;
 inline constexpr uint32_t TELEMETRY_EVERY      = 10;   // tokens between telemetry updates
 
@@ -373,8 +374,79 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // ── Phase 3: Metal bridge init ────────────────────────────
+    // ── Auto-compute slot size and ring size from vault + available RAM ──
+    //
+    // slot_bytes: must fit the largest expert blob in the vault. We scan
+    //   the expert table for the maximum padded_size and round up to 16 KB.
+    //   The user can override with --slot-mb.
+    //
+    // ring_size: target ≤ 25% of available physical RAM for the ring pool
+    //   so the OS is never pressured into OOM-killing us. On a 16 GB machine
+    //   this yields ~3 GB for the ring; on a 128 GB machine, ~24 GB.
+    //   Minimum ring = 8 × num_active_experts (8 per layer) = 64 slots minimum.
+    //   The user can override with --ring.
+    {
+        // ── 1. Slot size: scan expert table for max padded_size ──
+        if (slot_mb == 0) {
+            int scan_fd = ::open(vault_path, O_RDONLY);
+            uint64_t max_padded = 0;
+            if (scan_fd >= 0) {
+                const size_t table_bytes = static_cast<size_t>(vault_hdr.total_experts) * sizeof(smoe::ExpertEntry);
+                std::vector<smoe::ExpertEntry> table(vault_hdr.total_experts);
+                ssize_t nr = ::pread(scan_fd, table.data(), table_bytes,
+                                     static_cast<off_t>(vault_hdr.table_offset));
+                if (nr == static_cast<ssize_t>(table_bytes)) {
+                    for (const auto& e : table)
+                        if (e.padded_size > max_padded) max_padded = e.padded_size;
+                }
+                ::close(scan_fd);
+            }
+            if (max_padded == 0) max_padded = 8ULL * 1024 * 1024; // fallback 8 MB
+            // Round up to 16 KB boundary — use literal to avoid mach PAGE_SIZE macro collision
+            constexpr uint64_t SMOE_PAGE = 16384ULL;
+            uint64_t auto_slot = (max_padded + SMOE_PAGE - 1) & ~(SMOE_PAGE - 1);
+            slot_mb = (auto_slot + (1024*1024 - 1)) / (1024*1024); // round up to MB
+            if (slot_mb == 0) slot_mb = 1;
+            std::fprintf(stderr, "[ring] Auto slot size: %llu MB  (max expert blob: %llu KB)\n",
+                (unsigned long long)slot_mb,
+                (unsigned long long)(max_padded / 1024));
+        }
+
+        // ── 2. Ring size: use 25% of free physical RAM ─────────
+        if (ring_size == 0) {
+            // Query available RAM via host_statistics64
+            uint64_t free_bytes = 0;
+            vm_statistics64_data_t vmstat {};
+            mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+            if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
+                                  reinterpret_cast<host_info64_t>(&vmstat),
+                                  &count) == KERN_SUCCESS) {
+                // free_count includes pages that are available without swapping
+                uint64_t page_sz = static_cast<uint64_t>(vm_page_size);
+                free_bytes = (static_cast<uint64_t>(vmstat.free_count) +
+                              static_cast<uint64_t>(vmstat.inactive_count)) * page_sz;
+            }
+            if (free_bytes < 512ULL * 1024 * 1024)
+                free_bytes = 512ULL * 1024 * 1024; // assume at least 512 MB
+
+            uint64_t slot_bytes_now = slot_mb * 1024ULL * 1024ULL;
+            uint64_t ring_budget    = free_bytes / 4; // 25% of free RAM
+            uint32_t auto_ring      = static_cast<uint32_t>(ring_budget / slot_bytes_now);
+
+            // Clamp: minimum 64 (one full token's experts + spare), maximum 4096
+            if (auto_ring < 64)   auto_ring = 64;
+            if (auto_ring > 4096) auto_ring = 4096;
+            ring_size = auto_ring;
+            std::fprintf(stderr, "[ring] Auto ring size : %u slots × %llu MB = %.1f GB  (free RAM: %.1f GB)\n",
+                ring_size, (unsigned long long)slot_mb,
+                static_cast<double>(ring_size) * slot_mb / 1024.0,
+                static_cast<double>(free_bytes) / (1024.0*1024*1024));
+        }
+    }
+
     uint64_t slot_bytes = slot_mb * 1024ULL * 1024ULL;
+
+    // Phase 3: Metal bridge init ────────────────────────────────
     SmoeMetalCtx* metal = smoe_metal_init(slot_bytes);
     if (!metal) {
         std::fprintf(stderr, "  ✗  Metal initialisation failed.\n");
