@@ -99,16 +99,18 @@ void* smoe_metal_fused_ffn(SmoeMetalCtx*   ctx,
 void smoe_metal_wait(SmoeMetalCtx* ctx, void* handle, float* output_vec, uint32_t expert_index, uint32_t cols);
 
 // Perform a float32 matrix-vector multiplication on the GPU for Scout projections.
-void smoe_metal_scout_matvec(SmoeMetalCtx* ctx,
-                             const float*   weight,
+void smoe_metal_scout_matvec(SmoeMetalCtx* ctx, const float* weight, const float* input, float* output, uint32_t rows, uint32_t cols);
+void smoe_metal_scout_matvec_bf16(SmoeMetalCtx* ctx,
+                             const uint16_t* weight,
                              const float*   input_vec,
                              float*         output_vec,
                              uint32_t       rows,
                              uint32_t       cols);
 
 // Perform a batch of float32 matrix-vector multiplications on the GPU to reduce sync latency.
-void smoe_metal_scout_matvec_batch(SmoeMetalCtx* ctx,
-                                   const float**  weights,
+void smoe_metal_scout_matvec_batch(SmoeMetalCtx* ctx, const float** weights, const float** inputs, float** outputs, const uint32_t* rows, const uint32_t* cols, uint32_t count);
+void smoe_metal_scout_matvec_batch_bf16(SmoeMetalCtx* ctx,
+                                   const uint16_t** weights,
                                    const float**  inputs,
                                    float**        outputs,
                                    const uint32_t* rows,

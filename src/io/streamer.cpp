@@ -142,7 +142,8 @@ static constexpr size_t REQUEST_QUEUE_CAPACITY = 1024;  // power of two
 // ─────────────────────────────────────────────────────────────
 struct Streamer::Impl {
     // ── Vault file ────────────────────────────────────────────
-    int fd { -1 };  // opened with F_NOCACHE; shared across all workers
+    int fd { -1 };  // main thread fd (used for parsing)
+    std::string vault_path; // used by workers to open their own fds
 
     // ── Expert index (built once at startup) ──────────────────
     // key: expert_key(layer_id, expert_id) → ExpertEntry
@@ -156,6 +157,9 @@ struct Streamer::Impl {
 
     // ── Request queue ─────────────────────────────────────────
     MPMCQueue<REQUEST_QUEUE_CAPACITY> request_queue;
+
+    // ── LRU Cache Tick ────────────────────────────────────────
+    std::atomic<uint64_t> global_tick { 0 };
 
     // ── Worker pool ───────────────────────────────────────────
     uint32_t                 num_workers { 0 };
@@ -229,6 +233,13 @@ void Streamer::Impl::run(Impl* impl, uint32_t worker_id)
     uint32_t scan_start = worker_id;   // stagger starting search offset
     uint32_t backoff    = 1;           // exponential yield backoff
 
+    // macOS kernel serializes F_NOCACHE preads on the same file descriptor.
+    // Give every thread its own independent FD to unlock full NVMe queue depth.
+    int local_fd = ::open(impl->vault_path.c_str(), O_RDONLY);
+    if (local_fd >= 0) {
+        ::fcntl(local_fd, F_NOCACHE, 1);
+    }
+
     while (!impl->shutdown.load(std::memory_order_relaxed)) {
 
         // ── 1. Get a pending request ──────────────────────────
@@ -245,7 +256,11 @@ void Streamer::Impl::run(Impl* impl, uint32_t worker_id)
         auto it = impl->expert_index.find(expert_key(req.layer_id, req.expert_id));
         if (it == impl->expert_index.end()) {
             // Unknown expert — should never happen with a valid vault
+            std::fprintf(stderr, "[worker] ERROR: Unknown expert requested: layer=%u, expert=%u\n", req.layer_id, req.expert_id);
             impl->stat_misses.fetch_add(1, std::memory_order_relaxed);
+            if (req.slot) {
+                req.slot->state.store(SlotState::EMPTY, std::memory_order_release);
+            }
             continue;
         }
         const smoe::ExpertEntry& entry = it->second;
@@ -260,7 +275,7 @@ void Streamer::Impl::run(Impl* impl, uint32_t worker_id)
         //  slot->data:         guaranteed 16 KB-aligned by posix_memalign
         //  F_NOCACHE already set on fd — NVMe DMA straight into UMA.
         const ssize_t n = ::pread(
-            impl->fd,
+            local_fd >= 0 ? local_fd : impl->fd,
             slot->data,
             static_cast<size_t>(entry.padded_size),
             static_cast<off_t>(entry.byte_offset)
@@ -269,6 +284,11 @@ void Streamer::Impl::run(Impl* impl, uint32_t worker_id)
         if (n < 0 ||
             static_cast<uint64_t>(n) != entry.padded_size)
         {
+            if (n < 0) {
+                std::perror("[worker] pread failed");
+            } else {
+                std::fprintf(stderr, "[worker] pread short read: %zd != %llu\n", n, (unsigned long long)entry.padded_size);
+            }
             // I/O error — release slot and count miss
             slot->state.store(SlotState::EMPTY, std::memory_order_release);
             impl->stat_misses.fetch_add(1, std::memory_order_relaxed);
@@ -304,6 +324,7 @@ Streamer::Streamer(const char* smoe_path,
     im.ring_sz      = ring_size;
     im.slot_cap     = slot_capacity;
     im.num_workers  = num_workers;
+    im.vault_path   = smoe_path;
 
     // ── Open vault file with Direct I/O ──────────────────────
     im.fd = ::open(smoe_path, O_RDONLY);
@@ -400,7 +421,8 @@ bool Streamer::prefetch(uint32_t layer_id, uint32_t expert_id) noexcept {
             im.slots[i].layer_id  == layer_id &&
             im.slots[i].expert_id == expert_id)
         {
-            im.slots[i].ref_count.fetch_add(1, std::memory_order_relaxed);
+            im.slots[i].last_used_tick.store(im.global_tick.fetch_add(1, std::memory_order_relaxed), std::memory_order_relaxed);
+            im.slots[i].last_used_tick.store(im.global_tick.fetch_add(1, std::memory_order_relaxed), std::memory_order_relaxed);
             return true;  // already queued or ready — no duplicate load
         }
     }
@@ -420,24 +442,20 @@ bool Streamer::prefetch(uint32_t layer_id, uint32_t expert_id) noexcept {
     }
 
     if (!slot) {
-        std::fprintf(stderr, "[DEBUG] prefetch failed: no empty slots!\n");
         return false;
     }
 
     // Set metadata NOW so idempotency check catches subsequent prefetch calls
     slot->layer_id = layer_id;
     slot->expert_id = expert_id;
-    slot->ref_count.store(1, std::memory_order_relaxed);
+    slot->ref_count.store(0, std::memory_order_relaxed);
 
     // ── Enqueue the request ───────────────────────────────────
-    bool ok = im.request_queue.push({ layer_id, expert_id, slot });
-    if (!ok) {
-        std::fprintf(stderr, "[DEBUG] prefetch failed: request queue full!\n");
-        slot->layer_id = 0xFFFFFFFF;
-        slot->expert_id = 0xFFFFFFFF;
+    if (!im.request_queue.push({ layer_id, expert_id, slot })) {
         slot->state.store(SlotState::EMPTY, std::memory_order_release);
+        return false;
     }
-    return ok;
+    return true;
 }
 
 RingSlot* Streamer::claim_ready() noexcept {
@@ -452,6 +470,7 @@ RingSlot* Streamer::claim_ready() noexcept {
                 std::memory_order_acquire,  // acquire: see all pread() writes
                 std::memory_order_relaxed))
         {
+            im.slots[i].last_used_tick.store(im.global_tick.fetch_add(1, std::memory_order_relaxed), std::memory_order_relaxed);
             return &im.slots[i];
         }
     }
@@ -462,15 +481,15 @@ RingSlot* Streamer::claim_specific(uint32_t layer_id, uint32_t expert_id) noexce
     Impl& im = *impl_;
     for (uint32_t i = 0; i < im.ring_sz; ++i) {
         if (im.slots[i].layer_id == layer_id && im.slots[i].expert_id == expert_id) {
-            SlotState expected = SlotState::READY;
-            if (im.slots[i].state.compare_exchange_strong(
-                    expected, SlotState::CONSUMED,
-                    std::memory_order_acquire,
-                    std::memory_order_relaxed))
-            {
-                return &im.slots[i];
-            }
-            if (im.slots[i].state.load(std::memory_order_acquire) == SlotState::CONSUMED) {
+            SlotState s = im.slots[i].state.load(std::memory_order_acquire);
+            if (s == SlotState::READY || s == SlotState::CONSUMED) {
+                SlotState expected = SlotState::READY;
+                im.slots[i].state.compare_exchange_strong(
+                        expected, SlotState::CONSUMED,
+                        std::memory_order_acquire,
+                        std::memory_order_relaxed);
+                im.slots[i].ref_count.fetch_add(1, std::memory_order_relaxed);
+                im.slots[i].last_used_tick.store(im.global_tick.fetch_add(1, std::memory_order_relaxed), std::memory_order_relaxed);
                 return &im.slots[i];
             }
         }
@@ -479,13 +498,10 @@ RingSlot* Streamer::claim_specific(uint32_t layer_id, uint32_t expert_id) noexce
 }
 
 void Streamer::release(RingSlot* slot) noexcept {
-    // Atomically decrement ref_count. Only release to EMPTY if it drops to 0.
-    if (slot->ref_count.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-        slot->data_size = 0;
-        slot->layer_id = 0xFFFFFFFF;
-        slot->expert_id = 0xFFFFFFFF;
-        slot->state.store(SlotState::EMPTY, std::memory_order_release);
-    }
+    // Atomically decrement ref_count. DO NOT release to EMPTY!
+    // The slot remains in CONSUMED/READY state so the LRU cache (prune_slots)
+    // can retain it for future hits.
+    slot->ref_count.fetch_sub(1, std::memory_order_acq_rel);
 }
 
 void Streamer::prune_slots(bool (*is_active)(uint32_t, uint32_t, void*), void* ctx) noexcept {
@@ -503,18 +519,36 @@ void Streamer::prune_slots(bool (*is_active)(uint32_t, uint32_t, void*), void* c
     uint32_t target_empty = std::min<uint32_t>(256, im.ring_sz / 4);
     if (empty_count >= target_empty) return;
     
-    for (uint32_t i = 0; i < im.ring_sz && empty_count < target_empty; ++i) {
+    struct Candidate {
+        uint32_t idx;
+        uint64_t tick;
+    };
+    std::vector<Candidate> candidates;
+    candidates.reserve(im.ring_sz);
+
+    for (uint32_t i = 0; i < im.ring_sz; ++i) {
         SlotState s = im.slots[i].state.load(std::memory_order_relaxed);
         if (s == SlotState::READY || s == SlotState::CONSUMED) {
             if (!is_active(im.slots[i].layer_id, im.slots[i].expert_id, ctx)) {
-                im.slots[i].ref_count.store(0, std::memory_order_relaxed);
-                im.slots[i].data_size = 0;
-                im.slots[i].layer_id = 0xFFFFFFFF;
-                im.slots[i].expert_id = 0xFFFFFFFF;
-                im.slots[i].state.store(SlotState::EMPTY, std::memory_order_release);
-                empty_count++;
+                candidates.push_back({i, im.slots[i].last_used_tick.load(std::memory_order_relaxed)});
             }
         }
+    }
+
+    // Sort by oldest tick first
+    std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
+        return a.tick < b.tick;
+    });
+
+    for (const auto& c : candidates) {
+        if (empty_count >= target_empty) break;
+        uint32_t i = c.idx;
+        im.slots[i].ref_count.store(0, std::memory_order_relaxed);
+        im.slots[i].data_size = 0;
+        im.slots[i].layer_id = 0xFFFFFFFF;
+        im.slots[i].expert_id = 0xFFFFFFFF;
+        im.slots[i].state.store(SlotState::EMPTY, std::memory_order_release);
+        empty_count++;
     }
 }
 

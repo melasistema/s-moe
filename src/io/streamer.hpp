@@ -54,9 +54,10 @@ struct alignas(64) RingSlot {
     uint32_t               layer_id  { 0xFFFFFFFF };
     uint32_t               expert_id { 0xFFFFFFFF };
     std::atomic<uint32_t>  ref_count { 0 };
+    std::atomic<uint64_t>  last_used_tick { 0 };
     uint8_t*               data      { nullptr };  // posix_memalign 16 KB-aligned
     uint64_t               data_size { 0 };        // bytes actually loaded by pread()
-    uint8_t                _pad1[32] {};
+    uint8_t                _pad1[24] {};
 };
 static_assert(sizeof(RingSlot) == 64,
     "RingSlot must be exactly one cache line (64 bytes).");

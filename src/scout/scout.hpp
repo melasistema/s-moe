@@ -31,7 +31,7 @@ namespace smoe::scout {
 // Lookahead window depth — how many future steps to predict
 inline constexpr uint32_t LOOKAHEAD_K   = 10;
 // Maximum simultaneously active experts per token per layer
-inline constexpr uint32_t MAX_ACTIVE    =  6;
+inline constexpr uint32_t MAX_ACTIVE    =  16;
 
 // ── Expert prediction for one future step ────────────────────
 struct ExpertPrediction {
@@ -54,7 +54,7 @@ struct ScoutOutput {
 class Scout {
 public:
     // Load Scout weights from a .safetensors file.
-    Scout(const char* scout_safetensors_path, SmoeMetalCtx* metal_ctx);
+    Scout(const char* scout_safetensors_path, SmoeMetalCtx* metal_ctx, const SmoeHeader* vault_hdr = nullptr);
     ~Scout();
 
     // Run one forward step, updating internal KV-cache context.
@@ -75,29 +75,29 @@ public:
     const SmoeModelConfig& config() const noexcept;
 
     // ── Getters for full-model execution ────────────────────────
-    const float* get_embed() const noexcept;
-    const float* get_lm_head() const noexcept;
-    const float* get_model_norm() const noexcept;
+    const uint16_t* get_embed() const noexcept;
+    const uint16_t* get_lm_head() const noexcept;
+    const uint16_t* get_model_norm() const noexcept;
     
     // Layer 0: dense MLP
-    const float* get_l0_gate() const noexcept;
-    const float* get_l0_up() const noexcept;
-    const float* get_l0_down() const noexcept;
+    const uint16_t* get_l0_gate() const noexcept;
+    const uint16_t* get_l0_up() const noexcept;
+    const uint16_t* get_l0_down() const noexcept;
 
     // Layers 0..27
-    const float* get_q_proj(uint32_t layer) const noexcept;
-    const float* get_k_proj(uint32_t layer) const noexcept;
-    const float* get_v_proj(uint32_t layer) const noexcept;
-    const float* get_o_proj(uint32_t layer) const noexcept;
-    const float* get_input_norm(uint32_t layer) const noexcept;
-    const float* get_post_norm(uint32_t layer) const noexcept;
+    const uint16_t* get_q_proj(uint32_t layer) const noexcept;
+    const uint16_t* get_k_proj(uint32_t layer) const noexcept;
+    const uint16_t* get_v_proj(uint32_t layer) const noexcept;
+    const uint16_t* get_o_proj(uint32_t layer) const noexcept;
+    const uint16_t* get_input_norm(uint32_t layer) const noexcept;
+    const uint16_t* get_post_norm(uint32_t layer) const noexcept;
     
     float* get_lm_head_scores() const noexcept;
     
     // Layers 1..27 shared experts
-    const float* get_shared_gate(uint32_t layer) const noexcept;
-    const float* get_shared_up(uint32_t layer) const noexcept;
-    const float* get_shared_down(uint32_t layer) const noexcept;
+    const uint16_t* get_shared_gate(uint32_t layer) const noexcept;
+    const uint16_t* get_shared_up(uint32_t layer) const noexcept;
+    const uint16_t* get_shared_down(uint32_t layer) const noexcept;
 
     Scout(const Scout&)            = delete;
     Scout& operator=(const Scout&) = delete;

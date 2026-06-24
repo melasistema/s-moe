@@ -27,7 +27,6 @@ namespace smoe {
 // ── Format constants ──────────────────────────────────────────
 inline constexpr uint32_t SMOE_VERSION        = 1;
 inline constexpr size_t   PAGE_SIZE           = 16'384;   // 16 KB Apple Silicon page
-inline constexpr uint32_t NUM_MOE_LAYERS      = 27;
 inline constexpr uint32_t Q2_GROUP_SIZE       = 64;       // weights per quantisation group
 inline constexpr uint32_t TENSORS_PER_EXPERT  = 3;        // gate_proj, up_proj, down_proj
 
@@ -72,12 +71,19 @@ static_assert(sizeof(SmoeHeader) == 64,
 struct SmoeModelConfig {
     uint32_t d_model;
     uint32_t vocab_size;
-    uint32_t ffn_dim;
+    uint32_t ffn_dim;                  // expert intermediate dim (from TensorDescriptor)
+    uint32_t shared_expert_ffn_dim {0};// 0 = no shared expert (Qwen3-235B), >0 = DeepSeek
     uint32_t num_moe_layers;
     uint32_t max_experts_per_layer;
     uint32_t q2_group_size;
-    bool has_dense_layer_0 {true}; // DeepSeek = true, Qwen = false
-    // Derived configurations for DeepSeek compat
+    bool has_dense_layer_0 {true};     // DeepSeek = true, Qwen3 = false
+    bool has_qk_norm {false};          // Qwen3-specific per-head Q/K RMS norm before RoPE
+    uint32_t num_heads {16};           // GQA queries (default 16 for backward compat)
+    uint32_t num_kv_heads {16};        // GQA keys/values
+    uint32_t head_dim {128};           // Attention head dimension
+    float    rope_theta {10000.0f};    // RoPE base frequency (10000=DeepSeek, 1000000=Qwen3)
+    bool     norm_topk_prob {false};   // Re-normalize routing weights over selected top-k
+    // Derived configurations
     uint32_t gate_rows() const { return max_experts_per_layer; }
 };
 
@@ -174,7 +180,44 @@ inline void free_aligned_float(float* ptr) noexcept {
     }
 }
 
+
+inline float bf16_to_f32(uint16_t bf) noexcept {
+    uint32_t val = static_cast<uint32_t>(bf) << 16;
+    float f;
+    std::memcpy(&f, &val, sizeof(f));
+    return f;
+}
+
+inline void rms_norm_bf16(float* x, const uint16_t* w, uint32_t n) noexcept {
+    float ss = 0.0f;
+    for (uint32_t i = 0; i < n; ++i) {
+        ss += x[i] * x[i];
+    }
+    ss /= n;
+    ss += 1e-6f;
+    ss = 1.0f / std::sqrt(ss);
+    for (uint32_t i = 0; i < n; ++i) {
+        x[i] = (x[i] * ss) * bf16_to_f32(w[i]);
+    }
+}
+
+inline void matvec_bf16(float* __restrict__ out,
+                   const uint16_t* __restrict__ weight,
+                   const float* __restrict__ in,
+                   uint32_t rows, uint32_t cols) noexcept {
+    #pragma omp parallel for if(rows > 128)
+    for (uint32_t i = 0; i < rows; ++i) {
+        float sum = 0.0f;
+        const uint16_t* w_row = weight + i * cols;
+        for (uint32_t j = 0; j < cols; ++j) {
+            sum += bf16_to_f32(w_row[j]) * in[j];
+        }
+        out[i] = sum;
+    }
+}
+
 inline void rms_norm(float* x, const float* w, uint32_t n) noexcept {
+    if (!w) return;
     float sum_sq = 0.0f;
     for (uint32_t i = 0; i < n; ++i) {
         sum_sq += x[i] * x[i];
@@ -190,6 +233,7 @@ inline void matvec(float* __restrict__ out,
                    const float* __restrict__ weight,
                    const float* __restrict__ x,
                    uint32_t rows, uint32_t cols) noexcept {
+    if (!weight) return;
     for (uint32_t r = 0; r < rows; ++r) {
         float acc = 0.0f;
         const float* row = weight + static_cast<size_t>(r) * cols;

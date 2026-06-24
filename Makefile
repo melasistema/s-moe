@@ -23,10 +23,10 @@ PIP         := $(VENV_DIR)/bin/pip
 # ── C++ / Metal toolchain ────────────────────────────────────
 CXX      := clang++
 XCRUN    := xcrun
-CXXFLAGS := -std=c++20 -O3 -Wall -Wextra -Wno-unused-parameter \
+CXXFLAGS := -std=c++20 -g -O3 -Wall -Wextra -Wno-unused-parameter \
              -Wno-unused-private-field \
              -arch arm64 -mmacosx-version-min=14.0
-MMFLAGS  := -std=c++20 -ObjC++ -O3 -arch arm64 -mmacosx-version-min=14.0
+MMFLAGS  := -std=c++20 -ObjC++ -g -O3 -arch arm64 -mmacosx-version-min=14.0
 LDFLAGS  := -framework Metal -framework Foundation \
              -framework MetalPerformanceShaders
 

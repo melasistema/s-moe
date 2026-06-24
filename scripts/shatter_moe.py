@@ -165,25 +165,15 @@ class TensorDescriptor:
 
 
 @dataclass
-class ExpertBlob:
-    """A fully quantised expert, ready to be serialised to the vault."""
+class ExpertMeta:
+    """Metadata for an expert, after it has been serialised to the vault."""
     layer_id:     int
     expert_id:    int
     tensor_descs: list[TensorDescriptor]
-    data:         bytes
-    file_offset:  int = field(default=0, repr=False)  # set during layout pass
-
-    @property
-    def raw_size(self) -> int:
-        return len(self.data)
-
-    @property
-    def padded_size(self) -> int:
-        return _align_up(len(self.data), PAGE_SIZE)
-
-    @property
-    def total_groups(self) -> int:
-        return sum(d.num_groups for d in self.tensor_descs)
+    raw_size:     int
+    padded_size:  int
+    total_groups: int
+    file_offset:  int
 
 
 def _align_up(value: int, alignment: int) -> int:
@@ -544,124 +534,7 @@ def build_expert_blob(
     return b"".join(parts), descs
 
 
-# ═════════════════════════════════════════════════════════════════
-# SMOE VAULT WRITER
-# ═════════════════════════════════════════════════════════════════
 
-def _layout_experts(experts: list[ExpertBlob]) -> tuple[int, int]:
-    """
-    Compute and assign file_offset for every expert blob.
-    The data section begins at the first 16 KB-aligned byte
-    after all metadata (header + expert table + tensor descriptors).
-
-    Returns (data_start_offset, total_file_size).
-    """
-    meta_bytes = (
-        HEADER_FMT.size
-        + len(experts) * EXPERT_ENTRY_FMT.size
-        + len(experts) * TENSORS_PER_EXPERT * TENSOR_DESC_FMT.size
-    )
-    data_start = _align_up(meta_bytes, PAGE_SIZE)
-
-    cursor = data_start
-    for blob in experts:
-        blob.file_offset = cursor
-        cursor += blob.padded_size
-
-    return data_start, cursor   # (data_offset, total_file_size)
-
-
-def write_smoe_vault(
-    output_path: Path,
-    experts: list[ExpertBlob],
-    topology: dict,
-    bits: int = 2,
-) -> dict:
-    """
-    Serialise all expert blobs into the .smoe binary vault.
-
-    Every expert blob is guaranteed to start on a 16 KB page boundary.
-    The file is fully deterministic given the same input experts list.
-
-    Returns a telemetry dict.
-    """
-    data_offset, total_size = _layout_experts(experts)
-
-    console.print(
-        f"  Layout  : header={HEADER_FMT.size}B"
-        f" + table={len(experts) * EXPERT_ENTRY_FMT.size}B"
-        f" + meta={len(experts) * TENSORS_PER_EXPERT * TENSOR_DESC_FMT.size}B"
-        f"  →  data@{data_offset:#x}"
-        f"  |  total={total_size / 1_073_741_824:.3f} GB"
-    )
-
-    with open(output_path, "wb") as f:
-
-        # ── FILE HEADER (64 bytes) ───────────────────────────────
-        f.write(HEADER_FMT.pack(
-            SMOE_MAGIC,
-            SMOE_VERSION,
-            topology["num_moe_layers"],
-            topology["max_experts"],
-            len(experts),
-            HEADER_FMT.size,    # table_offset: table starts immediately after header
-            data_offset,
-            Q2_GROUP_SIZE,
-            bits,               # bits
-            b"\x00" * 16,       # reserved
-        ))
-
-        # ── EXPERT TABLE (N × 48 bytes) ───────────────────────────
-        for blob in experts:
-            f.write(EXPERT_ENTRY_FMT.pack(
-                blob.layer_id,
-                blob.expert_id,
-                blob.file_offset,
-                blob.raw_size,
-                blob.padded_size,
-                Q2_GROUP_SIZE,
-                blob.total_groups,
-            ))
-
-        # ── TENSOR DESCRIPTORS (N × 3 × 44 bytes) ─────────────────
-        for blob in experts:
-            for desc in blob.tensor_descs:
-                f.write(TENSOR_DESC_FMT.pack(
-                    desc.tensor_type,
-                    2,                  # ndim — always 2 for weight matrices
-                    desc.rows,
-                    desc.cols,
-                    desc.packed_offset,
-                    desc.packed_size,
-                    desc.scales_offset,
-                    desc.scales_size,
-                ))
-
-        # ── ZERO-PAD TO DATA SECTION ──────────────────────────────
-        pad = data_offset - f.tell()
-        assert pad >= 0, f"Metadata overflow: wrote {f.tell()} bytes, data_offset={data_offset}"
-        f.write(b"\x00" * pad)
-
-        # ── EXPERT BLOBS (each 16 KB-page-aligned) ────────────────
-        for blob in experts:
-            pos = f.tell()
-            assert pos == blob.file_offset, (
-                f"Offset mismatch L{blob.layer_id}E{blob.expert_id}: "
-                f"expected {blob.file_offset:#x}, got {pos:#x}"
-            )
-            assert pos % PAGE_SIZE == 0, f"Expert blob not 16 KB-aligned: {pos:#x}"
-
-            f.write(blob.data)
-            f.write(b"\x00" * (blob.padded_size - blob.raw_size))
-
-        assert f.tell() == total_size, \
-            f"Final size mismatch: wrote {f.tell()}, expected {total_size}"
-
-    return {
-        "total_experts":    len(experts),
-        "total_size_bytes": total_size,
-        "data_offset":      data_offset,
-    }
 
 
 # ═════════════════════════════════════════════════════════════════
@@ -756,8 +629,8 @@ def _print_topology(topo: dict) -> None:
 
 
 def _print_summary(
-    experts:         list[ExpertBlob],
-    telemetry:       dict,
+    experts:         list[ExpertMeta],
+    total_size:      int,
     total_raw_bytes: int,
     total_q2_bytes:  int,
     t_quant:         float,
@@ -777,7 +650,7 @@ def _print_summary(
         t.add_row("Compressed volume",  f"{total_q2_bytes   / 1_073_741_824:.3f} GB")
         t.add_row("Compression ratio",  f"{ratio:.2f}×")
         t.add_row("Avg expert block",   f"{avg_kb:.1f} KB")
-        t.add_row("Vault total size",   f"{telemetry['total_size_bytes'] / 1_073_741_824:.3f} GB")
+        t.add_row("Vault total size",   f"{total_size / 1_073_741_824:.3f} GB")
         t.add_row("Page alignment",     "✓ 16 KB")
         console.print(t)
     else:
@@ -886,78 +759,156 @@ def main() -> None:
     console.print(f"\n  Shattering [bold]{total_work:,}[/bold] expert block(s)…\n")
 
     # ── Quantise all experts ──────────────────────────────────────
-    experts:         list[ExpertBlob] = []
+    experts_meta:    list[ExpertMeta] = []
     total_raw_bytes: int = 0
     total_q2_bytes:  int = 0
     error_metrics:   Optional[dict] = None
 
     t_quant_start = time.perf_counter()
 
-    def _run(progress=None, task=None):
-        nonlocal total_raw_bytes, total_q2_bytes, error_metrics
+    meta_bytes = (
+        HEADER_FMT.size
+        + total_work * EXPERT_ENTRY_FMT.size
+        + total_work * TENSORS_PER_EXPERT * TENSOR_DESC_FMT.size
+    )
+    data_offset = _align_up(meta_bytes, PAGE_SIZE)
 
-        for lid in layers:
-            eids = topology["experts_per_layer"][lid]
-            if args.max_experts:
-                eids = eids[: args.max_experts]
+    console.print(
+        f"  Layout  : header={HEADER_FMT.size}B"
+        f" + table={total_work * EXPERT_ENTRY_FMT.size}B"
+        f" + meta={total_work * TENSORS_PER_EXPERT * TENSOR_DESC_FMT.size}B"
+        f"  →  data@{data_offset:#x}"
+    )
 
-            for eid in eids:
-                if progress and task is not None:
-                    progress.update(task, description=f"L{lid:02d} E{eid:03d}")
+    with open(smoe_path, "wb") as f_out:
+        # Seek past the metadata block to start writing blobs immediately
+        f_out.seek(data_offset)
 
-                tensors = load_expert_tensors(tensor_index, lid, eid)
+        def _run(progress=None, task=None):
+            nonlocal total_raw_bytes, total_q2_bytes, error_metrics
 
-                for arr in tensors.values():
-                    total_raw_bytes += arr.nbytes
+            for lid in layers:
+                eids = topology["experts_per_layer"][lid]
+                if args.max_experts:
+                    eids = eids[: args.max_experts]
 
-                blob_bytes, descs = build_expert_blob(tensors, args.group_size, args.bits)
-                total_q2_bytes += len(blob_bytes)
+                for eid in eids:
+                    if progress and task is not None:
+                        progress.update(task, description=f"L{lid:02d} E{eid:03d}")
 
-                # Measure reconstruction error for the very first expert
-                if args.measure_error and not experts:
-                    d      = descs[0]    # gate_proj descriptor
-                    packed = np.frombuffer(blob_bytes[d.packed_offset: d.packed_offset + d.packed_size], np.uint8)
-                    scales = np.frombuffer(blob_bytes[d.scales_offset: d.scales_offset + d.scales_size], np.float16)
-                    if args.bits == 4:
-                        error_metrics = measure_q4_error(tensors["gate"].astype(np.float32), packed, scales)
+                    tensors = load_expert_tensors(tensor_index, lid, eid)
+
+                    for arr in tensors.values():
+                        total_raw_bytes += arr.nbytes
+
+                    blob_bytes, descs = build_expert_blob(tensors, args.group_size, args.bits)
+                    total_q2_bytes += len(blob_bytes)
+
+                    # Measure reconstruction error for the very first expert
+                    if args.measure_error and not experts_meta:
+                        d      = descs[0]    # gate_proj descriptor
+                        packed = np.frombuffer(blob_bytes[d.packed_offset: d.packed_offset + d.packed_size], np.uint8)
+                        scales = np.frombuffer(blob_bytes[d.scales_offset: d.scales_offset + d.scales_size], np.float16)
+                        if args.bits == 4:
+                            error_metrics = measure_q4_error(tensors["gate"].astype(np.float32), packed, scales)
+                        else:
+                            error_metrics = measure_q2_error(tensors["gate"].astype(np.float32), packed, scales)
+
+                    raw_size = len(blob_bytes)
+                    padded_size = _align_up(raw_size, PAGE_SIZE)
+                    file_offset = f_out.tell()
+
+                    # Write blob to disk immediately
+                    f_out.write(blob_bytes)
+                    f_out.write(b"\x00" * (padded_size - raw_size))
+
+                    experts_meta.append(ExpertMeta(
+                        layer_id=lid,
+                        expert_id=eid,
+                        tensor_descs=descs,
+                        raw_size=raw_size,
+                        padded_size=padded_size,
+                        total_groups=sum(d.num_groups for d in descs),
+                        file_offset=file_offset,
+                    ))
+
+                    # Drop tensors explicitly to force GC and avoid memory spikes
+                    del tensors
+                    del blob_bytes
+
+                    if progress and task is not None:
+                        progress.advance(task)
                     else:
-                        error_metrics = measure_q2_error(tensors["gate"].astype(np.float32), packed, scales)
+                        print(f"  Processed L{lid:02d} E{eid:03d}")
 
-                experts.append(ExpertBlob(
-                    layer_id=lid,
-                    expert_id=eid,
-                    tensor_descs=descs,
-                    data=blob_bytes,
+        if _RICH:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}", justify="left"),
+                BarColumn(bar_width=40),
+                MofNCompleteColumn(),
+                TaskProgressColumn(),
+                TimeRemainingColumn(),
+                console=console,
+                transient=False,
+            ) as prog:
+                task = prog.add_task("Shattering…", total=total_work)
+                _run(prog, task)
+        else:
+            _run()
+
+        t_quant = time.perf_counter() - t_quant_start
+
+        # ── Write metadata block at the beginning ─────────────────────
+        console.print(f"\n  Writing metadata header → [bold]{smoe_path.name}[/bold]")
+        t_write_start = time.perf_counter()
+        
+        total_size = f_out.tell()
+        f_out.seek(0)
+        
+        f_out.write(HEADER_FMT.pack(
+            SMOE_MAGIC,
+            SMOE_VERSION,
+            topology["num_moe_layers"],
+            topology["max_experts"],
+            len(experts_meta),
+            HEADER_FMT.size,    # table_offset: table starts immediately after header
+            data_offset,
+            args.group_size,
+            args.bits,
+            b"\x00" * 16,       # reserved
+        ))
+
+        for meta in experts_meta:
+            f_out.write(EXPERT_ENTRY_FMT.pack(
+                meta.layer_id,
+                meta.expert_id,
+                meta.file_offset,
+                meta.raw_size,
+                meta.padded_size,
+                args.group_size,
+                meta.total_groups,
+            ))
+
+        for meta in experts_meta:
+            for desc in meta.tensor_descs:
+                f_out.write(TENSOR_DESC_FMT.pack(
+                    desc.tensor_type,
+                    2,                  # ndim — always 2 for weight matrices
+                    desc.rows,
+                    desc.cols,
+                    desc.packed_offset,
+                    desc.packed_size,
+                    desc.scales_offset,
+                    desc.scales_size,
                 ))
+        
+        # Zero-pad until data_offset
+        pad = data_offset - f_out.tell()
+        assert pad >= 0, "Metadata overflow!"
+        f_out.write(b"\x00" * pad)
 
-                if progress and task is not None:
-                    progress.advance(task)
-                else:
-                    print(f"  Processed L{lid:02d} E{eid:03d}")
-
-    if _RICH:
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}", justify="left"),
-            BarColumn(bar_width=40),
-            MofNCompleteColumn(),
-            TaskProgressColumn(),
-            TimeRemainingColumn(),
-            console=console,
-            transient=False,
-        ) as prog:
-            task = prog.add_task("Shattering…", total=total_work)
-            _run(prog, task)
-    else:
-        _run()
-
-    t_quant = time.perf_counter() - t_quant_start
-
-    # ── Write vault ───────────────────────────────────────────────
-    console.print(f"\n  Writing vault → [bold]{smoe_path.name}[/bold]")
-    t_write_start = time.perf_counter()
-    telemetry = write_smoe_vault(smoe_path, experts, topology, args.bits)
-    t_write = time.perf_counter() - t_write_start
+        t_write = time.perf_counter() - t_write_start
 
     # ── Extract Scout weights ─────────────────────────────────────
     scout_keys = classify_scout_keys(tensor_index)
@@ -982,7 +933,7 @@ def main() -> None:
         )
 
     # ── Final telemetry table ─────────────────────────────────────
-    _print_summary(experts, telemetry, total_raw_bytes, total_q2_bytes, t_quant, t_write)
+    _print_summary(experts_meta, total_size, total_raw_bytes, total_q2_bytes, t_quant, t_write)
 
     if _RICH:
         console.print(f"\n  [bold green]→ {smoe_path}[/bold green]")
