@@ -865,18 +865,15 @@ void smoe_metal_scout_matvec(SmoeMetalCtx* ctx,
 
     [enc endEncoding];
 
-    // Asynchronous commit - use completion handler to signal when done
-    __block bool completed = false;
-    __block uint64_t local_dispatch_count = 0;
-
-    [cmd addCompletedHandler:^(id<MTLCommandBuffer> buffer) {
-        // This is called asynchronously when the command buffer completes
-        local_dispatch_count = ctx->dispatch_count.fetch_add(1, std::memory_order_relaxed);
-        completed = true;
-    }];
+    ctx->signaled_value++;
+    uint64_t wait_val = ctx->signaled_value;
+    [cmd encodeSignalEvent:ctx->shared_event value:wait_val];
 
     [cmd commit];
-    [cmd waitUntilCompleted];
+
+    while (ctx->shared_event.signaledValue < wait_val) {
+        std::this_thread::yield();
+    }
     }
 }
 
@@ -933,8 +930,15 @@ void smoe_metal_scout_matvec_batch(SmoeMetalCtx* ctx,
     }
 
     [enc endEncoding];
+    ctx->signaled_value++;
+    uint64_t wait_val = ctx->signaled_value;
+    [cmd encodeSignalEvent:ctx->shared_event value:wait_val];
+
     [cmd commit];
-    [cmd waitUntilCompleted];
+
+    while (ctx->shared_event.signaledValue < wait_val) {
+        std::this_thread::yield();
+    }
 
     ctx->dispatch_count.fetch_add(count, std::memory_order_relaxed);
     }
@@ -1010,8 +1014,16 @@ void smoe_metal_scout_matvec_batch_bf16(SmoeMetalCtx* ctx,
     }
 
     [enc endEncoding];
+    
+    ctx->signaled_value++;
+    uint64_t wait_val = ctx->signaled_value;
+    [cmd encodeSignalEvent:ctx->shared_event value:wait_val];
+
     [cmd commit];
-    [cmd waitUntilCompleted];
+
+    while (ctx->shared_event.signaledValue < wait_val) {
+        std::this_thread::yield();
+    }
     }
 }
 
