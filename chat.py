@@ -15,8 +15,8 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 def main():
     print(f"{CYAN}{BOLD}=== S-MoE Utopia Console ==={RESET}")
-    print(f"{CYAN}Initializing DeepSeek-MoE-16B tokenizer...{RESET}", end="", flush=True)
-    tokenizer = AutoTokenizer.from_pretrained("deepseek-ai/DeepSeek-MoE-16B-chat", trust_remote_code=True)
+    print(f"{CYAN}Initializing Qwen3-235B tokenizer...{RESET}", end="", flush=True)
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-7B-Instruct", trust_remote_code=True)
     print(f" {GREEN}[OK]{RESET}\n")
     
     print(f"{MAGENTA}Welcome to the democratic frontier of AI.{RESET}")
@@ -63,8 +63,8 @@ def main():
 
         cmd = [
             "build/smoe-engine",
-            "--vault", "vault/deepseek-chat.smoe",
-            "--scout", "vault/deepseek-chat.scout.safetensors",
+            "--vault", "vault/qwen3-235b-instruct.smoe",
+            "--scout", "vault/qwen3-235b-instruct.scout.safetensors",
             "--tokens-in", token_str,
             "--tokens", "256",
             "--ring", ring_size,
@@ -91,11 +91,14 @@ def main():
                 if char:
                     if char.isspace():
                         if token_buffer:
-                            tok_id = int(token_buffer)
+                            # Strip brackets if main.cpp uses them, like "[151644]"
+                            clean_buf = token_buffer.replace('[', '').replace(']', '').strip()
+                            if clean_buf.isdigit():
+                                tok_id = int(clean_buf)
+                                response_tokens.append(tok_id)
+                                # Decode and print safely
+                                print(tokenizer.decode([tok_id], skip_special_tokens=True), end="", flush=True)
                             token_buffer = ""
-                            response_tokens.append(tok_id)
-                            # Decode and print safely
-                            print(tokenizer.decode([tok_id], skip_special_tokens=True), end="", flush=True)
                     else:
                         token_buffer += char
         except KeyboardInterrupt:

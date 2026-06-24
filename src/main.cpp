@@ -296,7 +296,7 @@ int main(int argc, char* argv[]) {
     float       top_p       = 0.95f;
     uint32_t    top_k       = 50;
     float       rep_penalty = 1.0f;
-    std::vector<uint32_t> eos_ids = {100001};
+    std::vector<uint32_t> eos_ids = {151645, 151643};
 
     for (int i = 1; i < argc; ++i) {
         auto arg = [&](const char* flag) {
@@ -729,14 +729,23 @@ int main(int argc, char* argv[]) {
             std::memcpy(heavy_normed, heavy_hidden, d_model * sizeof(float));
             smoe::rms_norm_bf16(heavy_normed, scout.get_input_norm(l), d_model);
 
-            smoe::matvec_bf16(heavy_qbuf, scout.get_q_proj(l), heavy_normed, q_dim, d_model);
-            smoe::matvec_bf16(heavy_kbuf, scout.get_k_proj(l), heavy_normed, kv_dim, d_model);
-            smoe::matvec_bf16(heavy_vbuf, scout.get_v_proj(l), heavy_normed, kv_dim, d_model);
+            if (metal) {
+                const uint16_t* weights[3] = { scout.get_q_proj(l), scout.get_k_proj(l), scout.get_v_proj(l) };
+                const float* inputs[3] = { heavy_normed, heavy_normed, heavy_normed };
+                float* outputs[3] = { heavy_qbuf, heavy_kbuf, heavy_vbuf };
+                uint32_t rows[3] = { q_dim, kv_dim, kv_dim };
+                uint32_t cols[3] = { d_model, d_model, d_model };
+                smoe_metal_scout_matvec_batch_bf16(metal, weights, inputs, outputs, rows, cols, 3);
+            } else {
+                smoe::matvec_bf16(heavy_qbuf, scout.get_q_proj(l), heavy_normed, q_dim, d_model);
+                smoe::matvec_bf16(heavy_kbuf, scout.get_k_proj(l), heavy_normed, kv_dim, d_model);
+                smoe::matvec_bf16(heavy_vbuf, scout.get_v_proj(l), heavy_normed, kv_dim, d_model);
+            }
 
             // Apply RoPE to Q
             for (uint32_t h = 0; h < cfg.num_heads; ++h) {
                 for (uint32_t d = 0; d < cfg.head_dim / 2; ++d) {
-                    float freq = 1.0f / std::pow(10000.0f, static_cast<float>(d * 2) / static_cast<float>(cfg.head_dim));
+                    float freq = 1.0f / std::pow(cfg.rope_theta, static_cast<float>(d * 2) / static_cast<float>(cfg.head_dim));
                     float angle = static_cast<float>(n) * freq;
                     float cos_val = std::cos(angle);
                     float sin_val = std::sin(angle);
@@ -751,7 +760,7 @@ int main(int argc, char* argv[]) {
             // Apply RoPE to K
             for (uint32_t h = 0; h < cfg.num_kv_heads; ++h) {
                 for (uint32_t d = 0; d < cfg.head_dim / 2; ++d) {
-                    float freq = 1.0f / std::pow(10000.0f, static_cast<float>(d * 2) / static_cast<float>(cfg.head_dim));
+                    float freq = 1.0f / std::pow(cfg.rope_theta, static_cast<float>(d * 2) / static_cast<float>(cfg.head_dim));
                     float angle = static_cast<float>(n) * freq;
                     float cos_val = std::cos(angle);
                     float sin_val = std::sin(angle);
@@ -817,7 +826,11 @@ int main(int argc, char* argv[]) {
             }
 
             // O Proj and Residual
-            smoe::matvec_bf16(heavy_normed, scout.get_o_proj(l), heavy_attn_out, d_model, q_dim);
+            if (metal) {
+                smoe_metal_scout_matvec_bf16(metal, scout.get_o_proj(l), heavy_attn_out, heavy_normed, d_model, q_dim);
+            } else {
+                smoe::matvec_bf16(heavy_normed, scout.get_o_proj(l), heavy_attn_out, d_model, q_dim);
+            }
             for (uint32_t i = 0; i < d_model; ++i) {
                 heavy_hidden[i] += heavy_normed[i];
             }
@@ -828,15 +841,27 @@ int main(int argc, char* argv[]) {
 
             // FFN
             if (l == 0 && cfg.has_dense_layer_0) {
-                // Dense MLP for Layer 0
-                smoe::matvec_bf16(l0_gate_out, scout.get_l0_gate(), heavy_normed, ffn_dim, d_model);
-                smoe::matvec_bf16(l0_up_out, scout.get_l0_up(), heavy_normed, ffn_dim, d_model);
+                if (metal) {
+                    const uint16_t* weights[2] = { scout.get_l0_gate(), scout.get_l0_up() };
+                    const float* inputs[2] = { heavy_normed, heavy_normed };
+                    float* outputs[2] = { l0_gate_out, l0_up_out };
+                    uint32_t rows[2] = { ffn_dim, ffn_dim };
+                    uint32_t cols[2] = { d_model, d_model };
+                    smoe_metal_scout_matvec_batch_bf16(metal, weights, inputs, outputs, rows, cols, 2);
+                } else {
+                    smoe::matvec_bf16(l0_gate_out, scout.get_l0_gate(), heavy_normed, ffn_dim, d_model);
+                    smoe::matvec_bf16(l0_up_out, scout.get_l0_up(), heavy_normed, ffn_dim, d_model);
+                }
                 for (uint32_t i = 0; i < ffn_dim; ++i) {
                     // Silu
                     float val = l0_gate_out[i];
                     l0_gate_out[i] = (val / (1.0f + std::exp(-val))) * l0_up_out[i];
                 }
-                smoe::matvec_bf16(heavy_normed, scout.get_l0_down(), l0_gate_out, d_model, ffn_dim);
+                if (metal) {
+                    smoe_metal_scout_matvec_bf16(metal, scout.get_l0_down(), l0_gate_out, heavy_normed, d_model, ffn_dim);
+                } else {
+                    smoe::matvec_bf16(heavy_normed, scout.get_l0_down(), l0_gate_out, d_model, ffn_dim);
+                }
                 for (uint32_t d = 0; d < d_model; ++d) heavy_hidden[d] += heavy_normed[d];
                 if (n == 0 && g_debug) {
                     std::fprintf(stderr, "\n[L0] hidden = %.4f %.4f %.4f %.4f\n", heavy_hidden[0], heavy_hidden[1], heavy_hidden[2], heavy_hidden[3]);
@@ -859,11 +884,13 @@ int main(int argc, char* argv[]) {
                     if (!expert_output_vec[i]) expert_output_vec[i] = smoe::allocate_aligned_float(d_model);
                 }
                 // Initial non-blocking pass
-                std::fprintf(stderr, "[DEBUG] layer %u: pred.count = %u. Experts: ", l, pred.count);
-                for (uint32_t e = 0; e < pred.count; ++e) {
-                    std::fprintf(stderr, "%u ", pred.expert_ids[e]);
+                if (g_debug) {
+                    std::fprintf(stderr, "[DEBUG] layer %u: pred.count = %u. Experts: ", l, pred.count);
+                    for (uint32_t e = 0; e < pred.count; ++e) {
+                        std::fprintf(stderr, "%u ", pred.expert_ids[e]);
+                    }
+                    std::fprintf(stderr, "\n");
                 }
-                std::fprintf(stderr, "\n");
                 std::fflush(stderr);
                 
                 for (uint32_t e = 0; e < pred.count; ++e) {
@@ -878,8 +905,10 @@ int main(int argc, char* argv[]) {
                             const uint8_t*  packed_down = slot->data + expert_layout.down_packed_offset;
                             const uint16_t* scales_down = reinterpret_cast<const uint16_t*>(slot->data + expert_layout.down_scales_offset);
 
-                            std::fprintf(stderr, "[DEBUG] e=%u, ffn_dim=%u, d_model=%u, scratch=%p, out=%p\n", e, ffn_dim, d_model, expert_hidden_scratch[e], expert_output_vec[e]);
-                            std::fflush(stderr);
+                            if (g_debug) {
+                                std::fprintf(stderr, "[DEBUG] e=%u, ffn_dim=%u, d_model=%u, scratch=%p, out=%p\n", e, ffn_dim, d_model, expert_hidden_scratch[e], expert_output_vec[e]);
+                                std::fflush(stderr);
+                            }
                             std::memset(expert_hidden_scratch[e], 0, ffn_dim * sizeof(float));
                             std::memset(expert_output_vec[e], 0, d_model * sizeof(float));
 
@@ -901,13 +930,26 @@ int main(int argc, char* argv[]) {
                 std::memset(shared_out, 0, d_model * sizeof(float));
                 
                 if (scout.get_shared_gate(l)) {
-                    smoe::matvec_bf16(shared_gate_out, scout.get_shared_gate(l), heavy_normed, shared_dim, d_model);
-                    smoe::matvec_bf16(shared_up_out, scout.get_shared_up(l), heavy_normed, shared_dim, d_model);
+                    if (metal) {
+                        const uint16_t* weights[2] = { scout.get_shared_gate(l), scout.get_shared_up(l) };
+                        const float* inputs[2] = { heavy_normed, heavy_normed };
+                        float* outputs[2] = { shared_gate_out, shared_up_out };
+                        uint32_t rows[2] = { shared_dim, shared_dim };
+                        uint32_t cols[2] = { d_model, d_model };
+                        smoe_metal_scout_matvec_batch_bf16(metal, weights, inputs, outputs, rows, cols, 2);
+                    } else {
+                        smoe::matvec_bf16(shared_gate_out, scout.get_shared_gate(l), heavy_normed, shared_dim, d_model);
+                        smoe::matvec_bf16(shared_up_out, scout.get_shared_up(l), heavy_normed, shared_dim, d_model);
+                    }
                     for (uint32_t i = 0; i < shared_dim; ++i) {
                         float val = shared_gate_out[i];
                         shared_gate_out[i] = (val / (1.0f + std::exp(-val))) * shared_up_out[i];
                     }
-                    smoe::matvec_bf16(shared_out, scout.get_shared_down(l), shared_gate_out, d_model, shared_dim);
+                    if (metal) {
+                        smoe_metal_scout_matvec_bf16(metal, scout.get_shared_down(l), shared_gate_out, shared_out, d_model, shared_dim);
+                    } else {
+                        smoe::matvec_bf16(shared_out, scout.get_shared_down(l), shared_gate_out, d_model, shared_dim);
+                    }
                 }
 
                 // ── Phase 3: Spin-wait for any remaining missing experts ──
