@@ -515,8 +515,14 @@ void Streamer::prune_slots(bool (*is_active)(uint32_t, uint32_t, void*), void* c
     }
     
     // Retain a persistent cache: only prune when we run low on empty slots.
-    // Target 256 empty slots, or 25% of ring size for smaller rings.
-    uint32_t target_empty = std::min<uint32_t>(256, im.ring_sz / 4);
+    // For Qwen3-235B, a single token requires ~728 experts (91 layers * 8 experts).
+    // If target_empty is less than 728, Streamer::prefetch will fail to find EMPTY slots
+    // and cause a spin-wait deadlock in main.cpp Phase 3.
+    // Set target_empty to at least 1024 to guarantee enough slots for one full token lookahead.
+    uint32_t target_empty = std::max<uint32_t>(1024, im.ring_sz / 4);
+    if (im.ring_sz < 1024) {
+        target_empty = im.ring_sz / 2; // Best effort for very small rings
+    }
     if (empty_count >= target_empty) return;
     
     struct Candidate {
