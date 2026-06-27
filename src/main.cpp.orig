@@ -723,8 +723,9 @@ int main(int argc, char* argv[]) {
         smoe::scout::ScoutOutput scout_out = scout_queue[sq_head];
         static float attn_scores[ATTN_CTX];
 
-        const uint16_t* heavy_emb = scout.get_embed() + static_cast<size_t>(heavy_cur_token) * d_model;
-        for (uint32_t i = 0; i < d_model; ++i) heavy_hidden[i] = smoe::bf16_to_f32(heavy_emb[i]);
+        // NOTE: heavy_hidden is already loaded from the embedding table above (lines 659-662)
+        // via bf16_to_f32(). Do NOT use memcpy here — the embed table is BF16 (uint16_t),
+        // not float32, so a raw memcpy would reinterpret BF16 bit-patterns as float32 garbage.
 
         for (uint32_t l = 0; l < num_layers; ++l) {
             std::memcpy(heavy_normed, heavy_hidden, d_model * sizeof(float));
@@ -743,47 +744,53 @@ int main(int argc, char* argv[]) {
                 smoe::matvec_bf16(heavy_vbuf, scout.get_v_proj(l), heavy_normed, kv_dim, d_model);
             }
 
-            // Apply per-head Q/K norm
-            const uint16_t* q_norm_w = scout.get_q_norm(l);
-            const uint16_t* k_norm_w = scout.get_k_norm(l);
-            if (q_norm_w) {
-                for (uint32_t h = 0; h < cfg.num_heads; ++h) {
-                    smoe::rms_norm_bf16(heavy_qbuf + h * cfg.head_dim, q_norm_w, cfg.head_dim);
+            // Apply Qwen3 QK-norm (per-head RMSNorm before RoPE) if the model uses it.
+            // Without this, Qwen3 attention dot-products are unnormalized and produce garbage.
+            if (cfg.has_qk_norm) {
+                const uint16_t* q_norm_w = scout.get_q_norm(l);
+                const uint16_t* k_norm_w = scout.get_k_norm(l);
+                if (q_norm_w) {
+                    for (uint32_t h = 0; h < cfg.num_heads; ++h) {
+                        smoe::rms_norm_bf16(heavy_qbuf + h * cfg.head_dim, q_norm_w, cfg.head_dim);
+                    }
                 }
-            }
-            if (k_norm_w) {
-                for (uint32_t h = 0; h < cfg.num_kv_heads; ++h) {
-                    smoe::rms_norm_bf16(heavy_kbuf + h * cfg.head_dim, k_norm_w, cfg.head_dim);
+                if (k_norm_w) {
+                    for (uint32_t h = 0; h < cfg.num_kv_heads; ++h) {
+                        smoe::rms_norm_bf16(heavy_kbuf + h * cfg.head_dim, k_norm_w, cfg.head_dim);
+                    }
                 }
             }
 
-            // Apply RoPE to Q
+            // Apply RoPE to Q — Qwen3 uses split-half rotation: rotate_half(x) = cat(-x2, x1)
+            // i.e. new[d]       = x[d]       * cos - x[d+H/2] * sin   (first half)
+            //      new[d + H/2] = x[d]       * sin + x[d+H/2] * cos   (second half)
+            // Do NOT use adjacent-pair (interleaved) indexing — that is a different convention.
             for (uint32_t h = 0; h < cfg.num_heads; ++h) {
+                float* qh = heavy_qbuf + h * cfg.head_dim;
                 for (uint32_t d = 0; d < cfg.head_dim / 2; ++d) {
-                    float freq = 1.0f / std::pow(cfg.rope_theta, static_cast<float>(d * 2) / static_cast<float>(cfg.head_dim));
+                    float freq  = 1.0f / std::pow(cfg.rope_theta, static_cast<float>(d * 2) / static_cast<float>(cfg.head_dim));
                     float angle = static_cast<float>(n) * freq;
-                    float cos_val = std::cos(angle);
-                    float sin_val = std::sin(angle);
-                    
-                    float q0 = heavy_qbuf[h * cfg.head_dim + d];
-                    float q1 = heavy_qbuf[h * cfg.head_dim + d + (cfg.head_dim / 2)];
-                    heavy_qbuf[h * cfg.head_dim + d]                           = q0 * cos_val - q1 * sin_val;
-                    heavy_qbuf[h * cfg.head_dim + d + (cfg.head_dim / 2)]      = q0 * sin_val + q1 * cos_val;
+                    float cos_v = std::cos(angle);
+                    float sin_v = std::sin(angle);
+                    float q0 = qh[d];
+                    float q1 = qh[d + cfg.head_dim / 2];
+                    qh[d]                    = q0 * cos_v - q1 * sin_v;
+                    qh[d + cfg.head_dim / 2] = q0 * sin_v + q1 * cos_v;
                 }
             }
-            
-            // Apply RoPE to K
+
+            // Apply RoPE to K — same split-half convention
             for (uint32_t h = 0; h < cfg.num_kv_heads; ++h) {
+                float* kh = heavy_kbuf + h * cfg.head_dim;
                 for (uint32_t d = 0; d < cfg.head_dim / 2; ++d) {
-                    float freq = 1.0f / std::pow(cfg.rope_theta, static_cast<float>(d * 2) / static_cast<float>(cfg.head_dim));
+                    float freq  = 1.0f / std::pow(cfg.rope_theta, static_cast<float>(d * 2) / static_cast<float>(cfg.head_dim));
                     float angle = static_cast<float>(n) * freq;
-                    float cos_val = std::cos(angle);
-                    float sin_val = std::sin(angle);
-                    
-                    float k0 = heavy_kbuf[h * cfg.head_dim + d];
-                    float k1 = heavy_kbuf[h * cfg.head_dim + d + (cfg.head_dim / 2)];
-                    heavy_kbuf[h * cfg.head_dim + d]                           = k0 * cos_val - k1 * sin_val;
-                    heavy_kbuf[h * cfg.head_dim + d + (cfg.head_dim / 2)]      = k0 * sin_val + k1 * cos_val;
+                    float cos_v = std::cos(angle);
+                    float sin_v = std::sin(angle);
+                    float k0 = kh[d];
+                    float k1 = kh[d + cfg.head_dim / 2];
+                    kh[d]                    = k0 * cos_v - k1 * sin_v;
+                    kh[d + cfg.head_dim / 2] = k0 * sin_v + k1 * cos_v;
                 }
             }
 
@@ -998,11 +1005,6 @@ int main(int argc, char* argv[]) {
                             }
                             executed[e] = true;
                             num_executed++;
-                            if (g_debug) {
-                                float test_sum = 0;
-                                for (int i=0; i<10; ++i) test_sum += expert_output_vec[e][i];
-                                std::fprintf(stderr, "[DEBUG] layer=%u e=%d weight=%f sum_10=%f\n", l, e, pred.expert_weights[e], test_sum);
-                            }
                             made_progress = true;
                         } else {
                             
@@ -1028,7 +1030,6 @@ if (spin % 10000 == 0) {
                             std::fprintf(stderr, "[L1] Routed Expert %d, weight = %.4f\n", pred.expert_ids[e], weight);
                         }
                         for (uint32_t d = 0; d < d_model; ++d) {
-                            if (g_debug && d == 0) std::fprintf(stderr, "[MoE_OUT] layer=%u e=%d sum_first=%f\n", l, e, expert_output_vec[e][0]);
                             routed_out[d] += weight * expert_output_vec[e][d];
                         }
                     }
@@ -1051,9 +1052,6 @@ if (spin % 10000 == 0) {
                 if (l == 1 && n == 0 && g_debug) {
                     std::fprintf(stderr, "\n[L1] hidden after FFN = %.4f %.4f %.4f %.4f\n", heavy_hidden[0], heavy_hidden[1], heavy_hidden[2], heavy_hidden[3]);
                 }
-                
-                // Temporal routing feedback: pass the heavy state back to the Scout for the next token
-                scout.update_echo(l, heavy_hidden);
             }
         }
         
@@ -1061,17 +1059,23 @@ if (spin % 10000 == 0) {
         if (ctx_fill < ATTN_CTX) ++ctx_fill;
 
         // ── Step 5: Final Model Norm and LM Head ──────────────
-        if (g_debug) {
-            float h_sum2 = 0.0f;
-            for(uint32_t i=0; i<d_model; i++) h_sum2 += heavy_hidden[i]*heavy_hidden[i];
-            std::fprintf(stderr, "\n[n=%u] raw_hidden_L2 = %f\n", n, std::sqrt(h_sum2));
-        }
         smoe::rms_norm_bf16(heavy_hidden, scout.get_model_norm(), d_model);
         
-        // Execute LM Head on CPU
+        // Execute LM Head on GPU
+        const uint16_t* weights[1] = { scout.get_lm_head() };
+        const float* inputs[1]  = { heavy_hidden };
+        float* outputs[1]       = { scout.get_lm_head_scores() };
+        uint32_t rows[1]        = { cfg.vocab_size };
+        uint32_t cols[1]        = { d_model };
+        smoe_metal_scout_matvec_batch_bf16(metal, weights, inputs, outputs, rows, cols, 1);
+
+        // Process lm_head result
         float* scores = scout.get_lm_head_scores();
-        smoe::matvec_bf16(scores, scout.get_lm_head(), heavy_hidden, cfg.vocab_size, d_model);
         uint32_t best_tok   = 0;
+        
+        if (n == prompt_len - 1 || n == prompt_len) {
+            std::fprintf(stderr, "[DEBUG] token=%u, top scores: %f %f %f\n", heavy_cur_token, scores[0], scores[1], scores[2]);
+        }
         
         // Repetition penalty
         if (rep_penalty != 1.0f) {
@@ -1110,7 +1114,6 @@ if (spin % 10000 == 0) {
                 float h_sum2 = 0.0f;
                 for(uint32_t i=0; i<d_model; i++) h_sum2 += heavy_hidden[i]*heavy_hidden[i];
                 std::fprintf(stderr, "\n[n=%u] hidden_L2 = %f, Top score = %f for tok = %u\n", n, std::sqrt(h_sum2), best_score, best_tok);
-                std::fflush(stderr);
             }
         } else {
             // Temperature + Top-p
@@ -1159,12 +1162,6 @@ if (spin % 10000 == 0) {
         }
         
         heavy_cur_token = best_tok;
-        if (g_debug) {
-            float h_sum2 = 0.0f;
-            for(uint32_t i=0; i<d_model; i++) h_sum2 += heavy_hidden[i]*heavy_hidden[i];
-            std::fprintf(stderr, "\\n[n=%u] hidden_L2 = %f, best_tok = %u\\n", n, std::sqrt(h_sum2), best_tok);
-            std::fflush(stderr);
-        }
         next_heavy_token = best_tok; // Save for the next contiguous iteration
         bool is_generating = (prompt_len == 0) || (n >= prompt_len - 1);
         if (is_generating && history_len < 8192) {

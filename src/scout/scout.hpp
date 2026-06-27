@@ -59,7 +59,7 @@ public:
 
     // Run one forward step, updating internal KV-cache context.
     // Returns next token + expert routing for the current token.
-    ScoutOutput forward(uint32_t token_id);
+    ScoutOutput forward(uint32_t token_id, bool is_prompt = false);
 
     // Rollback the internal KV-cache state by K steps to recover from 
     // speculative divergence.
@@ -74,7 +74,10 @@ public:
     // Get the dynamically parsed model configuration
     const SmoeModelConfig& config() const noexcept;
 
-    // ── Getters for full-model execution ────────────────────────
+    // ── Heavy Echo (Temporal Routing) ─────────────────────────────────
+    void update_echo(uint32_t layer, const float* hidden) noexcept;
+
+    // ── Accessors (for heavy-model / debugger) ────────────────────────
     const uint16_t* get_embed() const noexcept;
     const uint16_t* get_lm_head() const noexcept;
     const uint16_t* get_model_norm() const noexcept;
@@ -88,9 +91,17 @@ public:
     const uint16_t* get_q_proj(uint32_t layer) const noexcept;
     const uint16_t* get_k_proj(uint32_t layer) const noexcept;
     const uint16_t* get_v_proj(uint32_t layer) const noexcept;
+    const uint16_t* get_q_norm(uint32_t layer) const noexcept;
+    const uint16_t* get_k_norm(uint32_t layer) const noexcept;
     const uint16_t* get_o_proj(uint32_t layer) const noexcept;
+    uint32_t compute_top_k(const float* scores, uint32_t n, uint32_t k, uint32_t* out_indices, float* out_weights, bool norm_topk) const noexcept;
     const uint16_t* get_input_norm(uint32_t layer) const noexcept;
-    const uint16_t* get_post_norm(uint32_t layer) const noexcept;
+    [[nodiscard]] const uint16_t* get_post_norm(uint32_t l) const noexcept;
+    
+    // Mmapped memory access
+    [[nodiscard]] const void* get_mapped_ptr() const noexcept;
+    [[nodiscard]] size_t      get_mapped_size() const noexcept;
+    const uint16_t* get_gate(uint32_t layer) const noexcept;
     
     float* get_lm_head_scores() const noexcept;
     

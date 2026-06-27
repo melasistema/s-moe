@@ -16,7 +16,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 def main():
     print(f"{CYAN}{BOLD}=== S-MoE Utopia Console ==={RESET}")
     print(f"{CYAN}Initializing Qwen3-235B tokenizer...{RESET}", end="", flush=True)
-    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-7B-Instruct", trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-235B-A22B", trust_remote_code=True)
     print(f" {GREEN}[OK]{RESET}\n")
     
     print(f"{MAGENTA}Welcome to the democratic frontier of AI.{RESET}")
@@ -41,7 +41,13 @@ def main():
             
         messages.append({"role": "user", "content": user_input})
         
-        token_ids = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
+        # enable_thinking=False: suppresses <think> chain-of-thought tokens that
+        # the Qwen3 instruct model emits by default in thinking mode.
+        # With enable_thinking=True the model prepends a <think> block before answering,
+        # which our engine handles fine but doubles TTFT. Keep False for direct answers.
+        token_ids = tokenizer.apply_chat_template(
+            messages, add_generation_prompt=True, enable_thinking=False
+        )
         token_str = ",".join(map(str, token_ids))
         
         # Auto-tune ring size based on system RAM
@@ -74,7 +80,8 @@ def main():
             "--top-p", "0.95",
             "--top-k", "50",
             "--rep-penalty", "1.1",
-            "--raw-ids"
+            "--raw-ids",
+            "--cpu"
         ]
         
         print(f"{CYAN}{BOLD}S-MoE [RAM: {ram_gb:.1f}GB | Ring: {ring_size}]:{RESET} ", end="", flush=True)

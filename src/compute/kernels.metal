@@ -30,6 +30,16 @@
 #include <metal_stdlib>
 using namespace metal;
 
+struct Dims {
+    uint32_t rows;
+    uint32_t cols;
+};
+
+inline float bf16_to_f32(ushort bf) {
+    uint val = uint(bf) << 16;
+    return as_type<float>(val);
+}
+
 // ── Tuning constants ─────────────────────────────────────────
 // 256 threads per threadgroup: on Apple M-series GPU a 256-thread
 // occupancy point typically saturates the SIMD width (32) × 8 waves.
@@ -81,15 +91,15 @@ inline float smoeq4_dequant(
     uint wi,
     uint group_size)
 {
-    uint    pack_idx  = wi >> 2;                        // wi / 4
-    uint    bit_shift = (wi & 3u) << 1u;               // (wi % 4) * 2
+    uint    pack_idx  = wi >> 1;                        // wi / 2
+    uint    bit_shift = (wi & 1u) << 2u;               // (wi % 2) * 4
     uint    group_idx = wi / group_size;
 
-    uint8_t code  = (packed[pack_idx] >> bit_shift) & 0x3u;
+    uint8_t code  = (packed[pack_idx] >> bit_shift) & 0xFu;
     float   scale = float(scales[group_idx]);
 
-    // Affine mapping: centre 0-3 around 1.5, then scale
-    return (float(code) - 1.5f) * scale;
+    // Affine mapping: centre 0-15 around 7.5, then scale
+    return (float(code) - 7.5f) * (1.0f / 7.5f) * scale;
 }
 
 // ── Fused Gate+Up+Down FFN kernel ────────────────────────────
@@ -196,8 +206,8 @@ kernel void smoe_gate_up(
                 for (uint b = 0; b < 4; ++b) {
                     float gcode = float((gbyte >> (b * 2)) & 0x3u);
                     float ucode = float((ubyte >> (b * 2)) & 0x3u);
-                    float gw    = (gcode - 1.5f) * (1.0f / 1.5f) * gs;
-                    float uw    = (ucode - 1.5f) * (1.0f / 1.5f) * us;
+                    float gw    = (gcode - 1.5f) * gs;
+                    float uw    = (ucode - 1.5f) * us;
                     float x_k   = tg_input[k + b];
                     gate_acc   += gw * x_k;
                     up_acc     += uw * x_k;
@@ -283,7 +293,7 @@ kernel void smoe_down(
 
                 for (uint b = 0; b < 4; ++b) {
                     float dcode = float((dbyte >> (b * 2)) & 0x3u);
-                    float dw    = (dcode - 1.5f) * (1.0f / 1.5f) * ds;
+                    float dw    = (dcode - 1.5f) * ds;
                     acc        += dw * tg_hidden[k + b];
                 }
             }
@@ -342,3 +352,43 @@ kernel void scout_matvec(
     output_vec[row] = acc;
 }
 
+
+// ── Scout BF16 Matvec ─────────────────────────────────────────
+kernel void scout_matvec_bf16(
+    device const uint16_t* weights [[buffer(0)]],
+    device const float*    input   [[buffer(1)]],
+    device       float*    output  [[buffer(2)]],
+    constant     Dims&     dims    [[buffer(3)]],
+    uint                   gid     [[thread_position_in_grid]],
+    uint                   tid     [[thread_index_in_threadgroup]],
+    uint                   threads_per_tg [[threads_per_threadgroup]],
+    threadgroup  float*    tg_input [[threadgroup(0)]])
+{
+    uint row = gid;
+    float acc = 0.0f;
+    uint tiles = (dims.cols + TGROUP_SIZE - 1) / TGROUP_SIZE;
+
+    for (uint t = 0; t < tiles; ++t) {
+        uint col_base = t * TGROUP_SIZE;
+        for (uint i = tid; i < TGROUP_SIZE; i += threads_per_tg) {
+            uint col = col_base + i;
+            tg_input[i] = (col < dims.cols) ? input[col] : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (row < dims.rows) {
+            uint tile_end = min(TGROUP_SIZE, dims.cols - col_base);
+            for (uint k = 0; k < tile_end; ++k) {
+                uint col = col_base + k;
+                ushort bf = weights[row * dims.cols + col];
+                float w = bf16_to_f32(bf);
+                acc += w * tg_input[k];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (row < dims.rows) {
+        output[row] = acc;
+    }
+}

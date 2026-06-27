@@ -459,6 +459,8 @@ struct Scout::Impl {
     float* vbuf         { nullptr };
     float* attn_out     { nullptr };
 
+    float* heavy_echo   { nullptr }; // Temporal Routing buffer [MAX_LAYERS * d_model]
+
     // Attention context ring: full full K/V caches
     float* k_cache  { nullptr }; // [28 × ATTN_CTX × cfg.d_model]
     float* v_cache  { nullptr }; // [28 × ATTN_CTX × cfg.d_model]
@@ -471,7 +473,7 @@ struct Scout::Impl {
 
     // Gate score buffer [cfg.gate_rows()]
     float* gate_scores  { nullptr };
-    float* gate_scores_batch { nullptr }; // [LOOKAHEAD_K * cfg.gate_rows()] for GPU batching
+    float* gate_scores_batch { nullptr }; // [num_moe_layers * cfg.gate_rows()] for GPU batching
 
     // LM head score buffer — we compute via GPU matvec and scan.
     float* lm_head_scores { nullptr };     // [cfg.vocab_size]
@@ -558,7 +560,7 @@ Scout::Impl::Impl(const char* path, SmoeMetalCtx* metal_ctx, const SmoeHeader* v
     // F_NOCACHE is reserved for the vault streamer.
     // The scout file stays resident — no need to bypass the page cache.
     mmap_base = ::mmap(nullptr, mmap_size,
-                       PROT_READ, MAP_PRIVATE, fd, 0);
+                       PROT_READ, MAP_SHARED, fd, 0);
     ::close(fd);  // fd no longer needed after mmap
     if (mmap_base == MAP_FAILED) {
         mmap_base = nullptr;
@@ -647,10 +649,10 @@ Scout::Impl::Impl(const char* path, SmoeMetalCtx* metal_ctx, const SmoeHeader* v
 
     // Detect rope_theta: Qwen3 uses 1000000.0, DeepSeek uses 10000.0
     // Heuristic: if model has QK-norm it's Qwen3-family
-    cfg.rope_theta = cfg.has_qk_norm ? 1000000.0f : 10000.0f;
+    cfg.rope_theta = 1000000.0f;
 
     // norm_topk_prob: Qwen3 re-normalizes selected expert weights to sum=1
-    cfg.norm_topk_prob = cfg.has_qk_norm;
+    cfg.norm_topk_prob = true;
 
     // shared_expert_ffn_dim: Qwen3-235B has NO shared expert (confirmed from header scan)
     cfg.shared_expert_ffn_dim = 0; // Will be overridden if tensors found during load
@@ -693,13 +695,15 @@ Scout::Impl::Impl(const char* path, SmoeMetalCtx* metal_ctx, const SmoeHeader* v
     vbuf                 = allocate_aligned_float(cfg.num_kv_heads * cfg.head_dim);
     attn_out             = allocate_aligned_float(cfg.num_heads * cfg.head_dim);
     gate_scores          = allocate_aligned_float(cfg.gate_rows());
-    gate_scores_batch    = allocate_aligned_float(LOOKAHEAD_K * cfg.gate_rows());
+    gate_scores_batch    = allocate_aligned_float(cfg.num_moe_layers * cfg.gate_rows());
     lm_head_scores       = allocate_aligned_float(cfg.vocab_size);
     
-    k_cache              = allocate_aligned_float((cfg.num_moe_layers + (cfg.has_dense_layer_0 ? 1 : 0)) * ATTN_CTX * (cfg.num_kv_heads * cfg.head_dim));
-    v_cache              = allocate_aligned_float((cfg.num_moe_layers + (cfg.has_dense_layer_0 ? 1 : 0)) * ATTN_CTX * (cfg.num_kv_heads * cfg.head_dim));
+    uint32_t total_layers = cfg.num_moe_layers + (cfg.has_dense_layer_0 ? 1 : 0);
+    k_cache              = allocate_aligned_float(total_layers * ATTN_CTX * (cfg.num_kv_heads * cfg.head_dim));
+    v_cache              = allocate_aligned_float(total_layers * ATTN_CTX * (cfg.num_kv_heads * cfg.head_dim));
+    heavy_echo           = allocate_aligned_float(total_layers * cfg.d_model);
 
-    if (!hidden || !normed || !qbuf || !kbuf || !vbuf || !attn_out || !gate_scores || !gate_scores_batch || !lm_head_scores || !k_cache || !v_cache) {
+    if (!hidden || !normed || !qbuf || !kbuf || !vbuf || !attn_out || !gate_scores || !gate_scores_batch || !lm_head_scores || !k_cache || !v_cache || !heavy_echo) {
         ok = false;
     }
     
@@ -837,7 +841,7 @@ Scout::Impl::Impl(const char* path, SmoeMetalCtx* metal_ctx, const SmoeHeader* v
         smoe_metal_register_buffer(metal_ctx, kbuf, cfg.num_kv_heads * cfg.head_dim * sizeof(float));
         smoe_metal_register_buffer(metal_ctx, vbuf, cfg.num_kv_heads * cfg.head_dim * sizeof(float));
         smoe_metal_register_buffer(metal_ctx, attn_out, cfg.num_heads * cfg.head_dim * sizeof(float));
-        smoe_metal_register_buffer(metal_ctx, gate_scores_batch, LOOKAHEAD_K * cfg.gate_rows() * sizeof(float));
+        smoe_metal_register_buffer(metal_ctx, gate_scores_batch, cfg.num_moe_layers * cfg.gate_rows() * sizeof(float));
         smoe_metal_register_buffer(metal_ctx, lm_head_scores, cfg.vocab_size * sizeof(float));
     }
 
@@ -879,9 +883,40 @@ const uint16_t* Scout::get_l0_down() const noexcept { return impl_->w_l0_down; }
 const uint16_t* Scout::get_q_proj(uint32_t l) const noexcept { return impl_->w_q_proj[l]; }
 const uint16_t* Scout::get_k_proj(uint32_t l) const noexcept { return impl_->w_k_proj[l]; }
 const uint16_t* Scout::get_v_proj(uint32_t l) const noexcept { return impl_->w_v_proj[l]; }
-const uint16_t* Scout::get_o_proj(uint32_t l) const noexcept { return impl_->w_o_proj[l]; }
+const uint16_t* Scout::get_q_norm(uint32_t layer) const noexcept { return impl_->w_q_norm[layer]; }
+const uint16_t* Scout::get_k_norm(uint32_t layer) const noexcept { return impl_->w_k_norm[layer]; }
+const uint16_t* Scout::get_o_proj(uint32_t layer) const noexcept { return impl_->w_o_proj[layer]; }
+
+uint32_t Scout::compute_top_k(const float* scores, uint32_t n, uint32_t k, uint32_t* out_indices, float* out_weights, bool norm_topk) const noexcept {
+    return top_k(scores, n, k, out_indices, out_weights, norm_topk);
+}
+
 const uint16_t* Scout::get_input_norm(uint32_t layer) const noexcept { return impl_->w_input_norm[layer]; }
 const uint16_t* Scout::get_post_norm(uint32_t layer) const noexcept { return impl_->w_post_norm[layer]; }
+const uint16_t* Scout::get_gate(uint32_t layer) const noexcept { return impl_->gate_w[layer]; }
+
+
+void Scout::update_echo(uint32_t layer, const float* hidden) noexcept {
+    if (layer < impl_->cfg.num_moe_layers + (impl_->cfg.has_dense_layer_0 ? 1 : 0)) {
+        std::memcpy(impl_->heavy_echo + layer * impl_->cfg.d_model, hidden, impl_->cfg.d_model * sizeof(float));
+    }
+}
+
+void rope_inplace(float* x, uint32_t pos, uint32_t heads, uint32_t head_dim, float rope_theta) noexcept {
+    uint32_t half_dim = head_dim / 2;
+    for (uint32_t h = 0; h < heads; ++h) {
+        float* head_vec = x + h * head_dim;
+        for (uint32_t i = 0; i < half_dim; ++i) {
+            float freq = pos / std::pow(rope_theta, static_cast<float>(2 * i) / head_dim);
+            float cos_val = std::cos(freq);
+            float sin_val = std::sin(freq);
+            float x0 = head_vec[i];
+            float x1 = head_vec[i + half_dim];
+            head_vec[i]            = x0 * cos_val - x1 * sin_val;
+            head_vec[i + half_dim] = x1 * cos_val + x0 * sin_val;
+        }
+    }
+}
 
 float* Scout::get_lm_head_scores() const noexcept { return impl_->lm_head_scores; }
 
@@ -1046,40 +1081,18 @@ ScoutOutput Scout::Impl::neural_forward(uint32_t token_id) noexcept {
         // g. Heavy Expert Gate Prediction
         uint32_t moe_start_layer = cfg.has_dense_layer_0 ? 1 : 0;
         if (l >= moe_start_layer) {
-            // For the first layer that requires gate prediction, we'll batch all predictions together
-            if (l == moe_start_layer) {
-                // Batch all gate predictions into a single Metal call
-                const uint16_t* batch_weights[MAX_MOE_LAYERS];
-                const float* batch_inputs[MAX_MOE_LAYERS];
-                
-                for(uint32_t i = 0; i < cfg.num_moe_layers; i++) batch_inputs[i] = normed;
-                float* batch_outputs[MAX_MOE_LAYERS];
-                uint32_t batch_rows[MAX_MOE_LAYERS];
-                uint32_t batch_cols[MAX_MOE_LAYERS];
-
-                // Collect all gate predictions for this forward pass
-                for (uint32_t layer_idx = 0; layer_idx < cfg.num_moe_layers; ++layer_idx) {
-                    batch_weights[layer_idx] = gate_w[layer_idx];
-                    batch_inputs[layer_idx]  = normed;
-                    batch_outputs[layer_idx] = gate_scores_batch + layer_idx * cfg.gate_rows();
-                    batch_rows[layer_idx] = cfg.gate_rows();
-                    batch_cols[layer_idx] = cfg.d_model;
-                }
-
-                if (metal_ctx) {
-                    smoe_metal_scout_matvec_batch_bf16(metal_ctx, batch_weights, batch_inputs, batch_outputs, batch_rows, batch_cols, cfg.num_moe_layers);
-                } else {
-                    for (uint32_t layer_idx = 0; layer_idx < cfg.num_moe_layers; ++layer_idx) {
-                        float* scores = gate_scores_batch + layer_idx * cfg.gate_rows();
-                        matvec_bf16(scores, gate_w[layer_idx], normed, cfg.gate_rows(), cfg.d_model);
-                    }
-                }
+            uint32_t layer_idx = l - moe_start_layer;
+            float* scores = gate_scores_batch + layer_idx * cfg.gate_rows();
+            
+            if (metal_ctx) {
+                smoe_metal_scout_matvec_bf16(metal_ctx, gate_w[layer_idx], normed, scores, cfg.gate_rows(), cfg.d_model);
+            } else {
+                matvec_bf16(scores, gate_w[layer_idx], normed, cfg.gate_rows(), cfg.d_model);
             }
 
             // Extract results for this specific layer
-            ExpertPrediction& pred = out.routing[l - moe_start_layer];
+            ExpertPrediction& pred = out.routing[layer_idx];
             pred.layer_id = l;
-            float* scores = gate_scores_batch + (l - moe_start_layer) * cfg.gate_rows();
             pred.count = top_k(scores, cfg.gate_rows(), 8, pred.expert_ids, pred.expert_weights, cfg.norm_topk_prob);
         }
 
@@ -1295,7 +1308,7 @@ Scout::~Scout() {
     delete impl_;
 }
 
-ScoutOutput Scout::forward(uint32_t token_id) {
+ScoutOutput Scout::forward(uint32_t token_id, bool is_prompt) {
     if (impl_->neural_mode) {
         return impl_->neural_forward(token_id);
     }
@@ -1348,6 +1361,9 @@ void Scout::write_kv_cache(uint32_t layer, uint32_t slot, const float* k, const 
     std::memcpy(layer_k, k, kv_dim * sizeof(float));
     std::memcpy(layer_v, v, kv_dim * sizeof(float));
 }
+
+const void* Scout::get_mapped_ptr() const noexcept { return impl_->mmap_base; }
+size_t      Scout::get_mapped_size() const noexcept { return impl_->mmap_size; }
 
 } // namespace smoe::scout
 
