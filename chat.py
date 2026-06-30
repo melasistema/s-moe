@@ -80,31 +80,45 @@ def main():
             "--top-p", "0.95",
             "--top-k", "50",
             "--rep-penalty", "1.1",
-            "--raw-ids",
-            "--cpu"
+            "--raw-ids"
         ]
         
         print(f"{CYAN}{BOLD}S-MoE [RAM: {ram_gb:.1f}GB | Ring: {ring_size}]:{RESET} ", end="", flush=True)
         
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        
+
         response_tokens = []
         token_buffer = ""
+        printed_text = ""
         try:
             while True:
                 char = process.stdout.read(1)
                 if not char and process.poll() is not None:
+                    if token_buffer:
+                        clean_buf = token_buffer.replace('[', '').replace(']', '').strip()
+                        if clean_buf.isdigit():
+                            tok_id = int(clean_buf)
+                            response_tokens.append(tok_id)
+                            full_text = tokenizer.decode(response_tokens, skip_special_tokens=True)
+                            if not full_text.endswith('\ufffd'):
+                                new_text = full_text[len(printed_text):]
+                                print(new_text, end="", flush=True)
+                                printed_text = full_text
                     break
                 if char:
-                    if char.isspace():
+                    if char.isspace() or char == '\n':
                         if token_buffer:
                             # Strip brackets if main.cpp uses them, like "[151644]"
                             clean_buf = token_buffer.replace('[', '').replace(']', '').strip()
                             if clean_buf.isdigit():
                                 tok_id = int(clean_buf)
                                 response_tokens.append(tok_id)
-                                # Decode and print safely
-                                print(tokenizer.decode([tok_id], skip_special_tokens=True), end="", flush=True)
+                                # Decode using BPE delta to handle multi-byte chars and space prefixes correctly
+                                full_text = tokenizer.decode(response_tokens, skip_special_tokens=True)
+                                if not full_text.endswith('\ufffd'):
+                                    new_text = full_text[len(printed_text):]
+                                    print(new_text, end="", flush=True)
+                                    printed_text = full_text
                             token_buffer = ""
                     else:
                         token_buffer += char

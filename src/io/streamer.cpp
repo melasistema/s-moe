@@ -441,6 +441,51 @@ bool Streamer::prefetch(uint32_t layer_id, uint32_t expert_id) noexcept {
         }
     }
 
+    // ── Evict a CONSUMED slot if no EMPTY slot ─────────
+    if (!slot) {
+        for (uint32_t i = 0; i < im.ring_sz; ++i) {
+            SlotState expected = SlotState::CONSUMED;
+            if (im.slots[i].state.compare_exchange_strong(
+                    expected, SlotState::LOADING,
+                    std::memory_order_acquire,
+                    std::memory_order_relaxed))
+            {
+                slot = &im.slots[i];
+                break;
+            }
+        }
+    }
+
+    // ── Evict a stale READY slot (LRU) if still no slot ──
+    // This prevents deadlock when all slots are READY but none
+    // match the experts we need for the current token.
+    if (!slot) {
+        uint64_t oldest_tick = UINT64_MAX;
+        int best_idx = -1;
+        for (uint32_t i = 0; i < im.ring_sz; ++i) {
+            SlotState s = im.slots[i].state.load(std::memory_order_relaxed);
+            if (s == SlotState::READY &&
+                im.slots[i].ref_count.load(std::memory_order_relaxed) == 0)
+            {
+                uint64_t tick = im.slots[i].last_used_tick.load(std::memory_order_relaxed);
+                if (tick < oldest_tick) {
+                    oldest_tick = tick;
+                    best_idx = static_cast<int>(i);
+                }
+            }
+        }
+        if (best_idx >= 0) {
+            SlotState expected = SlotState::READY;
+            if (im.slots[best_idx].state.compare_exchange_strong(
+                    expected, SlotState::LOADING,
+                    std::memory_order_acquire,
+                    std::memory_order_relaxed))
+            {
+                slot = &im.slots[best_idx];
+            }
+        }
+    }
+
     if (!slot) {
         return false;
     }
@@ -481,17 +526,22 @@ RingSlot* Streamer::claim_specific(uint32_t layer_id, uint32_t expert_id) noexce
     Impl& im = *impl_;
     for (uint32_t i = 0; i < im.ring_sz; ++i) {
         if (im.slots[i].layer_id == layer_id && im.slots[i].expert_id == expert_id) {
-            SlotState s = im.slots[i].state.load(std::memory_order_acquire);
-            if (s == SlotState::READY || s == SlotState::CONSUMED) {
-                SlotState expected = SlotState::READY;
-                im.slots[i].state.compare_exchange_strong(
-                        expected, SlotState::CONSUMED,
-                        std::memory_order_acquire,
-                        std::memory_order_relaxed);
+            // Only claim slots in READY state — CONSUMED slots may be
+            // mid-eviction or have stale data from a prior use.
+            SlotState expected = SlotState::READY;
+            if (im.slots[i].state.compare_exchange_strong(
+                    expected, SlotState::CONSUMED,
+                    std::memory_order_acquire,
+                    std::memory_order_relaxed))
+            {
                 im.slots[i].ref_count.fetch_add(1, std::memory_order_relaxed);
-                im.slots[i].last_used_tick.store(im.global_tick.fetch_add(1, std::memory_order_relaxed), std::memory_order_relaxed);
+                im.slots[i].last_used_tick.store(
+                    im.global_tick.fetch_add(1, std::memory_order_relaxed),
+                    std::memory_order_relaxed);
                 return &im.slots[i];
             }
+            // If slot is LOADING, it's being filled — return nullptr
+            // so caller retries.
         }
     }
     return nullptr;
@@ -514,15 +564,11 @@ void Streamer::prune_slots(bool (*is_active)(uint32_t, uint32_t, void*), void* c
         }
     }
     
-    // Retain a persistent cache: only prune when we run low on empty slots.
-    // For Qwen3-235B, a single token requires ~728 experts (91 layers * 8 experts).
-    // If target_empty is less than 728, Streamer::prefetch will fail to find EMPTY slots
-    // and cause a spin-wait deadlock in main.cpp Phase 3.
-    // Set target_empty to at least 1024 to guarantee enough slots for one full token lookahead.
-    uint32_t target_empty = std::max<uint32_t>(1024, im.ring_sz / 4);
-    if (im.ring_sz < 1024) {
-        target_empty = im.ring_sz / 2; // Best effort for very small rings
-    }
+    // Always prune all inactive slots — the ring needs maximum available
+    // capacity for the next token. With 94 MoE layers × 8 experts = 752
+    // slots per token, any retention of stale slots risks deadlock.
+    // The prefetch idempotency check prevents re-loading cached experts.
+    uint32_t target_empty = im.ring_sz;  // free everything inactive
     if (empty_count >= target_empty) return;
     
     struct Candidate {
@@ -535,8 +581,10 @@ void Streamer::prune_slots(bool (*is_active)(uint32_t, uint32_t, void*), void* c
     for (uint32_t i = 0; i < im.ring_sz; ++i) {
         SlotState s = im.slots[i].state.load(std::memory_order_relaxed);
         if (s == SlotState::READY || s == SlotState::CONSUMED) {
-            if (!is_active(im.slots[i].layer_id, im.slots[i].expert_id, ctx)) {
-                candidates.push_back({i, im.slots[i].last_used_tick.load(std::memory_order_relaxed)});
+            if (im.slots[i].ref_count.load(std::memory_order_relaxed) == 0) {
+                if (!is_active(im.slots[i].layer_id, im.slots[i].expert_id, ctx)) {
+                    candidates.push_back({i, im.slots[i].last_used_tick.load(std::memory_order_relaxed)});
+                }
             }
         }
     }
@@ -620,6 +668,28 @@ void Streamer::print_debug_states() const noexcept {
         }
     }
     std::fflush(stderr);
+}
+
+uint32_t Streamer::debug_slot_state(uint32_t layer_id, uint32_t expert_id) const noexcept {
+    for (uint32_t i = 0; i < impl_->ring_sz; ++i) {
+        if (impl_->slots[i].layer_id == layer_id && impl_->slots[i].expert_id == expert_id) {
+            return static_cast<uint32_t>(impl_->slots[i].state.load(std::memory_order_relaxed));
+        }
+    }
+    return 999;
+}
+
+void Streamer::debug_dump_ring() const noexcept {
+    std::fprintf(stderr, "--- RING BUFFER DUMP ---\n");
+    for (uint32_t i = 0; i < impl_->ring_sz; ++i) {
+        uint32_t st = static_cast<uint32_t>(impl_->slots[i].state.load(std::memory_order_relaxed));
+        if (st != 0) {
+            std::fprintf(stderr, "Slot %u: layer=%u expert=%u state=%u ref_count=%u\n", 
+                         i, impl_->slots[i].layer_id, impl_->slots[i].expert_id, st,
+                         impl_->slots[i].ref_count.load(std::memory_order_relaxed));
+        }
+    }
+    std::fprintf(stderr, "------------------------\n");
 }
 
 } // namespace smoe::io

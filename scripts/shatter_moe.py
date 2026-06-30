@@ -682,8 +682,8 @@ def main() -> None:
                         help="Process only the first N MoE layers (for quick testing)")
     parser.add_argument("--max-experts",   type=int, default=None,
                         help="Process only the first N experts per layer (for quick testing)")
-    parser.add_argument("--bits",          type=int, default=2, choices=[2, 4],
-                        help="Quantisation bit depth: 2 (SMOE-Q2) or 4 (SMOE-Q4)")
+    parser.add_argument("--bits",          type=int, default=4, choices=[2, 4],
+                        help="Quantisation bits per parameter (default: 4)")
     parser.add_argument("--measure-error", action="store_true",
                         help="Compute RMSE / SNR for the first expert's gate_proj (slow)")
 

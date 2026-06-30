@@ -21,6 +21,8 @@
 #include "io/streamer.hpp"
 #include "scout/scout.hpp"
 #include "compute/metal_bridge.h"
+#include "cli.hpp"
+#include "sampler.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -36,10 +38,6 @@
 #include <vector>
 
 // ── Compile-time defaults ─────────────────────────────────────
-inline constexpr uint32_t DEFAULT_RING_SIZE    = 0;     // 0 = auto-compute from available RAM
-inline constexpr uint32_t DEFAULT_WORKERS      = 16;
-inline constexpr uint64_t DEFAULT_SLOT_MB      = 0;     // 0 = auto-compute from vault expert size
-inline constexpr uint32_t DEFAULT_MAX_TOKENS   = 512;
 inline constexpr uint32_t TELEMETRY_EVERY      = 10;   // tokens between telemetry updates
 
 // ── Telemetry helpers ─────────────────────────────────────────
@@ -63,40 +61,6 @@ static double wall_ms() noexcept {
     using namespace std::chrono;
     return double(duration_cast<microseconds>(
         steady_clock::now().time_since_epoch()).count()) / 1000.0;
-}
-
-// ── CLI usage ─────────────────────────────────────────────────
-
-static void print_usage(const char* argv0) {
-    std::fprintf(stderr,
-        "\n"
-        "  S-MoE Engine — Streaming Mixture-of-Experts Inference\n"
-        "  ───────────────────────────────────────────────────────\n"
-        "  Usage:\n"
-        "    %s --vault <path.smoe> --prompt <text> [options]\n"
-        "\n"
-        "  Required:\n"
-        "    --vault   <path>    Path to the .smoe vault file\n"
-        "    --prompt  <text>    Input prompt (string)\n"
-        "\n"
-        "  Optional:\n"
-        "    --scout   <path>    Path to Scout .safetensors weights\n"
-        "                        (omit for heuristic-only mode)\n"
-        "    --tokens  <N>       Max tokens to generate (default: %u)\n"
-        "    --ring    <N>       Ring buffer slot count  (default: %u)\n"
-        "    --workers <N>       I/O worker thread count (default: %u)\n"
-        "    --slot-mb <N>       Bytes per ring slot, MB (default: %llu)\n"
-        "    --raw-ids           Print raw token IDs as integers instead of text\n"
-        "\n"
-        "  Example:\n"
-        "    %s --vault vault/deepseek.smoe --prompt \"Explain MoE routing\" --tokens 200\n"
-        "\n",
-        argv0,
-        DEFAULT_MAX_TOKENS,
-        DEFAULT_RING_SIZE,
-        DEFAULT_WORKERS,
-        DEFAULT_SLOT_MB,
-        argv0);
 }
 
 // ── Telemetry bar ─────────────────────────────────────────────
@@ -284,68 +248,26 @@ static std::string decode_token(uint32_t id) {
 int main(int argc, char* argv[]) {
 
     // ── Argument parsing ──────────────────────────────────────
-    const char* vault_path  = nullptr;
-    const char* scout_path  = nullptr;
-    const char* prompt_text = nullptr;
-    const char* tokens_in   = nullptr;
-    uint32_t    max_tokens  = DEFAULT_MAX_TOKENS;
-    uint32_t    ring_size   = DEFAULT_RING_SIZE;
-    uint32_t    num_workers = DEFAULT_WORKERS;
-    uint64_t    slot_mb     = DEFAULT_SLOT_MB;
-    float       temperature = 0.6f;
-    float       top_p       = 0.95f;
-    uint32_t    top_k       = 50;
-    float       rep_penalty = 1.0f;
-    std::vector<uint32_t> eos_ids = {151645, 151643};
+    smoe::cli::EngineConfig cli_cfg = smoe::cli::parse_args(argc, argv);
+    if (!cli_cfg.valid) return 1;
 
-    for (int i = 1; i < argc; ++i) {
-        auto arg = [&](const char* flag) {
-            return std::strcmp(argv[i], flag) == 0 && i + 1 < argc;
-        };
-        if      (arg("--vault"))     { vault_path  = argv[++i]; }
-        else if (arg("--scout"))     { scout_path  = argv[++i]; }
-        else if (arg("--prompt"))    { prompt_text = argv[++i]; }
-        else if (arg("--tokens-in")) { tokens_in   = argv[++i]; }
-        else if (arg("--tokens"))    { max_tokens  = static_cast<uint32_t>(std::atoi(argv[++i])); }
-        else if (arg("--ring"))      { ring_size   = static_cast<uint32_t>(std::atoi(argv[++i])); }
-        else if (arg("--workers"))   { num_workers = static_cast<uint32_t>(std::atoi(argv[++i])); }
-        else if (arg("--slot-mb"))   { slot_mb     = static_cast<uint64_t>(std::atoll(argv[++i])); }
-        else if (arg("--temperature")){ temperature = static_cast<float>(std::atof(argv[++i])); }
-        else if (arg("--top-p"))      { top_p = static_cast<float>(std::atof(argv[++i])); }
-        else if (arg("--top-k"))      { top_k = static_cast<uint32_t>(std::atoi(argv[++i])); }
-        else if (arg("--rep-penalty")){ rep_penalty = static_cast<float>(std::atof(argv[++i])); }
-        else if (arg("--eos-ids")) {
-            eos_ids.clear();
-            std::string ids_str = argv[++i];
-            size_t pos = 0;
-            while ((pos = ids_str.find(',')) != std::string::npos) {
-                if (pos > 0) eos_ids.push_back(std::stoul(ids_str.substr(0, pos)));
-                ids_str.erase(0, pos + 1);
-            }
-            if (!ids_str.empty()) eos_ids.push_back(std::stoul(ids_str));
-        }
-        else if (std::strcmp(argv[i], "--debug") == 0) { g_debug = true; }
-        else if (std::strcmp(argv[i], "--raw-ids") == 0) { g_raw_ids = true; }
-        else if (std::strcmp(argv[i], "--help") == 0 ||
-                 std::strcmp(argv[i], "-h")     == 0) {
-            print_usage(argv[0]);
-            return 0;
-        }
-    }
+    const char* vault_path  = cli_cfg.vault_path;
+    const char* scout_path  = cli_cfg.scout_path;
+    const char* prompt_text = cli_cfg.prompt_text;
+    const char* tokens_in   = cli_cfg.tokens_in;
+    uint32_t    max_tokens  = cli_cfg.max_tokens;
+    uint32_t    ring_size   = cli_cfg.ring_size;
+    uint32_t    num_workers = cli_cfg.num_workers;
+    uint64_t    slot_mb     = cli_cfg.slot_mb;
+    float       temperature = cli_cfg.temperature;
+    float       top_p       = cli_cfg.top_p;
+    uint32_t    top_k       = cli_cfg.top_k;
+    float       rep_penalty = cli_cfg.rep_penalty;
+    std::vector<uint32_t> eos_ids = cli_cfg.eos_ids;
+    g_debug = cli_cfg.debug;
+    g_raw_ids = cli_cfg.raw_ids;
 
-    if (!vault_path || (!prompt_text && !tokens_in)) {
-        std::fprintf(stderr,
-            "\n  ✗  --vault and either --prompt or --tokens-in are required.\n");
-        print_usage(argv[0]);
-        return 1;
-    }
-
-    const char* sm_dbg = std::getenv("SMOE_DEBUG");
-    if (sm_dbg) {
-        g_debug = g_debug || (std::strcmp(sm_dbg, "1") == 0 || std::strcmp(sm_dbg, "true") == 0);
-    }
-
-    // ── Vault header read ─────────────────────────────────────
+    // ── Vault header read ────────────────────────────────────────────────────────────────────────
     smoe::SmoeHeader vault_hdr {};
     if (!read_vault_header(vault_path, vault_hdr)) return 1;
 
@@ -1073,90 +995,15 @@ if (spin % 10000 == 0) {
         smoe::matvec_bf16(scores, scout.get_lm_head(), heavy_hidden, cfg.vocab_size, d_model);
         uint32_t best_tok   = 0;
         
-        // Repetition penalty
-        if (rep_penalty != 1.0f) {
-            std::vector<bool> penalized(cfg.vocab_size, false);
-            uint32_t penalty_last_n = 256; // 256 tokens is enough to break loops without forcing language switches
-            uint32_t start_idx = (history_len > penalty_last_n) ? (history_len - penalty_last_n) : 0;
-            
-            for (uint32_t i = start_idx; i < history_len; ++i) {
-                uint32_t tok = token_history[i];
-                // Exempt common punctuation and special tokens from penalty
-                // 13: '.', 11: ',', 185: '\n', 30: '?', 0: '!', 100000: BOS, 100001: EOS
-                if (tok == 13 || tok == 11 || tok == 185 || tok == 30 || tok == 0 || tok == 100000 || tok == 100001) {
-                    continue;
-                }
-                if (!penalized[tok]) {
-                    if (scores[tok] <= 0) {
-                        scores[tok] *= rep_penalty;
-                    } else {
-                        scores[tok] /= rep_penalty;
-                    }
-                    penalized[tok] = true;
-                }
-            }
-        }
-
-        if (temperature < 1e-4f) {
-            // Greedy
-            float best_score = -1e38f;
-            for (uint32_t v = 0; v < cfg.vocab_size; ++v) {
-                if (scores[v] > best_score) {
-                    best_score = scores[v];
-                    best_tok   = v;
-                }
-            }
-            if (g_debug && ((prompt_len == 0) || (n >= prompt_len - 1))) {
-                float h_sum2 = 0.0f;
-                for(uint32_t i=0; i<d_model; i++) h_sum2 += heavy_hidden[i]*heavy_hidden[i];
-                std::fprintf(stderr, "\n[n=%u] hidden_L2 = %f, Top score = %f for tok = %u\n", n, std::sqrt(h_sum2), best_score, best_tok);
-                std::fflush(stderr);
-            }
-        } else {
-            // Temperature + Top-p
-            float max_score = scores[0];
-            for (uint32_t v = 1; v < cfg.vocab_size; ++v) {
-                if (scores[v] > max_score) max_score = scores[v];
-            }
-            
-            float sum_exp = 0.0f;
-            struct ProbTok { float p; uint32_t v; };
-            std::vector<ProbTok> probs(cfg.vocab_size);
-            for (uint32_t v = 0; v < cfg.vocab_size; ++v) {
-                probs[v].v = v;
-                probs[v].p = std::exp((scores[v] - max_score) / temperature);
-                sum_exp += probs[v].p;
-            }
-            
-            float inv_sum = 1.0f / sum_exp;
-            for (uint32_t v = 0; v < cfg.vocab_size; ++v) {
-                probs[v].p *= inv_sum;
-            }
-            
-            std::sort(probs.begin(), probs.end(), [](const ProbTok& a, const ProbTok& b) {
-                return a.p > b.p;
-            });
-            
-            float cumsum = 0.0f;
-            uint32_t top_k_len = 0;
-            for (uint32_t v = 0; v < cfg.vocab_size; ++v) {
-                cumsum += probs[v].p;
-                top_k_len++;
-                if (cumsum >= top_p || top_k_len >= top_k) break;
-            }
-            
-            std::uniform_real_distribution<float> dist(0.0f, cumsum);
-            float r = dist(rng);
-            float running = 0.0f;
-            best_tok = probs[top_k_len - 1].v;
-            for (uint32_t v = 0; v < top_k_len; ++v) {
-                running += probs[v].p;
-                if (r <= running) {
-                    best_tok = probs[v].v;
-                    break;
-                }
-            }
-        }
+        // Sample Token
+        smoe::SamplerConfig sampler_cfg {
+            .vocab_size = cfg.vocab_size,
+            .temperature = temperature,
+            .top_p = top_p,
+            .top_k = top_k,
+            .rep_penalty = rep_penalty
+        };
+        best_tok = smoe::sample_token(scores, sampler_cfg, token_history, history_len, rng);
         
         heavy_cur_token = best_tok;
         if (g_debug) {

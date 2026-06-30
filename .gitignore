@@ -5,7 +5,10 @@
 /references/
 /scratch/
 test_*.py
-
+check_*.py
+*.log
+*.txt
+fix_*.py
 # Agents
 GEMINI.md
 CLAUDE.md

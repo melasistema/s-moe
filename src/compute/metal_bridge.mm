@@ -972,7 +972,7 @@ void smoe_metal_scout_matvec_batch(SmoeMetalCtx* ctx,
 }
 
 void smoe_metal_register_buffer(SmoeMetalCtx* ctx, const void* ptr, size_t size_in_bytes) {
-    if (!ctx || !ptr) return;
+    if (!ctx || !ptr || size_in_bytes == 0) return;
 
     uintptr_t p = reinterpret_cast<uintptr_t>(ptr);
     for (const auto& reg : ctx->registered_buffers) {

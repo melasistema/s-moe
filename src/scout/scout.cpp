@@ -765,6 +765,10 @@ Scout::Impl::Impl(const char* path, SmoeMetalCtx* metal_ctx, const SmoeHeader* v
             uint32_t moe_start_layer = cfg.has_dense_layer_0 ? 1 : 0;
             if (l >= moe_start_layer && l < cfg.num_moe_layers + (cfg.has_dense_layer_0 ? 1 : 0)) {
                 std::snprintf(tensor_name, sizeof(tensor_name), "model.layers.%u.mlp.gate.weight", l);
+                TensorMeta tm = parse_tensor_meta(json_start, json_end, tensor_name);
+                if (!tm.valid) {
+                    std::snprintf(tensor_name, sizeof(tensor_name), "model.layers.%u.mlp.gate_proj.weight", l);
+                }
                 ok &= load_tensor(tensor_name, gate_w[l - moe_start_layer], static_cast<size_t>(cfg.gate_rows()) * cfg.d_model);
 
                 // Shared expert: try both naming conventions; silently skip if absent (Qwen3-235B has none)
@@ -1104,19 +1108,19 @@ ScoutOutput Scout::Impl::neural_forward(uint32_t token_id) noexcept {
                 const uint16_t* weights[2] = { w_l0_gate, w_l0_up };
                 const float* inputs[2]  = { normed, normed };
                 float* outputs[2]       = { l0_gate_out, l0_up_out };
-                uint32_t rows[2]        = { 10944, 10944 };
+                uint32_t rows[2]        = { cfg.ffn_dim, cfg.ffn_dim };
                 uint32_t cols[2]        = { cfg.d_model, cfg.d_model };
                 smoe_metal_scout_matvec_batch_bf16(metal_ctx, weights, inputs, outputs, rows, cols, 2);
             } else {
-                matvec_bf16(l0_gate_out, w_l0_gate, normed, 10944, cfg.d_model);
-                matvec_bf16(l0_up_out, w_l0_up, normed, 10944, cfg.d_model);
+                matvec_bf16(l0_gate_out, w_l0_gate, normed, cfg.ffn_dim, cfg.d_model);
+                matvec_bf16(l0_up_out, w_l0_up, normed, cfg.ffn_dim, cfg.d_model);
             }
-            for (uint32_t i = 0; i < 10944; ++i) {
+            for (uint32_t i = 0; i < cfg.ffn_dim; ++i) {
                 float val = l0_gate_out[i];
                 l0_gate_out[i] = (val / (1.0f + std::exp(-val))) * l0_up_out[i];
             }
-            if (metal_ctx) smoe_metal_scout_matvec_bf16(metal_ctx, w_l0_down, l0_gate_out, normed, cfg.d_model, 10944);
-            else matvec_bf16(normed, w_l0_down, l0_gate_out, cfg.d_model, 10944);
+            if (metal_ctx) smoe_metal_scout_matvec_bf16(metal_ctx, w_l0_down, l0_gate_out, normed, cfg.d_model, cfg.ffn_dim);
+            else matvec_bf16(normed, w_l0_down, l0_gate_out, cfg.d_model, cfg.ffn_dim);
             for (uint32_t d = 0; d < cfg.d_model; ++d) hidden[d] += normed[d];
         } else if (w_shared_gate[l]) {
             static float shared_gate_out[16384];
@@ -1155,7 +1159,7 @@ ScoutOutput Scout::Impl::neural_forward(uint32_t token_id) noexcept {
         for (uint32_t v = 0; v < cfg.vocab_size; ++v) {
             const uint16_t* row = w_lm_head + static_cast<size_t>(v) * cfg.d_model;
             float score = 0.0f;
-            for (uint32_t d = 0; d < cfg.d_model; ++d) score += row[d] * hidden[d];
+            for (uint32_t d = 0; d < cfg.d_model; ++d) score += bf16_to_f32(row[d]) * hidden[d];
             lm_head_scores[v] = score;
         }
     }
@@ -1289,7 +1293,7 @@ ScoutOutput Scout::Impl::heuristic_forward(uint32_t token_id) noexcept {
     out.next_token_id = next_token_heuristic(token_id);
     for (uint32_t k = 0; k < cfg.num_moe_layers; ++k) {
         ExpertPrediction& pred = out.routing[k];
-        pred.layer_id = k + 1;
+        pred.layer_id = k + (cfg.has_dense_layer_0 ? 1 : 0);
         pred.count    = predict(pred.layer_id, pred.expert_ids);
     }
     ++step;

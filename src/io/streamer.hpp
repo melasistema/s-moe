@@ -109,6 +109,11 @@ public:
     // Returns nullptr if the specific expert is not READY (non-blocking).
     [[nodiscard]] RingSlot* claim_specific(uint32_t layer_id, uint32_t expert_id) noexcept;
 
+    // Debugging helpers
+    void debug_print() const;
+    uint32_t debug_slot_state(uint32_t layer_id, uint32_t expert_id) const noexcept;
+    void debug_dump_ring() const noexcept;
+
     // Release a slot the GPU is done with.
     // Atomically transitions CONSUMED → EMPTY.
     // Zero allocations.

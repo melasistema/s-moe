@@ -81,8 +81,8 @@ inline float smoeq2_dequant(
     uint8_t code  = (packed[pack_idx] >> bit_shift) & 0x3u;
     float   scale = float(scales[group_idx]);
 
-    // Affine mapping: centre 0–3 around zero, then scale
-    return (float(code) - 1.5f) * scale;
+    // Affine mapping: centre 0–3 around 1.5, then scale
+    return (float(code) - 1.5f) * (1.0f / 1.5f) * scale;
 }
 
 inline float smoeq4_dequant(
@@ -206,8 +206,8 @@ kernel void smoe_gate_up(
                 for (uint b = 0; b < 4; ++b) {
                     float gcode = float((gbyte >> (b * 2)) & 0x3u);
                     float ucode = float((ubyte >> (b * 2)) & 0x3u);
-                    float gw    = (gcode - 1.5f) * gs;
-                    float uw    = (ucode - 1.5f) * us;
+                    float gw    = (gcode - 1.5f) * (1.0f / 1.5f) * gs;
+                    float uw    = (ucode - 1.5f) * (1.0f / 1.5f) * us;
                     float x_k   = tg_input[k + b];
                     gate_acc   += gw * x_k;
                     up_acc     += uw * x_k;
@@ -293,7 +293,7 @@ kernel void smoe_down(
 
                 for (uint b = 0; b < 4; ++b) {
                     float dcode = float((dbyte >> (b * 2)) & 0x3u);
-                    float dw    = (dcode - 1.5f) * ds;
+                    float dw    = (dcode - 1.5f) * (1.0f / 1.5f) * ds;
                     acc        += dw * tg_hidden[k + b];
                 }
             }
