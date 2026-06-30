@@ -8,7 +8,7 @@
 
 Silicon Valley has a bucket problem. 
 
-To run a modern frontier AI model—like DeepSeek with its **284 billion parameters**—the corporate high priests of compute insist that you must worship at the altar of the unified memory wall. They tell us we must host the entire mathematical mountain in RAM simultaneously, forcing developers to rent $15,000 H100 cloud instances or buy half-terabyte workstations.
+To run a modern frontier AI model—like Qwen3 with its **235 billion parameters**—the corporate high priests of compute insist that you must worship at the altar of the unified memory wall. They tell us we must host the entire mathematical mountain in RAM simultaneously, forcing developers to rent $15,000 H100 cloud instances or buy half-terabyte workstations.
 
 **The truth they hide:** In a true Mixture of Experts (MoE) architecture, 95% of the model is completely silent at any given millisecond. The weights are just cold stone; only a tiny fraction of "experts" fire for any single word. Yet, standard runtimes keep gigabytes of dead parameters sitting in precious RAM just in case.
 
@@ -23,7 +23,7 @@ Standard models blast inputs into monolithic weights and hope they fit in RAM. W
 S-MoE splits monolithic models into a similar acoustic sensor array:
 
 1. **The Surface Scout (The EM Strike):** A lightweight, highly efficient 1.5B parameter model sitting permanently in memory (~3GB). As it processes your prompt, it acts as a temporal oracle—calculating the semantic trajectory to predict exactly which specialized experts will be needed 5 to 10 tokens into the future. It computes the "sound" the model will make before the generation loop even gets there.
-2. **The Deep Strata (The Rock):** The massive 284B parameters rest cold on the SSD, shattered into custom page-aligned binary segments perfectly aligned to the Apple Silicon 16KB hardware boundary.
+2. **The Deep Strata (The Rock):** The massive 235B parameters rest cold on the SSD, shattered into custom page-aligned binary segments perfectly aligned to the Apple Silicon 16KB hardware boundary.
 3. **The Acoustic Receiver (The JIT Pump):** Guided by the Scout's phonon map, specialized background workers read data asynchronously using Direct I/O (`F_NOCACHE`), completely bypassing sluggish OS page caches. The incoming experts are packed into a cyclic ring buffer fractions of a second before the Metal GPU executes them, keeping total system RAM footprint incredibly low.
 
 ---
@@ -43,10 +43,11 @@ S-MoE splits monolithic models into a similar acoustic sensor array:
 ---
 
 ## Current Status
-S-MoE has achieved **Milestone 6**, featuring a fully integrated 28-layer sequential execution loop. 
-- The engine successfully coordinates CPU-based Attention and Shared Expert processing with high-speed GPU-accelerated Routed Expert dispatches (`smoe_metal_fused_ffn`).
-- Multi-layer KV-caches are managed entirely in static/aligned memory, strictly preserving the **zero runtime heap allocation** invariant.
-- Sustains active streaming and execution at ~1.6 tokens/second natively on Apple Silicon.
+S-MoE has reached a fully operational **Qwen3-235B** pipeline with a purely Data-Oriented C++ architecture.
+- **Architectural Masterpiece:** The core execution loop in `main.cpp` is completely devoid of OOP bloat, executing the forward pass linearly via pure functions and C-structs.
+- **Dynamic Topology:** Safely routes 128 fine-grained MoE experts via the 1.5B Scout model, streaming exactly what is needed for Qwen3-235B. 
+- **Q4 Quantisation:** 4-bit Apple Metal shaders efficiently unpack weights directly in the GPU registers, avoiding the mathematical collapse of 2-bit uniform quantization on fine-grained architectures.
+- **Zero-Allocation:** KV-caches and context windows are managed entirely in static/aligned memory, strictly preserving the **zero runtime heap allocation** invariant.
 
 ---
 
