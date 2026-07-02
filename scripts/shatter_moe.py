@@ -637,7 +637,7 @@ def _print_summary(
     t_write:         float,
 ) -> None:
     ratio   = total_raw_bytes / total_q2_bytes if total_q2_bytes else 0.0
-    avg_kb  = telemetry["total_size_bytes"] / max(len(experts), 1) / 1024
+    avg_kb  = total_size / max(len(experts), 1) / 1024
 
     if _RICH:
         t = Table(title="⚡  Shatter Complete", box=rich_box.DOUBLE_EDGE, border_style="green")
@@ -693,7 +693,7 @@ def main() -> None:
     if _RICH:
         console.print(Panel.fit(
             "[bold magenta]⚡  S-MoE  ·  Seismic Weight Sculptor[/bold magenta]\n"
-            "[dim]shatter_moe.py   Phase 1   SMOE-Q2   2-bit vault builder[/dim]",
+            "[dim]shatter_moe.py   Phase 1   SMOE-Q4   4-bit vault builder[/dim]",
             border_style="magenta",
         ))
     else:
@@ -722,6 +722,7 @@ def main() -> None:
 
     # ── Detect MoE topology ───────────────────────────────────────
     topology = detect_moe_topology(tensor_index)
+    dims = extract_model_dimensions(tensor_index)
     if topology["num_moe_layers"] == 0:
         console.print(
             "[red]ERROR: No MoE expert layers detected. "
@@ -876,7 +877,10 @@ def main() -> None:
             data_offset,
             args.group_size,
             args.bits,
-            b"\x00" * 16,       # reserved
+            dims["d_model"],
+            dims["vocab_size"],
+            dims["ffn_dim"],
+            0,                  # reserved_ext
         ))
 
         for meta in experts_meta:
