@@ -31,9 +31,12 @@ static inline uint32_t sample_token(
         
         for (uint32_t i = start_idx; i < history_len; ++i) {
             uint32_t tok = token_history[i];
-            // Exempt common punctuation and special tokens from penalty
-            // 13: '.', 11: ',', 185: '\n', 30: '?', 0: '!', 100000: BOS, 100001: EOS
-            if (tok == 13 || tok == 11 || tok == 185 || tok == 30 || tok == 0 || tok == 100000 || tok == 100001) {
+            // Exempt common punctuation and special tokens from penalty.
+            // NOTE: these IDs are vocab-specific. Qwen3 byte-level BPE:
+            // 13: '.', 11: ',', 198: '\n', 271: '\n\n', 30: '?', 0: '!',
+            // 151643: <|endoftext|>, 151645: <|im_end|>
+            if (tok == 13 || tok == 11 || tok == 198 || tok == 271 || tok == 30 || tok == 0 ||
+                tok == 151643 || tok == 151645) {
                 continue;
             }
             if (!penalized[tok]) {

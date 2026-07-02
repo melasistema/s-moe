@@ -16,7 +16,11 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 def main():
     print(f"{CYAN}{BOLD}=== S-MoE Utopia Console ==={RESET}")
     print(f"{CYAN}Initializing Qwen3-235B tokenizer...{RESET}", end="", flush=True)
-    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-235B-A22B", trust_remote_code=True)
+    # Must match the shattered checkpoint: Qwen3-235B-A22B-Instruct-2507 (non-thinking).
+    # The original Qwen3-235B-A22B (thinking) template injects an empty <think></think>
+    # block whose token embeddings (151667/151668) are untrained in the 2507 weights —
+    # feeding them mid-prompt collapses the residual stream into degenerate output.
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-235B-A22B-Instruct-2507", trust_remote_code=True)
     print(f" {GREEN}[OK]{RESET}\n")
     
     print(f"{MAGENTA}Welcome to the democratic frontier of AI.{RESET}")
@@ -41,24 +45,18 @@ def main():
             
         messages.append({"role": "user", "content": user_input})
         
-        # enable_thinking=False: suppresses <think> chain-of-thought tokens that
-        # the Qwen3 instruct model emits by default in thinking mode.
-        # With enable_thinking=True the model prepends a <think> block before answering,
-        # which our engine handles fine but doubles TTFT. Keep False for direct answers.
+        # Instruct-2507 is a non-thinking model: its template has no <think> block
+        # and no enable_thinking switch.
         token_ids = tokenizer.apply_chat_template(
-            messages, add_generation_prompt=True, enable_thinking=False
+            messages, add_generation_prompt=True
         )
         token_str = ",".join(map(str, token_ids))
         
-        # Auto-tune ring size based on system RAM
-        # Note: macOS often caps single `newBufferWithBytesNoCopy` allocations at ~50-60% of RAM.
-        # 4096 slots = 34GB, which fails on 48GB Macs. 2048 slots = 16GB, which is safe.
+        # Ring sizing is delegated to the engine (--ring 0 = auto): it scans the
+        # vault for the real slot size (Q2 ~5MB vs Q4 ~10MB blobs) and budgets
+        # 25% of free RAM, so a fixed slot count here would over-allocate on Q4.
         ram_gb = os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES') / (1024**3)
-        if ram_gb > 20:
-            ring_size = "2048"
-        else:
-            ring_size = "512"
-            
+
         eos_ids = tokenizer.eos_token_id
         if isinstance(eos_ids, int):
             eos_ids_str = str(eos_ids)
@@ -69,11 +67,11 @@ def main():
 
         cmd = [
             "build/smoe-engine",
-            "--vault", "vault/qwen3-235b-instruct.smoe",
-            "--scout", "vault/qwen3-235b-instruct.scout.safetensors",
+            "--vault", "vault/qwen3-235b-q4.smoe",
+            "--scout", "vault/qwen3-235b-q4.scout.safetensors",
             "--tokens-in", token_str,
             "--tokens", "256",
-            "--ring", ring_size,
+            "--ring", "0",
             "--eos-ids", eos_ids_str,
             "--workers", "4",
             "--temperature", "0.6",
@@ -83,7 +81,7 @@ def main():
             "--raw-ids"
         ]
         
-        print(f"{CYAN}{BOLD}S-MoE [RAM: {ram_gb:.1f}GB | Ring: {ring_size}]:{RESET} ", end="", flush=True)
+        print(f"{CYAN}{BOLD}S-MoE [RAM: {ram_gb:.1f}GB | Ring: auto]:{RESET} ", end="", flush=True)
         
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
@@ -128,6 +126,16 @@ def main():
             continue
             
         print()
+        process.wait()
+        if process.returncode != 0 or not response_tokens:
+            stderr_text = process.stderr.read().strip()
+            if stderr_text:
+                print(f"{MAGENTA}[engine exited with code {process.returncode}]{RESET}")
+                print(stderr_text, file=sys.stderr)
+            if not response_tokens:
+                messages.pop()  # drop the user turn so history stays consistent
+                continue
+
         response_text = tokenizer.decode(response_tokens, skip_special_tokens=True)
         messages.append({"role": "assistant", "content": response_text.strip()})
 

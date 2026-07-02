@@ -583,11 +583,10 @@ int main(int argc, char* argv[]) {
             heavy_hidden[d] = smoe::bf16_to_f32(emb[d]);
         }
 
-        if (n >= prompt_len) {
+        // Token emission happens once in Step 6; anything here is debug telemetry
+        // only and must stay off stdout (chat.py parses stdout as the token stream).
+        if (n >= prompt_len && g_debug) {
             std::fprintf(stderr, "[RAW TOK: %u] ", heavy_cur_token);
-            std::string s = decode_token(heavy_cur_token);
-            std::fputs(s.c_str(), stdout);
-            std::fflush(stdout);
         }
 
         if (n == 0) {
