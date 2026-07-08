@@ -982,39 +982,45 @@ if (spin % 10000 == 0) {
         if (ctx_fill < ATTN_CTX) ++ctx_fill;
 
         // ── Step 5: Final Model Norm and LM Head ──────────────
-        if (g_debug) {
-            float h_sum2 = 0.0f;
-            for(uint32_t i=0; i<d_model; i++) h_sum2 += heavy_hidden[i]*heavy_hidden[i];
-            std::fprintf(stderr, "\n[n=%u] raw_hidden_L2 = %f\n", n, std::sqrt(h_sum2));
-        }
-        smoe::rms_norm_bf16(heavy_hidden, scout.get_model_norm(), d_model);
-        
-        // Execute LM Head on CPU
-        float* scores = scout.get_lm_head_scores();
-        smoe::matvec_bf16(scores, scout.get_lm_head(), heavy_hidden, cfg.vocab_size, d_model);
-        uint32_t best_tok   = 0;
-        
-        // Sample Token
-        smoe::SamplerConfig sampler_cfg {
-            .vocab_size = cfg.vocab_size,
-            .temperature = temperature,
-            .top_p = top_p,
-            .top_k = top_k,
-            .rep_penalty = rep_penalty
-        };
-        best_tok = smoe::sample_token(scores, sampler_cfg, token_history, history_len, rng);
-        
-        heavy_cur_token = best_tok;
-        if (g_debug) {
-            float h_sum2 = 0.0f;
-            for(uint32_t i=0; i<d_model; i++) h_sum2 += heavy_hidden[i]*heavy_hidden[i];
-            std::fprintf(stderr, "\\n[n=%u] hidden_L2 = %f, best_tok = %u\\n", n, std::sqrt(h_sum2), best_tok);
-            std::fflush(stderr);
-        }
-        next_heavy_token = best_tok; // Save for the next contiguous iteration
+        // Prompt positions before the last already know their next token,
+        // so the vocab-sized LM head matvec (~622M MACs on CPU) and the
+        // sampling pass would be discarded work — skip them entirely.
+        // heavy_hidden is rebuilt from the embedding at the top of every
+        // step, so leaving it un-normed here is safe.
         bool is_generating = (prompt_len == 0) || (n >= prompt_len - 1);
-        if (is_generating && history_len < 8192) {
-            token_history[history_len++] = heavy_cur_token;
+        if (is_generating) {
+            if (g_debug) {
+                float h_sum2 = 0.0f;
+                for(uint32_t i=0; i<d_model; i++) h_sum2 += heavy_hidden[i]*heavy_hidden[i];
+                std::fprintf(stderr, "\n[n=%u] raw_hidden_L2 = %f\n", n, std::sqrt(h_sum2));
+            }
+            smoe::rms_norm_bf16(heavy_hidden, scout.get_model_norm(), d_model);
+
+            // Execute LM Head on CPU
+            float* scores = scout.get_lm_head_scores();
+            smoe::matvec_bf16(scores, scout.get_lm_head(), heavy_hidden, cfg.vocab_size, d_model);
+
+            // Sample Token
+            smoe::SamplerConfig sampler_cfg {
+                .vocab_size = cfg.vocab_size,
+                .temperature = temperature,
+                .top_p = top_p,
+                .top_k = top_k,
+                .rep_penalty = rep_penalty
+            };
+            uint32_t best_tok = smoe::sample_token(scores, sampler_cfg, token_history, history_len, rng);
+
+            heavy_cur_token = best_tok;
+            if (g_debug) {
+                float h_sum2 = 0.0f;
+                for(uint32_t i=0; i<d_model; i++) h_sum2 += heavy_hidden[i]*heavy_hidden[i];
+                std::fprintf(stderr, "\\n[n=%u] hidden_L2 = %f, best_tok = %u\\n", n, std::sqrt(h_sum2), best_tok);
+                std::fflush(stderr);
+            }
+            next_heavy_token = best_tok; // Save for the next contiguous iteration
+            if (history_len < 8192) {
+                token_history[history_len++] = heavy_cur_token;
+            }
         }
         uint32_t expected_scout_token = scout_out.next_token_id;
         if (g_debug) {
