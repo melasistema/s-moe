@@ -32,7 +32,8 @@ LDFLAGS  := -framework Metal -framework Foundation \
 
 SRCS_CXX  := $(SRC_DIR)/main.cpp \
               $(SRC_DIR)/io/streamer.cpp \
-              $(SRC_DIR)/scout/scout.cpp
+              $(SRC_DIR)/scout/scout.cpp \
+              $(SRC_DIR)/prefill.cpp
 SRCS_MM   := $(SRC_DIR)/compute/metal_bridge.mm
 METAL_SRC := $(SRC_DIR)/compute/kernels.metal
 METAL_LIB := $(BUILD_DIR)/kernels.metallib

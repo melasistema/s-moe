@@ -100,6 +100,35 @@ void* smoe_metal_fused_ffn(SmoeMetalCtx*   ctx,
 
 void smoe_metal_wait(SmoeMetalCtx* ctx, void* handle, float* output_vec, uint32_t expert_index, uint32_t cols);
 
+// ── Token-batch fused FFN (layer-major prefill) ──────────────
+// Applies ONE expert to `batch` token activations in a single
+// two-pass dispatch. input_mat is row-major [batch × gate_cols];
+// results are fetched with smoe_metal_wait_ffn_batch into
+// out_mat [batch × down_rows]. Returns NULL if the batch/dims
+// exceed the pre-allocated staging buffers (caller must fall back
+// to the per-token path).
+#define SMOE_MAX_FFN_BATCH 64
+#define SMOE_MAX_FFN_BATCH_DIM 16384
+
+void* smoe_metal_fused_ffn_batch(SmoeMetalCtx*   ctx,
+                                 const uint8_t*  packed_gate,
+                                 const uint16_t* scales_gate,
+                                 const uint8_t*  packed_up,
+                                 const uint16_t* scales_up,
+                                 const uint8_t*  packed_down,
+                                 const uint16_t* scales_down,
+                                 const float*    input_mat,
+                                 uint32_t        batch,
+                                 uint32_t        gate_rows,
+                                 uint32_t        gate_cols,
+                                 uint32_t        down_rows,
+                                 uint32_t        down_cols,
+                                 uint32_t        group_size,
+                                 uint32_t        bits);
+
+void smoe_metal_wait_ffn_batch(SmoeMetalCtx* ctx, void* handle,
+                               float* out_mat, uint32_t batch, uint32_t cols);
+
 // Perform a float32 matrix-vector multiplication on the GPU for Scout projections.
 void smoe_metal_scout_matvec(SmoeMetalCtx* ctx, const float* weight, const float* input, float* output, uint32_t rows, uint32_t cols);
 void smoe_metal_scout_matvec_bf16(SmoeMetalCtx* ctx,

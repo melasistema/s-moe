@@ -23,6 +23,7 @@
 #include "compute/metal_bridge.h"
 #include "cli.hpp"
 #include "sampler.hpp"
+#include "prefill.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -36,6 +37,8 @@
 #include <random>
 #include <algorithm>
 #include <vector>
+#include <iostream>
+#include <string>
 
 // ── Compile-time defaults ─────────────────────────────────────
 inline constexpr uint32_t TELEMETRY_EVERY      = 10;   // tokens between telemetry updates
@@ -135,22 +138,7 @@ static bool read_vault_header(const char* vault_path, smoe::SmoeHeader& hdr) {
     return true;
 }
 
-struct ExpertLayout {
-    uint32_t gate_rows;
-    uint32_t gate_cols;
-    uint64_t gate_packed_offset;
-    uint64_t gate_scales_offset;
-
-    uint32_t up_rows;
-    uint32_t up_cols;
-    uint64_t up_packed_offset;
-    uint64_t up_scales_offset;
-
-    uint32_t down_rows;
-    uint32_t down_cols;
-    uint64_t down_packed_offset;
-    uint64_t down_scales_offset;
-};
+using smoe::prefill::ExpertLayout;
 
 static bool read_expert_layout(const char* vault_path, const smoe::SmoeHeader& hdr, ExpertLayout& layout) {
     int fd = ::open(vault_path, O_RDONLY);
@@ -189,6 +177,37 @@ static bool g_vocab_loaded = false;
 static std::string g_vocab[151936];
 static bool g_debug = false;
 static bool g_raw_ids = false;
+
+// ── Expert popularity histogram (prewarm ordering) ────────────
+// Claim counts per (absolute layer, expert), persisted across runs so
+// the prewarm thread can stream the historically hottest experts first.
+static uint32_t g_expert_hits[128 * smoe::prefill::HITS_STRIDE];
+
+static void load_expert_freq(const char* path) {
+    FILE* f = std::fopen(path, "rb");
+    if (!f) return;
+    uint32_t magic = 0, ver = 0, n = 0;
+    if (std::fread(&magic, 4, 1, f) == 1 && magic == 0x51524653u /* 'SFRQ' */ &&
+        std::fread(&ver, 4, 1, f) == 1 && ver == 1 &&
+        std::fread(&n, 4, 1, f) == 1 && n <= 128u * smoe::prefill::HITS_STRIDE) {
+        static uint32_t tmp[128 * smoe::prefill::HITS_STRIDE];
+        if (std::fread(tmp, 4, n, f) == n) {
+            for (uint32_t i = 0; i < n; ++i) g_expert_hits[i] += tmp[i];
+        }
+    }
+    std::fclose(f);
+}
+
+static void save_expert_freq(const char* path) {
+    FILE* f = std::fopen(path, "wb");
+    if (!f) return;
+    uint32_t magic = 0x51524653u, ver = 1, n = 128u * smoe::prefill::HITS_STRIDE;
+    std::fwrite(&magic, 4, 1, f);
+    std::fwrite(&ver, 4, 1, f);
+    std::fwrite(&n, 4, 1, f);
+    std::fwrite(g_expert_hits, 4, n, f);
+    std::fclose(f);
+}
 
 static void load_vocab(const char* vocab_bin_path, uint32_t expected_vocab_size) {
     FILE* f = std::fopen(vocab_bin_path, "rb");
@@ -384,21 +403,67 @@ int main(int argc, char* argv[]) {
     const auto& cfg = scout.config();
     const uint32_t num_layers = cfg.num_moe_layers + (cfg.has_dense_layer_0 ? 1 : 0);
 
-    // ── Cache Pre-Warming (Stealth Background Load) ───────────
-    std::thread prewarm_thread([&streamer, vault_hdr, &cfg]() {
-        uint32_t count = 0;
-        // Leave 800 slots empty to ensure there's room for all active experts (8 per layer * 94 layers = ~752)
-        uint32_t max_prewarm = (streamer.ring_size() > 800) ? streamer.ring_size() - 800 : 0;
-        for (uint32_t l = 0; l < cfg.num_moe_layers && count < max_prewarm; ++l) {
-            for (uint32_t e = 0; e < vault_hdr.max_experts_per_layer && count < max_prewarm; ++e) {
-                if (streamer.prefetch(l, e)) count++;
-                // Sleep to trickle-load the cache, keeping the MPMC queue empty 
-                // and the NVMe SSD available for immediate priority prompt prefetching!
+    // ── Popularity-Ordered Cache Pre-Warming ──────────────────
+    // Streams the historically hottest experts into the ring while the
+    // engine is idle: at startup and, in serve mode, between requests
+    // (bump prewarm_epoch to re-arm a pass). engine_busy pauses it so
+    // it never competes with demand reads. Ordering comes from the
+    // persisted claim histogram; unseen experts keep their sequential
+    // order so a first boot still warms deterministically.
+    // Joinable (not detached): a detached pass could outlive main's
+    // stack-local streamer on short runs and read a dead reference.
+    load_expert_freq("vault/expert_freq.bin");
+    std::atomic<bool>     prewarm_shutdown { false };
+    std::atomic<bool>     engine_busy      { false };
+    std::atomic<uint32_t> prewarm_epoch    { 1 };
+    const uint32_t prewarm_start_layer = cfg.has_dense_layer_0 ? 1 : 0;
+    std::thread prewarm_thread([&]() {
+        constexpr uint32_t HS = smoe::prefill::HITS_STRIDE;
+        static uint32_t order[128 * HS];
+        uint32_t last_epoch = 0;
+        while (!prewarm_shutdown.load(std::memory_order_relaxed)) {
+            if (engine_busy.load(std::memory_order_relaxed)) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                continue;
+            }
+            uint32_t epoch = prewarm_epoch.load(std::memory_order_relaxed);
+            if (epoch == last_epoch) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                continue;
+            }
+            uint32_t n_entries = 0;
+            for (uint32_t l = prewarm_start_layer;
+                 l < prewarm_start_layer + cfg.num_moe_layers && l < 128; ++l) {
+                for (uint32_t e = 0; e < vault_hdr.max_experts_per_layer && e < HS; ++e) {
+                    order[n_entries++] = l * HS + e;
+                }
+            }
+            std::stable_sort(order, order + n_entries, [](uint32_t a, uint32_t b) {
+                return g_expert_hits[a] > g_expert_hits[b];
+            });
+
+            // Reserve headroom for the live working set. Layer-major
+            // prefill claims at most one layer's expert union (≤128
+            // slots) plus in-flight fetches at a time, so max(128,
+            // ring/4) suffices. (The old "ring − 800" margin was sized
+            // for a per-token working set that no longer exists — and
+            // made prewarm a silent no-op on rings under 800 slots,
+            // e.g. 580 here on 32/48 GB machines.)
+            const uint32_t ring_sz = streamer.ring_size();
+            const uint32_t margin  = (ring_sz / 4 > 128) ? ring_sz / 4 : 128;
+            uint32_t budget = (ring_sz > margin) ? ring_sz - margin : 0;
+            for (uint32_t i = 0; i < n_entries && budget > 0; ++i) {
+                if (prewarm_shutdown.load(std::memory_order_relaxed)) return;
+                if (engine_busy.load(std::memory_order_relaxed)) break; // yield to request
+                if (prewarm_epoch.load(std::memory_order_relaxed) != epoch) break;
+                if (streamer.prefetch(order[i] / HS, order[i] % HS)) budget--;
+                // Trickle: keep the MPMC queue shallow so demand
+                // prefetches always find room the moment a request lands.
                 std::this_thread::sleep_for(std::chrono::milliseconds(4));
             }
+            last_epoch = epoch;
         }
     });
-    prewarm_thread.detach();
 
     const uint32_t d_model = cfg.d_model;
     const uint32_t ffn_dim = cfg.ffn_dim;
@@ -409,60 +474,21 @@ int main(int argc, char* argv[]) {
     // ── Load vocabulary ───────────────────────────────────────
     load_vocab("vault/vocab.bin", cfg.vocab_size);
 
-    // ── Tokenise prompt ───────────────────────────────────────
-    // Pre-allocate on the stack — no heap in the loop.
+    // ── Persistent token stream (server mode) ─────────────────
+    // stream_tokens is the engine's canonical view of the whole
+    // conversation (prompt + generated), used for (a) repetition-penalty
+    // history and (b) longest-common-prefix matching so a follow-up
+    // request only prefills its new suffix against the retained KV cache.
+    static constexpr uint32_t STREAM_CAP = 8192;
+    static uint32_t stream_tokens[STREAM_CAP];
+    uint32_t stream_len = 0;
+
+    // Per-request prompt suffix. Pre-allocated on the stack — no heap in the loop.
     uint32_t* prompt_tokens = (uint32_t*)__builtin_alloca(4096 * sizeof(uint32_t));
-    uint32_t        prompt_len = 0;
-    if (tokens_in) {
-        std::string s(tokens_in);
-        size_t pos = 0;
-        while (pos < s.size() && prompt_len < 4096) {
-            size_t next_comma = s.find(',', pos);
-            if (next_comma == std::string::npos) {
-                prompt_tokens[prompt_len++] = std::stoul(s.substr(pos));
-                break;
-            }
-            prompt_tokens[prompt_len++] = std::stoul(s.substr(pos, next_comma - pos));
-            pos = next_comma + 1;
-        }
-    } else {
-        tokenise_prompt(prompt_text, prompt_tokens, prompt_len,
-                        std::min(max_tokens, uint32_t(4096)));
-    }
+    uint32_t  prompt_len = 0;
 
-    // ── Pre-generate telemetry state ──────────────────────────
-    TelemetryState ts;
-    ts.start_ms   = wall_ms();
-    ts.prev_ms    = ts.start_ms;
-    ts.prev_bytes = 0;
-
-    // ── Sampling state ────────────────────────────────────────
-    static uint32_t token_history[8192];
-    uint32_t history_len = 0;
-    for (uint32_t i = 0; i < prompt_len; ++i) {
-        if (history_len < 8192) {
-            token_history[history_len++] = prompt_tokens[i];
-        }
-    }
     std::mt19937 rng(1337); // Fixed seed for deterministic debug, can be randomized later
-
-    // ── Print prompt passthrough ──────────────────────────────
-    if (g_debug) {
-        std::fprintf(stdout, "\n");
-        for (uint32_t i = 0; i < prompt_len; ++i) {
-            uint32_t tok = prompt_tokens[i];
-            if (g_vocab_loaded && tok < cfg.vocab_size) {
-                std::string s = g_vocab[tok];
-                size_t pos;
-                while ((pos = s.find("Ġ")) != std::string::npos) s.replace(pos, 2, " ");
-                while ((pos = s.find("Ċ")) != std::string::npos) s.replace(pos, 2, "\n");
-                std::fputs(s.c_str(), stdout);
-            } else {
-                unsigned char c = static_cast<unsigned char>(tok & 0xFF);
-                std::fputc(c, stdout);
-            }
-        }
-    }
+    TelemetryState ts;
 
     // ── Token Generation Loop ─────────────────────────────────
     //
@@ -485,8 +511,6 @@ int main(int argc, char* argv[]) {
     uint32_t ctx_pos = 0;
     uint32_t ctx_fill = 0;
 
-    uint32_t total_steps = prompt_len + max_tokens;
-    if (prompt_len > 0) total_steps -= 1;
 
     // ── Pre-allocate and register Heavy Execution Buffers ───────
     float* heavy_hidden = nullptr;
@@ -512,6 +536,29 @@ int main(int argc, char* argv[]) {
     float* shared_gate_out = smoe::allocate_aligned_float(shared_dim);
     float* shared_up_out   = smoe::allocate_aligned_float(shared_dim);
 
+    // Exact prefill routing scratch: during prompt steps the router gate
+    // is evaluated directly on the heavy hidden state (128×d_model matvec,
+    // ~0.5M MACs) instead of running the scout's full backbone pass.
+    float* prefill_gate_scores = smoe::allocate_aligned_float(vault_hdr.max_experts_per_layer);
+    smoe::scout::ExpertPrediction prefill_pred {};
+    // NOTE: replaying the previous token's routing as prefetch hints was
+    // tried and measured SLOWER (114s vs 84s TTFT on the 45-token bench):
+    // adjacent-token routing overlap is low in Qwen3-235B, so hints mostly
+    // stream in the wrong experts ahead of the demand fetches. Prefill
+    // I/O overlap comes from layer-major batched prefill instead.
+
+    // RoPE tables: the rotation angle depends only on (position, dim) —
+    // not on head or layer — so inv_freq is computed once and cos/sin
+    // once per token step instead of per head × dim × layer.
+    const uint32_t rope_half = cfg.head_dim / 2;
+    float* rope_inv_freq = smoe::allocate_aligned_float(rope_half);
+    float* rope_cos      = smoe::allocate_aligned_float(rope_half);
+    float* rope_sin      = smoe::allocate_aligned_float(rope_half);
+    for (uint32_t d = 0; d < rope_half; ++d) {
+        rope_inv_freq[d] = 1.0f / std::pow(cfg.rope_theta,
+            static_cast<float>(d * 2) / static_cast<float>(cfg.head_dim));
+    }
+
     smoe_metal_register_buffer(metal, heavy_hidden, heavy_hidden_aligned);
     smoe_metal_register_buffer(metal, heavy_normed, heavy_normed_aligned);
     smoe_metal_register_buffer(metal, heavy_qbuf,   qbuf_aligned);
@@ -519,8 +566,43 @@ int main(int argc, char* argv[]) {
     smoe_metal_register_buffer(metal, heavy_vbuf,   kvbuf_aligned);
     smoe_metal_register_buffer(metal, heavy_attn_out, heavy_attn_out_aligned);
 
-    uint32_t heavy_cur_token = (prompt_len > 0) ? prompt_tokens[0] : 0;
-    uint32_t scout_cur_token = heavy_cur_token;
+    // ── Layer-major prefill activation planes ─────────────────
+    // One row per chunk token. 16 KB-aligned so Metal can wrap them
+    // zero-copy; registered once here, reused for every request.
+    smoe::prefill::Buffers pf {};
+    {
+        using smoe::prefill::CHUNK;
+        auto plane = [&](size_t elems, bool reg) -> float* {
+            void* p = nullptr;
+            size_t bytes = (elems * sizeof(float) + 16383) & ~size_t(16383);
+            if (::posix_memalign(&p, 16384, bytes) != 0 || !p) return nullptr;
+            std::memset(p, 0, bytes);
+            if (reg) smoe_metal_register_buffer(metal, p, bytes);
+            return static_cast<float*>(p);
+        };
+        pf.hidden      = plane(size_t(CHUNK) * d_model, false);
+        pf.normed      = plane(size_t(CHUNK) * d_model, true);   // matvec + fused_ffn input rows
+        pf.qbuf        = plane(size_t(CHUNK) * q_dim,  true);
+        pf.kbuf        = plane(size_t(CHUNK) * kv_dim, true);
+        pf.vbuf        = plane(size_t(CHUNK) * kv_dim, true);
+        pf.attn_out    = plane(size_t(CHUNK) * q_dim,  true);
+        pf.routed_out  = plane(size_t(CHUNK) * d_model, false);
+        pf.oproj_out   = plane(d_model, true);
+        pf.ffn_hidden  = plane(ffn_dim, true);
+        pf.ffn_up      = plane(ffn_dim, true);
+        pf.ffn_out     = plane(d_model, true);
+        pf.sh_gate     = (shared_dim > 0) ? plane(shared_dim, true) : nullptr;
+        pf.sh_up       = (shared_dim > 0) ? plane(shared_dim, true) : nullptr;
+        pf.sh_out      = (shared_dim > 0) ? plane(d_model, true) : nullptr;
+        pf.gate_scores = plane(vault_hdr.max_experts_per_layer, false);
+        pf.rope_cos    = plane(size_t(CHUNK) * rope_half, false);
+        pf.rope_sin    = plane(size_t(CHUNK) * rope_half, false);
+        pf.batch_in    = plane(size_t(CHUNK) * d_model, false);
+        pf.batch_out   = plane(size_t(CHUNK) * d_model, false);
+    }
+
+    uint32_t heavy_cur_token = 0;
+    uint32_t scout_cur_token = 0;
 
     // Speculative lookahead queue
     static constexpr uint32_t GEN_LOOKAHEAD_K = 1;
@@ -560,7 +642,184 @@ int main(int argc, char* argv[]) {
 
     uint32_t next_heavy_token = 0;
 
-    for (uint32_t n = 0; n < total_steps; ++n) {
+    const bool serve = cli_cfg.serve;
+    bool one_shot_done = false;
+    std::string req_line; // reused across requests; allocation stays out of the token loop
+
+    // ═══ REQUEST LOOP ═══════════════════════════════════════════
+    // One-shot mode runs exactly one request from the CLI arguments.
+    // Server mode reads one request per stdin line:
+    //   GEN <max_tokens> <id0>,<id1>,...   full conversation token stream
+    //   RESET                              drop all cached state
+    // and replies with raw token IDs on stdout, terminated by <<DONE>>.
+    // The KV cache, ring cache, and scout state persist across requests;
+    // only the suffix beyond the longest common prefix with the stored
+    // stream is prefetched and prefilled.
+    while (true) {
+        uint32_t req_max_tokens = max_tokens;
+        prompt_len = 0;
+
+        if (!serve) {
+            if (one_shot_done) break;
+            one_shot_done = true;
+            if (tokens_in) {
+                std::string s(tokens_in);
+                size_t pos = 0;
+                while (pos < s.size() && prompt_len < 4096) {
+                    size_t next_comma = s.find(',', pos);
+                    if (next_comma == std::string::npos) {
+                        prompt_tokens[prompt_len++] = std::stoul(s.substr(pos));
+                        break;
+                    }
+                    prompt_tokens[prompt_len++] = std::stoul(s.substr(pos, next_comma - pos));
+                    pos = next_comma + 1;
+                }
+            } else {
+                tokenise_prompt(prompt_text, prompt_tokens, prompt_len,
+                                std::min(max_tokens, uint32_t(4096)));
+            }
+            for (uint32_t i = 0; i < prompt_len && stream_len < STREAM_CAP; ++i) {
+                stream_tokens[stream_len++] = prompt_tokens[i];
+            }
+        } else {
+            if (!std::getline(std::cin, req_line)) break; // EOF → clean exit
+            if (req_line.empty()) continue;
+
+            if (req_line == "RESET") {
+                ctx_pos = 0; ctx_fill = 0;
+                stream_len = 0;
+                scout.reset_context();
+                std::printf("<<DONE>>\n");
+                std::fflush(stdout);
+                continue;
+            }
+            if (req_line.rfind("GEN ", 0) != 0) {
+                std::printf("<<ERR bad_request>>\n");
+                std::fflush(stdout);
+                continue;
+            }
+
+            // Parse: GEN <max_tokens> <csv-ids>
+            static uint32_t full_toks[STREAM_CAP];
+            uint32_t full_len = 0;
+            bool parse_ok = true;
+            {
+                size_t p = 4;
+                size_t sp = req_line.find(' ', p);
+                if (sp == std::string::npos) { parse_ok = false; }
+                else {
+                    req_max_tokens = static_cast<uint32_t>(std::atoi(req_line.c_str() + p));
+                    if (req_max_tokens == 0 || req_max_tokens > 8192) parse_ok = false;
+                    p = sp + 1;
+                    while (parse_ok && p < req_line.size()) {
+                        if (full_len >= STREAM_CAP) { parse_ok = false; break; }
+                        char* endp = nullptr;
+                        unsigned long v = std::strtoul(req_line.c_str() + p, &endp, 10);
+                        if (endp == req_line.c_str() + p) { parse_ok = false; break; }
+                        full_toks[full_len++] = static_cast<uint32_t>(v);
+                        p = static_cast<size_t>(endp - req_line.c_str());
+                        if (p < req_line.size() && req_line[p] == ',') ++p;
+                    }
+                }
+            }
+            if (!parse_ok || full_len == 0) {
+                std::printf("<<ERR %s>>\n", full_len >= STREAM_CAP ? "ctx_overflow" : "bad_request");
+                std::fflush(stdout);
+                continue;
+            }
+
+            // Longest common prefix against the stored stream: matching
+            // positions already live in the KV cache and are skipped.
+            uint32_t lcp = 0;
+            while (lcp < stream_len && lcp < full_len &&
+                   stream_tokens[lcp] == full_toks[lcp]) ++lcp;
+
+            if (lcp < stream_len) {
+                // History was edited/regenerated — cached KV beyond the
+                // divergence point is invalid. Full reset, full prefill.
+                ctx_pos = 0; ctx_fill = 0;
+                stream_len = 0;
+                scout.reset_context();
+                lcp = 0;
+            }
+
+            uint32_t suffix = full_len - lcp;
+            if (suffix == 0) {
+                std::printf("<<ERR empty_suffix>>\n");
+                std::fflush(stdout);
+                continue;
+            }
+            if (suffix > 4096) {
+                std::printf("<<ERR suffix_too_long>>\n");
+                std::fflush(stdout);
+                continue;
+            }
+            for (uint32_t i = 0; i < suffix; ++i) {
+                prompt_tokens[i] = full_toks[lcp + i];
+            }
+            prompt_len = suffix;
+            for (uint32_t i = 0; i < prompt_len && stream_len < STREAM_CAP; ++i) {
+                stream_tokens[stream_len++] = prompt_tokens[i];
+            }
+            if (g_debug) {
+                std::fprintf(stderr, "[serve] stream=%u lcp=%u suffix=%u gen=%u\n",
+                             full_len, lcp, suffix, req_max_tokens);
+            }
+        }
+
+        // Absolute position of prompt_tokens[0] in the token stream —
+        // RoPE and the scout sync must use stream positions, not the
+        // per-request loop index.
+        const uint64_t stream_base = stream_len - prompt_len;
+
+        // Pause the prewarm trickle for the duration of the request so
+        // demand reads own the NVMe queue.
+        engine_busy.store(true, std::memory_order_relaxed);
+
+        // ── Per-request state ─────────────────────────────────
+        ts.start_ms   = wall_ms();
+        ts.prev_ms    = ts.start_ms;
+        ts.prev_bytes = 0;
+
+        heavy_cur_token = (prompt_len > 0) ? prompt_tokens[0] : 0;
+        scout_cur_token = heavy_cur_token;
+        next_heavy_token = 0;
+        sq_head = 0; sq_tail = 0; sq_size = 0;
+
+        uint32_t total_steps = prompt_len + req_max_tokens;
+        if (prompt_len > 0) total_steps -= 1;
+
+        // ── Layer-major batched prefill ───────────────────────
+        // All prompt tokens except the last go through the chunked
+        // layer-major path: per layer, the chunk's routed experts are
+        // deduplicated and each blob is claimed once for all tokens
+        // that use it. The last prompt token runs through the normal
+        // serial step below so sampling/emission stay in one place.
+        uint32_t n_start = 0;
+        if (prompt_len > 1) {
+            static float prefill_attn_scores[ATTN_CTX];
+            smoe::prefill::Params pparams {
+                .cfg = &cfg,
+                .scout = &scout,
+                .streamer = &streamer,
+                .metal = metal,
+                .hdr = &vault_hdr,
+                .layout = &expert_layout,
+                .full_kv_cache = full_kv_cache,
+                .attn_ctx = ATTN_CTX,
+                .moe_start_layer = moe_start_layer,
+                .rope_inv_freq = rope_inv_freq,
+                .b = pf,
+                .expert_hits = g_expert_hits,
+                .debug = g_debug,
+            };
+            smoe::prefill::run_layer_major(pparams, prompt_tokens, prompt_len - 1,
+                                           stream_base, ctx_pos, ctx_fill,
+                                           prefill_attn_scores);
+            n_start = prompt_len - 1;
+        }
+
+    for (uint32_t n = n_start; n < total_steps; ++n) {
         uint32_t heavy_cur_token;
         bool is_prompt = (n < prompt_len);
 
@@ -596,8 +855,13 @@ int main(int argc, char* argv[]) {
             std::fprintf(stderr, "\n[Token %u] emb = %.4f %.4f %.4f %.4f\n", heavy_cur_token, heavy_hidden[0], heavy_hidden[1], heavy_hidden[2], heavy_hidden[3]);
         }
 
-        // Clean up any leaked/discarded slots in the streamer
-        {
+        // Clean up any leaked/discarded slots in the streamer.
+        // NOT during prompt steps: the lookahead queue is empty then, so
+        // this would mark every slot inactive and evict the entire ring
+        // each prompt token (zero cross-token reuse, ~7 GB re-read per
+        // token). During prefill, capacity is reclaimed lazily by
+        // prefetch()'s CONSUMED/LRU-READY eviction instead.
+        if (!is_prompt) {
             ActiveExpertsContext act_ctx { scout_queue, sq_head, sq_size, cfg.num_moe_layers, moe_start_layer };
             streamer.prune_slots(is_expert_active, &act_ctx);
         }
@@ -609,11 +873,21 @@ int main(int argc, char* argv[]) {
         }
 
         // ── Phase A: Scout Speculative Lookahead ──────────────
-        // During prompt: prefetch exactly 1 token's experts at a time (serial, safe).
-        // During generation: keep GEN_LOOKAHEAD_K steps ahead for speculative execution.
-        // The previous value of MIN(prompt_len-n, 64) during prompt exhausted the ring
-        // (64 × ~162 experts >> ring=256 slots) causing a deadlock after the first token.
-        uint32_t target_sq_size = is_prompt ? 1 : GEN_LOOKAHEAD_K;
+        // During prompt: the scout is NOT run at all — routing is computed
+        // exactly from the heavy hidden state at each MoE layer (Phase B),
+        // which both removes a duplicate full-backbone pass per prompt
+        // token and gives the true Qwen3 routing instead of a prediction.
+        // During generation: keep GEN_LOOKAHEAD_K steps ahead for
+        // speculative execution.
+        uint32_t target_sq_size = is_prompt ? 0 : GEN_LOOKAHEAD_K;
+
+        // First generation step after a prompt: the scout skipped the
+        // prompt entirely, but its KV cache was filled by write_kv_cache
+        // from the heavy path. Align its ring position and RoPE step
+        // before speculation starts.
+        if (!is_prompt && prompt_len > 0 && n == prompt_len) {
+            scout.sync_position(stream_base + prompt_len);
+        }
 
         while (sq_size < target_sq_size) {
             uint32_t scout_input;
@@ -646,6 +920,15 @@ int main(int argc, char* argv[]) {
 
         const uint16_t* heavy_emb = scout.get_embed() + static_cast<size_t>(heavy_cur_token) * d_model;
         for (uint32_t i = 0; i < d_model; ++i) heavy_hidden[i] = smoe::bf16_to_f32(heavy_emb[i]);
+
+        // RoPE rotation for this ABSOLUTE stream position (not the loop
+        // index — in server mode the request starts mid-stream), shared
+        // by all heads and layers.
+        for (uint32_t d = 0; d < rope_half; ++d) {
+            float angle = static_cast<float>(stream_base + n) * rope_inv_freq[d];
+            rope_cos[d] = std::cos(angle);
+            rope_sin[d] = std::sin(angle);
+        }
 
         for (uint32_t l = 0; l < num_layers; ++l) {
             std::memcpy(heavy_normed, heavy_hidden, d_model * sizeof(float));
@@ -680,31 +963,21 @@ int main(int argc, char* argv[]) {
 
             // Apply RoPE to Q
             for (uint32_t h = 0; h < cfg.num_heads; ++h) {
-                for (uint32_t d = 0; d < cfg.head_dim / 2; ++d) {
-                    float freq = 1.0f / std::pow(cfg.rope_theta, static_cast<float>(d * 2) / static_cast<float>(cfg.head_dim));
-                    float angle = static_cast<float>(n) * freq;
-                    float cos_val = std::cos(angle);
-                    float sin_val = std::sin(angle);
-                    
+                for (uint32_t d = 0; d < rope_half; ++d) {
                     float q0 = heavy_qbuf[h * cfg.head_dim + d];
-                    float q1 = heavy_qbuf[h * cfg.head_dim + d + (cfg.head_dim / 2)];
-                    heavy_qbuf[h * cfg.head_dim + d]                           = q0 * cos_val - q1 * sin_val;
-                    heavy_qbuf[h * cfg.head_dim + d + (cfg.head_dim / 2)]      = q0 * sin_val + q1 * cos_val;
+                    float q1 = heavy_qbuf[h * cfg.head_dim + d + rope_half];
+                    heavy_qbuf[h * cfg.head_dim + d]             = q0 * rope_cos[d] - q1 * rope_sin[d];
+                    heavy_qbuf[h * cfg.head_dim + d + rope_half] = q0 * rope_sin[d] + q1 * rope_cos[d];
                 }
             }
-            
+
             // Apply RoPE to K
             for (uint32_t h = 0; h < cfg.num_kv_heads; ++h) {
-                for (uint32_t d = 0; d < cfg.head_dim / 2; ++d) {
-                    float freq = 1.0f / std::pow(cfg.rope_theta, static_cast<float>(d * 2) / static_cast<float>(cfg.head_dim));
-                    float angle = static_cast<float>(n) * freq;
-                    float cos_val = std::cos(angle);
-                    float sin_val = std::sin(angle);
-                    
+                for (uint32_t d = 0; d < rope_half; ++d) {
                     float k0 = heavy_kbuf[h * cfg.head_dim + d];
-                    float k1 = heavy_kbuf[h * cfg.head_dim + d + (cfg.head_dim / 2)];
-                    heavy_kbuf[h * cfg.head_dim + d]                           = k0 * cos_val - k1 * sin_val;
-                    heavy_kbuf[h * cfg.head_dim + d + (cfg.head_dim / 2)]      = k0 * sin_val + k1 * cos_val;
+                    float k1 = heavy_kbuf[h * cfg.head_dim + d + rope_half];
+                    heavy_kbuf[h * cfg.head_dim + d]             = k0 * rope_cos[d] - k1 * rope_sin[d];
+                    heavy_kbuf[h * cfg.head_dim + d + rope_half] = k0 * rope_sin[d] + k1 * rope_cos[d];
                 }
             }
 
@@ -806,7 +1079,26 @@ int main(int argc, char* argv[]) {
                 // ── Phase 1: Dispatch Currently Available Routed Experts to GPU ──
                 std::memset(routed_out, 0, d_model * sizeof(float));
 
-                const smoe::scout::ExpertPrediction& pred = scout_out.routing[l - moe_start_layer];
+                // Prompt steps: exact routing from the real router gate on
+                // the heavy hidden state (norm_topk_prob re-normalisation
+                // per the Qwen3 spec). Prefetches fire immediately after.
+                // Generation steps: scout-predicted routing as before.
+                if (is_prompt) {
+                    smoe::matvec_bf16(prefill_gate_scores,
+                                      scout.get_gate(l - moe_start_layer),
+                                      heavy_normed,
+                                      cfg.max_experts_per_layer, d_model);
+                    prefill_pred.layer_id = l;
+                    prefill_pred.count = scout.compute_top_k(
+                        prefill_gate_scores, cfg.max_experts_per_layer, 8,
+                        prefill_pred.expert_ids, prefill_pred.expert_weights,
+                        cfg.norm_topk_prob);
+                    for (uint32_t e = 0; e < prefill_pred.count; ++e) {
+                        (void)streamer.prefetch(l, prefill_pred.expert_ids[e]);
+                    }
+                }
+                const smoe::scout::ExpertPrediction& pred =
+                    is_prompt ? prefill_pred : scout_out.routing[l - moe_start_layer];
                 bool executed[16] = {false};
                 uint32_t num_executed = 0;
                 uint64_t spin = 0;
@@ -833,6 +1125,8 @@ int main(int argc, char* argv[]) {
                     smoe::io::RingSlot* slot = streamer.claim_specific(pred.layer_id, pred.expert_ids[e]);
                     if (slot) {
                         active_slots[e] = slot;
+                        if (pred.layer_id < 128 && pred.expert_ids[e] < smoe::prefill::HITS_STRIDE)
+                            g_expert_hits[pred.layer_id * smoe::prefill::HITS_STRIDE + pred.expert_ids[e]]++;
                         if (slot->data_size > 0) {
                             const uint8_t*  packed_gate = slot->data + expert_layout.gate_packed_offset;
                             const uint16_t* scales_gate = reinterpret_cast<const uint16_t*>(slot->data + expert_layout.gate_scales_offset);
@@ -897,6 +1191,8 @@ int main(int argc, char* argv[]) {
                         smoe::io::RingSlot* slot = streamer.claim_specific(pred.layer_id, pred.expert_ids[e]);
                         if (slot) {
                             active_slots[e] = slot;
+                            if (pred.layer_id < 128 && pred.expert_ids[e] < smoe::prefill::HITS_STRIDE)
+                                g_expert_hits[pred.layer_id * smoe::prefill::HITS_STRIDE + pred.expert_ids[e]]++;
                             if (slot->data_size > 0) {
                                 const uint8_t*  packed_gate = slot->data + expert_layout.gate_packed_offset;
                                 const uint16_t* scales_gate = reinterpret_cast<const uint16_t*>(slot->data + expert_layout.gate_scales_offset);
@@ -996,9 +1292,15 @@ if (spin % 10000 == 0) {
             }
             smoe::rms_norm_bf16(heavy_hidden, scout.get_model_norm(), d_model);
 
-            // Execute LM Head on CPU
+            // LM Head: 151936x4096 matvec — GPU when available (the scout
+            // already registered w_lm_head and lm_head_scores with Metal;
+            // heavy_hidden is registered at init above).
             float* scores = scout.get_lm_head_scores();
-            smoe::matvec_bf16(scores, scout.get_lm_head(), heavy_hidden, cfg.vocab_size, d_model);
+            if (metal) {
+                smoe_metal_scout_matvec_bf16(metal, scout.get_lm_head(), heavy_hidden, scores, cfg.vocab_size, d_model);
+            } else {
+                smoe::matvec_bf16(scores, scout.get_lm_head(), heavy_hidden, cfg.vocab_size, d_model);
+            }
 
             // Sample Token
             smoe::SamplerConfig sampler_cfg {
@@ -1008,7 +1310,7 @@ if (spin % 10000 == 0) {
                 .top_k = top_k,
                 .rep_penalty = rep_penalty
             };
-            uint32_t best_tok = smoe::sample_token(scores, sampler_cfg, token_history, history_len, rng);
+            uint32_t best_tok = smoe::sample_token(scores, sampler_cfg, stream_tokens, stream_len, rng);
 
             heavy_cur_token = best_tok;
             if (g_debug) {
@@ -1018,8 +1320,8 @@ if (spin % 10000 == 0) {
                 std::fflush(stderr);
             }
             next_heavy_token = best_tok; // Save for the next contiguous iteration
-            if (history_len < 8192) {
-                token_history[history_len++] = heavy_cur_token;
+            if (stream_len < STREAM_CAP) {
+                stream_tokens[stream_len++] = heavy_cur_token;
             }
         }
         uint32_t expected_scout_token = scout_out.next_token_id;
@@ -1040,16 +1342,20 @@ if (spin % 10000 == 0) {
             sq_size = 0;
             sq_head = 0;
             sq_tail = 0;
-        } else {
-            // Scout guessed correctly (or we are in prompt phase)
-            // Consume the head of the queue.
+        } else if (sq_size > 0) {
+            // Scout guessed correctly — consume the head of the queue.
+            // (During prompt steps the queue stays empty: exact routing
+            // replaces the scout, so there is nothing to consume.)
             sq_head = (sq_head + 1) % MAX_LOOKAHEAD;
             sq_size--;
         }
 
-        // Always prune discarded experts (LRU cache eviction)
-        ActiveExpertsContext act_ctx { scout_queue, sq_head, sq_size, cfg.num_moe_layers, moe_start_layer };
-        streamer.prune_slots(is_expert_active, &act_ctx);
+        // Prune discarded experts (LRU cache eviction) — generation only;
+        // during prefill retention is handled by prefetch()'s lazy eviction.
+        if (!is_prompt) {
+            ActiveExpertsContext act_ctx { scout_queue, sq_head, sq_size, cfg.num_moe_layers, moe_start_layer };
+            streamer.prune_slots(is_expert_active, &act_ctx);
+        }
 
         // ── Step 6: Emit token ────────────────────────────────
         if (is_generating) {
@@ -1078,6 +1384,21 @@ if (spin % 10000 == 0) {
         }
     }
 
+        // ── Request epilogue ──────────────────────────────────
+        // Resume prewarm with the freshly updated popularity histogram:
+        // it re-warms the ring while the user types the next message.
+        save_expert_freq("vault/expert_freq.bin");
+        engine_busy.store(false, std::memory_order_relaxed);
+        prewarm_epoch.fetch_add(1, std::memory_order_relaxed);
+
+        if (serve) {
+            // Terminate the token stream for this request. chat.py reads
+            // token IDs until it sees the <<DONE>> sentinel line.
+            std::printf("\n<<DONE>>\n");
+            std::fflush(stdout);
+        }
+    } // ═══ end REQUEST LOOP ═══
+
     smoe::free_aligned_float(full_kv_cache);
 
     // Final telemetry flush
@@ -1098,6 +1419,9 @@ if (spin % 10000 == 0) {
     }
 
     // ── Shutdown ──────────────────────────────────────────────
+    prewarm_shutdown.store(true, std::memory_order_relaxed);
+    if (prewarm_thread.joinable()) prewarm_thread.join();
+    save_expert_freq("vault/expert_freq.bin");
     streamer.shutdown();
     smoe_metal_destroy(metal);
 

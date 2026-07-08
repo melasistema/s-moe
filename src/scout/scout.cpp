@@ -63,6 +63,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdarg>
+#include <thread>
 
 // POSIX / macOS headers for mmap
 #include <fcntl.h>
@@ -407,6 +408,10 @@ struct Scout::Impl {
     void*    mmap_base { nullptr };
     size_t   mmap_size { 0 };
 
+    // Background page-toucher that streams the mapping in sequentially;
+    // joined in the destructor before munmap.
+    std::thread prefault_thread;
+
     // ── Neural weight storage (float32, pre-allocated) ────────
     // Each array is large enough for the tensor it represents.
     // All allocated as flat C arrays — no std::vector, no new[].
@@ -470,6 +475,12 @@ struct Scout::Impl {
 
     // Attention score buffer [ATTN_CTX]
     float attn_scores[ATTN_CTX] {};
+
+    // RoPE tables [head_dim/2]: angle depends only on (position, dim),
+    // so inv_freq is fixed and cos/sin are refreshed once per forward().
+    float* rope_inv_freq { nullptr };
+    float* rope_cos      { nullptr };
+    float* rope_sin      { nullptr };
 
     // Gate score buffer [cfg.gate_rows()]
     float* gate_scores  { nullptr };
@@ -595,6 +606,20 @@ Scout::Impl::Impl(const char* path, SmoeMetalCtx* metal_ctx, const SmoeHeader* v
     // Data region starts immediately after the JSON header
     const uint8_t* data_region = base + 8 + header_len;
 
+    // Prefault the whole mapping in the background: without this the
+    // 16 GB of trunk weights are demand-paged in essentially random
+    // order during the first prefill (one fault per touched weight row),
+    // which serialises against compute. A sequential touch loop streams
+    // them in at full NVMe bandwidth instead. One read per 16 KB page.
+    ::madvise(mmap_base, mmap_size, MADV_WILLNEED);
+    prefault_thread = std::thread([base, sz = mmap_size]() {
+        volatile uint8_t sink = 0;
+        for (size_t off = 0; off < sz; off += 16384) {
+            sink ^= base[off];
+        }
+        (void)sink;
+    });
+
     info_printf(
         "[scout] Safetensors header: %llu bytes\n",
         static_cast<unsigned long long>(header_len));
@@ -614,6 +639,7 @@ Scout::Impl::Impl(const char* path, SmoeMetalCtx* metal_ctx, const SmoeHeader* v
             cfg.d_model = embed_meta.shape[1];
         } else {
             std::fprintf(stderr, "[scout] ✗ Failed to extract model dimensions.\n");
+            if (prefault_thread.joinable()) prefault_thread.join(); // reads the mapping
             ::munmap(mmap_base, mmap_size); mmap_base = nullptr;
             return;
         }
@@ -703,7 +729,18 @@ Scout::Impl::Impl(const char* path, SmoeMetalCtx* metal_ctx, const SmoeHeader* v
     v_cache              = allocate_aligned_float(total_layers * ATTN_CTX * (cfg.num_kv_heads * cfg.head_dim));
     heavy_echo           = allocate_aligned_float(total_layers * cfg.d_model);
 
-    if (!hidden || !normed || !qbuf || !kbuf || !vbuf || !attn_out || !gate_scores || !gate_scores_batch || !lm_head_scores || !k_cache || !v_cache || !heavy_echo) {
+    rope_inv_freq        = allocate_aligned_float(cfg.head_dim / 2);
+    rope_cos             = allocate_aligned_float(cfg.head_dim / 2);
+    rope_sin             = allocate_aligned_float(cfg.head_dim / 2);
+    if (rope_inv_freq) {
+        for (uint32_t d = 0; d < cfg.head_dim / 2; ++d) {
+            rope_inv_freq[d] = 1.0f / std::pow(cfg.rope_theta,
+                static_cast<float>(d * 2) / static_cast<float>(cfg.head_dim));
+        }
+    }
+
+    if (!hidden || !normed || !qbuf || !kbuf || !vbuf || !attn_out || !gate_scores || !gate_scores_batch || !lm_head_scores || !k_cache || !v_cache || !heavy_echo
+        || !rope_inv_freq || !rope_cos || !rope_sin) {
         ok = false;
     }
     
@@ -863,7 +900,10 @@ Scout::Impl::Impl(const char* path, SmoeMetalCtx* metal_ctx, const SmoeHeader* v
 // ── Impl destructor ───────────────────────────────────────────
 
 Scout::Impl::~Impl() {
-    
+    // The prefault thread reads the mapping — join before munmap.
+    if (prefault_thread.joinable()) {
+        prefault_thread.join();
+    }
 
     if (mmap_base) {
         ::munmap(mmap_base, mmap_size);
@@ -944,6 +984,13 @@ ScoutOutput Scout::Impl::neural_forward(uint32_t token_id) noexcept {
     }
 
     // ── 2. Full 28-Layer Backbone Execution ───────────────────
+    // RoPE rotation for this position, shared by all heads and layers
+    for (uint32_t d = 0; d < cfg.head_dim / 2; ++d) {
+        float angle = static_cast<float>(step) * rope_inv_freq[d];
+        rope_cos[d] = std::cos(angle);
+        rope_sin[d] = std::sin(angle);
+    }
+
     uint32_t total_layers = cfg.num_moe_layers + (cfg.has_dense_layer_0 ? 1 : 0);
     for (uint32_t l = 0; l < total_layers; ++l) {
         
@@ -988,33 +1035,24 @@ ScoutOutput Scout::Impl::neural_forward(uint32_t token_id) noexcept {
             }
         }
 
-        // Apply RoPE to Q — use cfg.rope_theta (10000 for DeepSeek, 1000000 for Qwen3)
+        // Apply RoPE to Q — tables hold the per-position rotation
+        const uint32_t rope_half = cfg.head_dim / 2;
         for (uint32_t h = 0; h < cfg.num_heads; ++h) {
-            for (uint32_t d = 0; d < cfg.head_dim / 2; ++d) {
-                float freq = 1.0f / std::pow(cfg.rope_theta, static_cast<float>(d * 2) / static_cast<float>(cfg.head_dim));
-                float angle = static_cast<float>(step) * freq;
-                float cos_val = std::cos(angle);
-                float sin_val = std::sin(angle);
-                
+            for (uint32_t d = 0; d < rope_half; ++d) {
                 float q0 = qbuf[h * cfg.head_dim + d];
-                float q1 = qbuf[h * cfg.head_dim + d + (cfg.head_dim / 2)];
-                qbuf[h * cfg.head_dim + d]                      = q0 * cos_val - q1 * sin_val;
-                qbuf[h * cfg.head_dim + d + (cfg.head_dim / 2)] = q0 * sin_val + q1 * cos_val;
+                float q1 = qbuf[h * cfg.head_dim + d + rope_half];
+                qbuf[h * cfg.head_dim + d]             = q0 * rope_cos[d] - q1 * rope_sin[d];
+                qbuf[h * cfg.head_dim + d + rope_half] = q0 * rope_sin[d] + q1 * rope_cos[d];
             }
         }
-        
+
         // Apply RoPE to K
         for (uint32_t h = 0; h < cfg.num_kv_heads; ++h) {
-            for (uint32_t d = 0; d < cfg.head_dim / 2; ++d) {
-                float freq = 1.0f / std::pow(cfg.rope_theta, static_cast<float>(d * 2) / static_cast<float>(cfg.head_dim));
-                float angle = static_cast<float>(step) * freq;
-                float cos_val = std::cos(angle);
-                float sin_val = std::sin(angle);
-                
+            for (uint32_t d = 0; d < rope_half; ++d) {
                 float k0 = kbuf[h * cfg.head_dim + d];
-                float k1 = kbuf[h * cfg.head_dim + d + (cfg.head_dim / 2)];
-                kbuf[h * cfg.head_dim + d]                      = k0 * cos_val - k1 * sin_val;
-                kbuf[h * cfg.head_dim + d + (cfg.head_dim / 2)] = k0 * sin_val + k1 * cos_val;
+                float k1 = kbuf[h * cfg.head_dim + d + rope_half];
+                kbuf[h * cfg.head_dim + d]             = k0 * rope_cos[d] - k1 * rope_sin[d];
+                kbuf[h * cfg.head_dim + d + rope_half] = k0 * rope_sin[d] + k1 * rope_cos[d];
             }
         }
 
@@ -1341,6 +1379,12 @@ void Scout::reset_context() {
 
     impl_->step = 0;
     info_printf("[scout] Context reset.\n");
+}
+
+void Scout::sync_position(uint64_t pos) {
+    impl_->ctx_pos  = static_cast<uint32_t>(pos % ATTN_CTX);
+    impl_->ctx_fill = (pos < ATTN_CTX) ? static_cast<uint32_t>(pos) : ATTN_CTX;
+    impl_->step     = pos;
 }
 
 void Scout::rollback(uint32_t steps) {

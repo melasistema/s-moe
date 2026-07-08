@@ -61,9 +61,14 @@ public:
     // Returns next token + expert routing for the current token.
     ScoutOutput forward(uint32_t token_id, bool is_prompt = false);
 
-    // Rollback the internal KV-cache state by K steps to recover from 
+    // Rollback the internal KV-cache state by K steps to recover from
     // speculative divergence.
     void rollback(uint32_t steps);
+
+    // Align the scout's KV ring position and RoPE step with the heavy
+    // stream. Used when the prompt was prefilled without scout forwards
+    // (exact routing) but the KV cache was populated via write_kv_cache.
+    void sync_position(uint64_t pos);
 
     // Reset KV-cache for a new prompt.
     void reset_context();

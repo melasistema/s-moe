@@ -447,6 +447,122 @@ kernel void scout_matvec_bf16(
 
 )MSL";
 
+// Token-batch fused FFN kernels, concatenated after kMetalSource at JIT
+// time so they can reuse TGROUP_SIZE / silu / smoeq*_dequant.
+// Mirror of the batch section appended to kernels.metal — keep in sync.
+static const char* kMetalBatchSource = R"MSL(
+
+struct FusedFFNBatchParams {
+    uint gate_rows;
+    uint gate_cols;
+    uint down_rows;
+    uint down_cols;
+    uint group_size;
+    uint bits;
+    uint batch;
+};
+
+kernel void smoe_gate_up_batch(
+    device const uint8_t*          gate_packed [[buffer(0)]],
+    device const half*             gate_scales [[buffer(1)]],
+    device const uint8_t*          up_packed   [[buffer(2)]],
+    device const half*             up_scales   [[buffer(3)]],
+    device const float*            input_mat   [[buffer(6)]],
+    device       float*            hidden_mat  [[buffer(7)]],
+    constant FusedFFNBatchParams&  params      [[buffer(9)]],
+    uint2                          tg_pos      [[threadgroup_position_in_grid]],
+    uint                           tid         [[thread_index_in_threadgroup]],
+    uint2                          tg_dim      [[threads_per_threadgroup]],
+    threadgroup float*             tg_input    [[threadgroup(0)]])
+{
+    const uint b   = tg_pos.y;
+    const uint row = tg_pos.x * tg_dim.x + tid;
+    device const float* input = input_mat + b * params.gate_cols;
+
+    float gate_acc = 0.0f;
+    float up_acc   = 0.0f;
+    uint tiles = (params.gate_cols + TGROUP_SIZE - 1) / TGROUP_SIZE;
+
+    for (uint t = 0; t < tiles; ++t) {
+        uint col_base = t * TGROUP_SIZE;
+        for (uint i = tid; i < TGROUP_SIZE; i += tg_dim.x) {
+            uint col = col_base + i;
+            tg_input[i] = (col < params.gate_cols) ? input[col] : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        uint tile_end = min(TGROUP_SIZE, params.gate_cols - col_base);
+        if (row < params.gate_rows) {
+            uint wi_base = row * params.gate_cols + col_base;
+            for (uint k = 0; k < tile_end; ++k) {
+                uint wi = wi_base + k;
+                float gw, uw;
+                if (params.bits == 4) {
+                    gw = smoeq4_dequant(gate_packed, gate_scales, wi, params.group_size);
+                    uw = smoeq4_dequant(up_packed,   up_scales,   wi, params.group_size);
+                } else {
+                    gw = smoeq2_dequant(gate_packed, gate_scales, wi, params.group_size);
+                    uw = smoeq2_dequant(up_packed,   up_scales,   wi, params.group_size);
+                }
+                gate_acc += gw * tg_input[k];
+                up_acc   += uw * tg_input[k];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (row < params.gate_rows) {
+        hidden_mat[b * params.gate_rows + row] = silu(gate_acc) * up_acc;
+    }
+}
+
+kernel void smoe_down_batch(
+    device const uint8_t*          down_packed [[buffer(4)]],
+    device const half*             down_scales [[buffer(5)]],
+    device const float*            hidden_mat  [[buffer(7)]],
+    device       float*            output_mat  [[buffer(8)]],
+    constant FusedFFNBatchParams&  params      [[buffer(9)]],
+    uint2                          tg_pos      [[threadgroup_position_in_grid]],
+    uint                           tid         [[thread_index_in_threadgroup]],
+    uint2                          tg_dim      [[threads_per_threadgroup]],
+    threadgroup float*             tg_hidden   [[threadgroup(0)]])
+{
+    const uint b   = tg_pos.y;
+    const uint row = tg_pos.x * tg_dim.x + tid;
+    device const float* hidden = hidden_mat + b * params.down_cols;
+
+    float acc  = 0.0f;
+    uint tiles = (params.down_cols + TGROUP_SIZE - 1) / TGROUP_SIZE;
+
+    for (uint t = 0; t < tiles; ++t) {
+        uint col_base = t * TGROUP_SIZE;
+        for (uint i = tid; i < TGROUP_SIZE; i += tg_dim.x) {
+            uint col = col_base + i;
+            tg_hidden[i] = (col < params.down_cols) ? hidden[col] : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        uint tile_end = min(TGROUP_SIZE, params.down_cols - col_base);
+        if (row < params.down_rows) {
+            uint wi_base = row * params.down_cols + col_base;
+            for (uint k = 0; k < tile_end; ++k) {
+                uint wi = wi_base + k;
+                float dw = (params.bits == 4)
+                    ? smoeq4_dequant(down_packed, down_scales, wi, params.group_size)
+                    : smoeq2_dequant(down_packed, down_scales, wi, params.group_size);
+                acc += dw * tg_hidden[k];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (row < params.down_rows) {
+        output_mat[b * params.down_rows + row] = acc;
+    }
+}
+
+)MSL";
+
 // ═══════════════════════════════════════════════════════════════
 // SmoeMetalCtx — internal implementation struct
 // ═══════════════════════════════════════════════════════════════
@@ -463,6 +579,17 @@ struct SmoeMetalCtx {
     id<MTLComputePipelineState> down_pso     = nil;
     id<MTLComputePipelineState> scout_matvec_pso = nil;
     id<MTLComputePipelineState> scout_matvec_bf16_pso = nil;
+    id<MTLComputePipelineState> gate_up_batch_pso = nil;
+    id<MTLComputePipelineState> down_batch_pso    = nil;
+
+    // Token-batch fused FFN staging (layer-major prefill):
+    //   batch_in  [SMOE_MAX_FFN_BATCH × gate_cols]
+    //   batch_hid [SMOE_MAX_FFN_BATCH × gate_rows]
+    //   batch_out [SMOE_MAX_FFN_BATCH × down_rows]
+    // Dim cap: SMOE_MAX_FFN_BATCH_DIM floats per row.
+    id<MTLBuffer>               batch_in_buf     = nil;
+    id<MTLBuffer>               batch_hidden_buf = nil;
+    id<MTLBuffer>               batch_out_buf    = nil;
 
     // Ping-pong UMA buffers
     // buf_a = active (GPU executing)
@@ -555,7 +682,8 @@ SmoeMetalCtx* smoe_metal_init(size_t slot_bytes) {
     info_printf("[smoe_metal] Compiling SMOE-Q2 kernels (JIT)...\n");
 
     NSError*  err    = nil;
-    NSString* source = [NSString stringWithUTF8String:kMetalSource];
+    NSString* source = [[NSString stringWithUTF8String:kMetalSource]
+        stringByAppendingString:[NSString stringWithUTF8String:kMetalBatchSource]];
 
     MTLCompileOptions* opts = [[MTLCompileOptions alloc] init];
     opts.languageVersion = MTLLanguageVersion3_1;
@@ -652,6 +780,26 @@ SmoeMetalCtx* smoe_metal_init(size_t slot_bytes) {
         return nullptr;
     }
     ctx->scout_matvec_bf16_pso = scout_matvec_bf16_pso;
+
+    // Token-batch FFN: non-fatal if unavailable — callers fall back to
+    // the per-token fused FFN path when these PSOs/buffers are nil.
+    ctx->gate_up_batch_pso = make_pso(dev, lib, "smoe_gate_up_batch", &err);
+    ctx->down_batch_pso    = make_pso(dev, lib, "smoe_down_batch", &err);
+    if (ctx->gate_up_batch_pso && ctx->down_batch_pso) {
+        // Row cap is SMOE_MAX_FFN_BATCH_DIM floats; ~4 MB per plane at
+        // 64 × 16384 × 4 B. Shared-mode: CPU memcpy in, GPU writes out.
+        size_t plane = size_t(SMOE_MAX_FFN_BATCH) * SMOE_MAX_FFN_BATCH_DIM * sizeof(float);
+        ctx->batch_in_buf     = [dev newBufferWithLength:plane options:uma];
+        ctx->batch_hidden_buf = [dev newBufferWithLength:plane options:uma];
+        ctx->batch_out_buf    = [dev newBufferWithLength:plane options:uma];
+        if (!ctx->batch_in_buf || !ctx->batch_hidden_buf || !ctx->batch_out_buf) {
+            std::fprintf(stderr, "[smoe_metal] WARN: batch FFN staging alloc failed — per-token path only.\n");
+            ctx->gate_up_batch_pso = nil;
+            ctx->down_batch_pso    = nil;
+        }
+    } else {
+        std::fprintf(stderr, "[smoe_metal] WARN: batch FFN PSOs unavailable — per-token path only.\n");
+    }
 
     ctx->buf_a       = buf_a;
     ctx->buf_b       = buf_b;
@@ -822,6 +970,109 @@ void smoe_metal_wait(SmoeMetalCtx* ctx, void* handle, float* output_vec, uint32_
         std::this_thread::yield();
     }
     std::memcpy(output_vec, ((float*)[ctx->output_buf contents]) + expert_index * ctx->max_rows, cols * sizeof(float));
+}
+
+void* smoe_metal_fused_ffn_batch(SmoeMetalCtx*   ctx,
+                                 const uint8_t*  packed_gate,
+                                 const uint16_t* scales_gate,
+                                 const uint8_t*  packed_up,
+                                 const uint16_t* scales_up,
+                                 const uint8_t*  packed_down,
+                                 const uint16_t* scales_down,
+                                 const float*    input_mat,
+                                 uint32_t        batch,
+                                 uint32_t        gate_rows,
+                                 uint32_t        gate_cols,
+                                 uint32_t        down_rows,
+                                 uint32_t        down_cols,
+                                 uint32_t        group_size,
+                                 uint32_t        bits)
+{
+    if (!ctx || !ctx->gate_up_batch_pso || batch == 0 ||
+        batch > SMOE_MAX_FFN_BATCH ||
+        gate_rows > SMOE_MAX_FFN_BATCH_DIM || gate_cols > SMOE_MAX_FFN_BATCH_DIM ||
+        down_rows > SMOE_MAX_FFN_BATCH_DIM || down_cols > SMOE_MAX_FFN_BATCH_DIM) {
+        return nullptr; // caller falls back to the per-token path
+    }
+
+    struct FusedFFNBatchParamsC {
+        uint32_t gate_rows, gate_cols, down_rows, down_cols, group_size, bits, batch;
+    };
+    FusedFFNBatchParamsC params { gate_rows, gate_cols, down_rows, down_cols,
+                                  group_size, bits, batch };
+
+    @autoreleasepool {
+        uint64_t packed_bytes = static_cast<uint64_t>(gate_rows) * gate_cols * bits / 8;
+        uint64_t scale_bytes  = static_cast<uint64_t>(gate_rows) * gate_cols / group_size * sizeof(uint16_t);
+
+        NSUInteger off_gp = 0, off_gs = 0, off_up = 0, off_us = 0, off_dp = 0, off_ds = 0;
+        id<MTLBuffer> buf_gp = get_registered_buffer(ctx, packed_gate,  packed_bytes, off_gp);
+        id<MTLBuffer> buf_gs = get_registered_buffer(ctx, scales_gate,  scale_bytes,  off_gs);
+        id<MTLBuffer> buf_up = get_registered_buffer(ctx, packed_up,    packed_bytes, off_up);
+        id<MTLBuffer> buf_us = get_registered_buffer(ctx, scales_up,    scale_bytes,  off_us);
+        id<MTLBuffer> buf_dp = get_registered_buffer(ctx, packed_down,  packed_bytes, off_dp);
+        id<MTLBuffer> buf_ds = get_registered_buffer(ctx, scales_down,  scale_bytes,  off_ds);
+
+        std::memcpy([ctx->batch_in_buf contents], input_mat,
+                    static_cast<size_t>(batch) * gate_cols * sizeof(float));
+
+        id<MTLCommandBuffer>         cmd = [ctx->queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+
+        // Pass 1: gate+up+SiLU for all batch rows of this expert
+        [enc setComputePipelineState:ctx->gate_up_batch_pso];
+        [enc setBuffer:buf_gp offset:off_gp atIndex:0];
+        [enc setBuffer:buf_gs offset:off_gs atIndex:1];
+        [enc setBuffer:buf_up offset:off_up atIndex:2];
+        [enc setBuffer:buf_us offset:off_us atIndex:3];
+        [enc setBuffer:ctx->batch_in_buf     offset:0 atIndex:6];
+        [enc setBuffer:ctx->batch_hidden_buf offset:0 atIndex:7];
+        [enc setBytes:&params length:sizeof(params) atIndex:9];
+        [enc setThreadgroupMemoryLength:256 * 2 * sizeof(float) atIndex:0];
+        {
+            MTLSize tg   = MTLSizeMake(256, 1, 1);
+            MTLSize grid = MTLSizeMake((gate_rows + 255) / 256, batch, 1);
+            [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
+        }
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        // Pass 2: down projection for all batch rows
+        [enc setComputePipelineState:ctx->down_batch_pso];
+        [enc setBuffer:buf_dp offset:off_dp atIndex:4];
+        [enc setBuffer:buf_ds offset:off_ds atIndex:5];
+        [enc setBuffer:ctx->batch_hidden_buf offset:0 atIndex:7];
+        [enc setBuffer:ctx->batch_out_buf    offset:0 atIndex:8];
+        [enc setBytes:&params length:sizeof(params) atIndex:9];
+        [enc setThreadgroupMemoryLength:256 * 2 * sizeof(float) atIndex:0];
+        {
+            MTLSize tg   = MTLSizeMake(256, 1, 1);
+            MTLSize grid = MTLSizeMake((down_rows + 255) / 256, batch, 1);
+            [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
+        }
+        [enc endEncoding];
+
+        [cmd addCompletedHandler:^(id<MTLCommandBuffer> buffer) {
+            ctx->dispatch_count.fetch_add(1, std::memory_order_relaxed);
+        }];
+
+        ctx->signaled_value++;
+        uint64_t wait_val = ctx->signaled_value;
+        [cmd encodeSignalEvent:ctx->shared_event value:wait_val];
+        [cmd commit];
+
+        return (void*)(uintptr_t)wait_val;
+    }
+}
+
+void smoe_metal_wait_ffn_batch(SmoeMetalCtx* ctx, void* handle,
+                               float* out_mat, uint32_t batch, uint32_t cols) {
+    if (!ctx || !handle) return;
+    uint64_t val = (uint64_t)(uintptr_t)handle;
+    while (ctx->shared_event.signaledValue < val) {
+        std::this_thread::yield();
+    }
+    std::memcpy(out_mat, [ctx->batch_out_buf contents],
+                static_cast<size_t>(batch) * cols * sizeof(float));
 }
 
 void smoe_metal_swap_buffers(SmoeMetalCtx* ctx) {

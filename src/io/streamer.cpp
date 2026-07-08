@@ -441,30 +441,19 @@ bool Streamer::prefetch(uint32_t layer_id, uint32_t expert_id) noexcept {
         }
     }
 
-    // ── Evict a CONSUMED slot if no EMPTY slot ─────────
-    if (!slot) {
-        for (uint32_t i = 0; i < im.ring_sz; ++i) {
-            SlotState expected = SlotState::CONSUMED;
-            if (im.slots[i].state.compare_exchange_strong(
-                    expected, SlotState::LOADING,
-                    std::memory_order_acquire,
-                    std::memory_order_relaxed))
-            {
-                slot = &im.slots[i];
-                break;
-            }
-        }
-    }
-
-    // ── Evict a stale READY slot (LRU) if still no slot ──
-    // This prevents deadlock when all slots are READY but none
-    // match the experts we need for the current token.
+    // ── Evict the least-recently-used idle slot if none EMPTY ──
+    // Considers CONSUMED and READY slots alike, but ONLY with
+    // ref_count == 0: a CONSUMED slot with a live reference is still
+    // being read by the GPU — evicting it (as the old first-fit
+    // CONSUMED scan did) lets the worker pread() over data mid-kernel.
+    // LRU order matters now that the ring retains slots across tokens
+    // as a cache instead of being mass-pruned every step.
     if (!slot) {
         uint64_t oldest_tick = UINT64_MAX;
         int best_idx = -1;
         for (uint32_t i = 0; i < im.ring_sz; ++i) {
             SlotState s = im.slots[i].state.load(std::memory_order_relaxed);
-            if (s == SlotState::READY &&
+            if ((s == SlotState::CONSUMED || s == SlotState::READY) &&
                 im.slots[i].ref_count.load(std::memory_order_relaxed) == 0)
             {
                 uint64_t tick = im.slots[i].last_used_tick.load(std::memory_order_relaxed);
@@ -475,8 +464,10 @@ bool Streamer::prefetch(uint32_t layer_id, uint32_t expert_id) noexcept {
             }
         }
         if (best_idx >= 0) {
-            SlotState expected = SlotState::READY;
-            if (im.slots[best_idx].state.compare_exchange_strong(
+            SlotState expected =
+                im.slots[best_idx].state.load(std::memory_order_relaxed);
+            if ((expected == SlotState::CONSUMED || expected == SlotState::READY) &&
+                im.slots[best_idx].state.compare_exchange_strong(
                     expected, SlotState::LOADING,
                     std::memory_order_acquire,
                     std::memory_order_relaxed))
@@ -494,6 +485,12 @@ bool Streamer::prefetch(uint32_t layer_id, uint32_t expert_id) noexcept {
     slot->layer_id = layer_id;
     slot->expert_id = expert_id;
     slot->ref_count.store(0, std::memory_order_relaxed);
+    // Fresh tick: without this a newly loaded slot keeps its previous
+    // occupant's (old) tick and becomes the LRU eviction victim before
+    // it is ever read — a large prefetch burst then evicts its own head.
+    slot->last_used_tick.store(
+        im.global_tick.fetch_add(1, std::memory_order_relaxed),
+        std::memory_order_relaxed);
 
     // ── Enqueue the request ───────────────────────────────────
     if (!im.request_queue.push({ layer_id, expert_id, slot })) {
@@ -526,13 +523,30 @@ RingSlot* Streamer::claim_specific(uint32_t layer_id, uint32_t expert_id) noexce
     Impl& im = *impl_;
     for (uint32_t i = 0; i < im.ring_sz; ++i) {
         if (im.slots[i].layer_id == layer_id && im.slots[i].expert_id == expert_id) {
-            // Only claim slots in READY state — CONSUMED slots may be
-            // mid-eviction or have stale data from a prior use.
             SlotState expected = SlotState::READY;
             if (im.slots[i].state.compare_exchange_strong(
                     expected, SlotState::CONSUMED,
                     std::memory_order_acquire,
                     std::memory_order_relaxed))
+            {
+                im.slots[i].ref_count.fetch_add(1, std::memory_order_relaxed);
+                im.slots[i].last_used_tick.store(
+                    im.global_tick.fetch_add(1, std::memory_order_relaxed),
+                    std::memory_order_relaxed);
+                return &im.slots[i];
+            }
+
+            // Retained-cache hit: release() leaves slots CONSUMED with their
+            // data intact (only eviction/prune wipes it). Re-claiming an idle
+            // populated slot is what makes the ring an actual LRU cache —
+            // without it, prefetch()'s idempotency check ("already in ring")
+            // plus a CONSUMED-only slot deadlocks the claim spin-loop.
+            // Safe without CAS on state: eviction (inside prefetch) and
+            // claiming both run on the caller thread only; workers only ever
+            // transition LOADING→READY.
+            if (expected == SlotState::CONSUMED &&
+                im.slots[i].ref_count.load(std::memory_order_relaxed) == 0 &&
+                im.slots[i].data_size > 0)
             {
                 im.slots[i].ref_count.fetch_add(1, std::memory_order_relaxed);
                 im.slots[i].last_used_tick.store(

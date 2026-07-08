@@ -392,3 +392,122 @@ kernel void scout_matvec_bf16(
         output[row] = acc;
     }
 }
+
+// ═══════════════════════════════════════════════════════════════
+// Token-batch fused FFN (layer-major prefill)
+// ═══════════════════════════════════════════════════════════════
+// One dispatch applies one expert to `batch` token activations:
+// grid = (ceil(rows/256), batch). Row-major matrices:
+//   input  [batch × gate_cols]   hidden [batch × gate_rows]
+//   output [batch × down_rows]
+// NOTE: like the kernels above, this source is duplicated as an
+// embedded string in metal_bridge.mm (kMetalBatchSource) — keep in sync.
+
+struct FusedFFNBatchParams {
+    uint gate_rows;
+    uint gate_cols;
+    uint down_rows;
+    uint down_cols;
+    uint group_size;
+    uint bits;
+    uint batch;
+};
+
+kernel void smoe_gate_up_batch(
+    device const uint8_t*          gate_packed [[buffer(0)]],
+    device const half*             gate_scales [[buffer(1)]],
+    device const uint8_t*          up_packed   [[buffer(2)]],
+    device const half*             up_scales   [[buffer(3)]],
+    device const float*            input_mat   [[buffer(6)]],
+    device       float*            hidden_mat  [[buffer(7)]],
+    constant FusedFFNBatchParams&  params      [[buffer(9)]],
+    uint2                          tg_pos      [[threadgroup_position_in_grid]],
+    uint                           tid         [[thread_index_in_threadgroup]],
+    uint2                          tg_dim      [[threads_per_threadgroup]],
+    threadgroup float*             tg_input    [[threadgroup(0)]])
+{
+    const uint b   = tg_pos.y;
+    const uint row = tg_pos.x * tg_dim.x + tid;
+    device const float* input = input_mat + b * params.gate_cols;
+
+    float gate_acc = 0.0f;
+    float up_acc   = 0.0f;
+    uint tiles = (params.gate_cols + TGROUP_SIZE - 1) / TGROUP_SIZE;
+
+    for (uint t = 0; t < tiles; ++t) {
+        uint col_base = t * TGROUP_SIZE;
+        for (uint i = tid; i < TGROUP_SIZE; i += tg_dim.x) {
+            uint col = col_base + i;
+            tg_input[i] = (col < params.gate_cols) ? input[col] : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        uint tile_end = min(TGROUP_SIZE, params.gate_cols - col_base);
+        if (row < params.gate_rows) {
+            uint wi_base = row * params.gate_cols + col_base;
+            for (uint k = 0; k < tile_end; ++k) {
+                uint wi = wi_base + k;
+                float gw, uw;
+                if (params.bits == 4) {
+                    gw = smoeq4_dequant(gate_packed, gate_scales, wi, params.group_size);
+                    uw = smoeq4_dequant(up_packed,   up_scales,   wi, params.group_size);
+                } else {
+                    gw = smoeq2_dequant(gate_packed, gate_scales, wi, params.group_size);
+                    uw = smoeq2_dequant(up_packed,   up_scales,   wi, params.group_size);
+                }
+                gate_acc += gw * tg_input[k];
+                up_acc   += uw * tg_input[k];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (row < params.gate_rows) {
+        hidden_mat[b * params.gate_rows + row] = silu(gate_acc) * up_acc;
+    }
+}
+
+kernel void smoe_down_batch(
+    device const uint8_t*          down_packed [[buffer(4)]],
+    device const half*             down_scales [[buffer(5)]],
+    device const float*            hidden_mat  [[buffer(7)]],
+    device       float*            output_mat  [[buffer(8)]],
+    constant FusedFFNBatchParams&  params      [[buffer(9)]],
+    uint2                          tg_pos      [[threadgroup_position_in_grid]],
+    uint                           tid         [[thread_index_in_threadgroup]],
+    uint2                          tg_dim      [[threads_per_threadgroup]],
+    threadgroup float*             tg_hidden   [[threadgroup(0)]])
+{
+    const uint b   = tg_pos.y;
+    const uint row = tg_pos.x * tg_dim.x + tid;
+    device const float* hidden = hidden_mat + b * params.down_cols;
+
+    float acc  = 0.0f;
+    uint tiles = (params.down_cols + TGROUP_SIZE - 1) / TGROUP_SIZE;
+
+    for (uint t = 0; t < tiles; ++t) {
+        uint col_base = t * TGROUP_SIZE;
+        for (uint i = tid; i < TGROUP_SIZE; i += tg_dim.x) {
+            uint col = col_base + i;
+            tg_hidden[i] = (col < params.down_cols) ? hidden[col] : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        uint tile_end = min(TGROUP_SIZE, params.down_cols - col_base);
+        if (row < params.down_rows) {
+            uint wi_base = row * params.down_cols + col_base;
+            for (uint k = 0; k < tile_end; ++k) {
+                uint wi = wi_base + k;
+                float dw = (params.bits == 4)
+                    ? smoeq4_dequant(down_packed, down_scales, wi, params.group_size)
+                    : smoeq2_dequant(down_packed, down_scales, wi, params.group_size);
+                acc += dw * tg_hidden[k];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (row < params.down_rows) {
+        output_mat[b * params.down_rows + row] = acc;
+    }
+}

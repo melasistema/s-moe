@@ -31,6 +31,7 @@ struct EngineConfig {
     std::vector<uint32_t> eos_ids = {151645, 151643};
     bool        debug       = false;
     bool        raw_ids     = false;
+    bool        serve       = false;
     bool        valid       = true;
 };
 
@@ -54,6 +55,8 @@ static inline void print_usage(const char* argv0) {
         "    --workers <N>       I/O worker thread count (default: %u)\n"
         "    --slot-mb <N>       Bytes per ring slot, MB (default: %llu)\n"
         "    --raw-ids           Print raw token IDs as integers instead of text\n"
+        "    --serve             Persistent server mode: read GEN/RESET requests\n"
+        "                        on stdin, reuse KV cache across requests\n"
         "\n"
         "  Example:\n"
         "    %s --vault vault/deepseek.smoe --prompt \"Explain MoE routing\" --tokens 200\n"
@@ -97,6 +100,7 @@ static inline EngineConfig parse_args(int argc, char* argv[]) {
         }
         else if (std::strcmp(argv[i], "--debug") == 0) { cfg.debug = true; }
         else if (std::strcmp(argv[i], "--raw-ids") == 0) { cfg.raw_ids = true; }
+        else if (std::strcmp(argv[i], "--serve") == 0) { cfg.serve = true; }
         else if (std::strcmp(argv[i], "--help") == 0 ||
                  std::strcmp(argv[i], "-h")     == 0) {
             print_usage(argv[0]);
@@ -105,8 +109,8 @@ static inline EngineConfig parse_args(int argc, char* argv[]) {
         }
     }
 
-    if (!cfg.vault_path || (!cfg.prompt_text && !cfg.tokens_in)) {
-        std::fprintf(stderr, "\n  ✗  --vault and either --prompt or --tokens-in are required.\n");
+    if (!cfg.vault_path || (!cfg.prompt_text && !cfg.tokens_in && !cfg.serve)) {
+        std::fprintf(stderr, "\n  ✗  --vault and either --prompt, --tokens-in or --serve are required.\n");
         print_usage(argv[0]);
         cfg.valid = false;
         return cfg;
