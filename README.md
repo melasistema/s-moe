@@ -22,7 +22,7 @@ Standard models blast inputs into monolithic weights and hope they fit in RAM. W
 
 S-MoE splits monolithic models into a similar acoustic sensor array:
 
-1. **The Surface Scout (The EM Strike):** A lightweight, highly efficient 1.5B parameter model sitting permanently in memory (~3GB). As it processes your prompt, it acts as a temporal oracle—calculating the semantic trajectory to predict exactly which specialized experts will be needed 5 to 10 tokens into the future. It computes the "sound" the model will make before the generation loop even gets there.
+1. **The Surface Scout (The EM Strike):** The model's own dense backbone — embeddings, attention, norms, routing gates (~16GB in bfloat16 for Qwen3-235B) — sitting permanently in Unified Memory. During generation it acts as a temporal oracle, running speculatively ahead to predict which specialized experts the heavy model will summon next. During prompt prefill it stands down entirely: the routing is computed *exactly* from the true hidden state, because a known future needs no prophet.
 2. **The Deep Strata (The Rock):** The massive 235B parameters rest cold on the SSD, shattered into custom page-aligned binary segments perfectly aligned to the Apple Silicon 16KB hardware boundary.
 3. **The Acoustic Receiver (The JIT Pump):** Guided by the Scout's phonon map, specialized background workers read data asynchronously using Direct I/O (`F_NOCACHE`), completely bypassing sluggish OS page caches. The incoming experts are packed into a cyclic ring buffer fractions of a second before the Metal GPU executes them, keeping total system RAM footprint incredibly low.
 
@@ -37,17 +37,24 @@ S-MoE splits monolithic models into a similar acoustic sensor array:
 
 ## Architectural Layout Overview
 * `scripts/shatter_moe.py`: Offline pre-processing utility that slices monolithic model weights into aligned, discrete expert components.
-* `src/io/streamer.cpp`: High-speed asynchronous storage pipeline that handles multi-threaded, unbuffered file reads.
-* `src/compute/metal_bridge.mm`: The operational execution nexus, swapping active memory pointers directly into the Apple GPU ring.
+* `src/io/streamer.cpp`: High-speed asynchronous storage pipeline that handles multi-threaded, unbuffered file reads — its ring buffer doubles as a true LRU expert cache.
+* `src/prefill.cpp`: Layer-major batched prefill — prompt chunks traverse the model layer by layer, each layer's deduplicated expert union read from the vault exactly once.
+* `src/compute/metal_bridge.mm`: The operational execution nexus, swapping active memory pointers directly into the Apple GPU ring, with token-batch fused FFN kernels for prefill.
+* `chat.py`: The thin Python console — tokenization and display only. It speaks to one persistent engine process per session over a line protocol.
 
 ---
 
 ## Current Status
-S-MoE has reached a fully operational **Qwen3-235B** pipeline with a purely Data-Oriented C++ architecture.
-- **Architectural Masterpiece:** The core execution loop in `main.cpp` is completely devoid of OOP bloat, executing the forward pass linearly via pure functions and C-structs.
-- **Dynamic Topology:** Safely routes 128 fine-grained MoE experts via the 1.5B Scout model, streaming exactly what is needed for Qwen3-235B. 
+S-MoE has reached a fully operational **Qwen3-235B** pipeline with a purely Data-Oriented C++ architecture — and, after the utopian latency refactor, it is no longer just *running* the frontier; it is running it **3× faster to first token**.
+
+- **Layer-Major Batched Prefill:** Prompt chunks traverse the model layer by layer with exact router-gate evaluation; each layer's deduplicated expert union is read from NVMe once per chunk instead of once per token. Cold time-to-first-token on a 45-token prompt: **92.7s → 32.4s**, bit-identical output.
+- **Persistent Serve Mode:** One engine process per *session*, not per turn. The KV-cache, expert ring, and Scout state survive across turns; each message prefills only its new suffix (longest-common-prefix contract). Follow-up turns answer in **~14s flat** — no longer growing with conversation length.
+- **The Ring is a Cache:** Released expert slots are retained with valid data and re-claimed as LRU cache hits; eviction respects live GPU references. The old regime evicted the entire ring every prompt token.
+- **GPU-Resident Hot Path:** The heavy LM head runs on Metal (decode **0.48 → 0.70 t/s**), token-batch fused FFN kernels apply one expert to a whole chunk in a single dispatch, and prompt positions that cannot emit a token skip the LM head and sampler entirely.
+- **Dynamic Topology:** Safely routes 128 fine-grained MoE experts per layer — exact routing during prefill, Scout speculation during generation — streaming exactly what is needed for Qwen3-235B.
 - **Q4 Quantisation:** 4-bit Apple Metal shaders efficiently unpack weights directly in the GPU registers, avoiding the mathematical collapse of 2-bit uniform quantization on fine-grained architectures.
-- **Zero-Allocation:** KV-caches and context windows are managed entirely in static/aligned memory, strictly preserving the **zero runtime heap allocation** invariant.
+- **Zero-Allocation:** KV-caches, context windows, and all prefill activation planes are managed entirely in static/aligned memory, strictly preserving the **zero runtime heap allocation** invariant.
+- **Self-Learning Cache:** Expert claim frequencies persist to `vault/expert_freq.bin`; an idle-time prewarm streams the historically hottest experts into the ring while the user types — machinery that comes into its own as ring capacity grows (Q2 vaults).
 
 ---
 
