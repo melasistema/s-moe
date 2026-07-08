@@ -2,6 +2,19 @@
 
 > **Rock, Paper, Silicon.** A rebellious attempt to shatter the "Monolithic Delusion" of Silicon Valley gatekeepers. S-MoE enables high-fidelity frontier LLM inference completely within the democratic boundaries of a standard 32/48 GB Apple Silicon MacBook — the 235B frontier's dense backbone alone weighs ~16 GB, the price of admission just to turn it on. On 16 GB machines, the same architecture rules over smaller fine-grained MoE models.
 
+<div align="center">
+
+### The Cartography of the Mountain
+
+Every byte, every struct field, every atomic flag — mapped, explained, and public.
+No secrets. No priesthood. A door in the memory wall, and the map to walk through it.
+
+**[docs.s-moe.com](https://docs.s-moe.com/)**
+
+*The Guide · The Phonon Metaphor · The Internals · The Manifesto*
+
+</div>
+
 ---
 
 ## The Monolithic Delusion
@@ -61,5 +74,7 @@ S-MoE has reached a fully operational **Qwen3-235B** pipeline with a purely Data
 ## License
 
 S-MoE is open-source software licensed under the [MIT license](LICENSE).
+
+The code lives here. The philosophy, the architecture, and the honest mistakes live at **[docs.s-moe.com](https://docs.s-moe.com/)**.
 
 Built by [Luca Visciola](https://github.com/melasistema) and an AI agent who hopefully knows C++ and low level programming, because i do not 😅.
