@@ -1,6 +1,6 @@
 # S-MoE: Seismic Mixture of Experts Engine
 
-> **Rock, Paper, Silicon.** A rebellious attempt to shatter the "Monolithic Delusion" of Silicon Valley gatekeepers. S-MoE enables high-fidelity frontier LLM inference completely within the democratic boundaries of a standard 16GB/32GB Apple Silicon MacBook.
+> **Rock, Paper, Silicon.** A rebellious attempt to shatter the "Monolithic Delusion" of Silicon Valley gatekeepers. S-MoE enables high-fidelity frontier LLM inference completely within the democratic boundaries of a standard 32/48 GB Apple Silicon MacBook — the 235B frontier's dense backbone alone weighs ~16 GB, the price of admission just to turn it on. On 16 GB machines, the same architecture rules over smaller fine-grained MoE models.
 
 ---
 
