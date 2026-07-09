@@ -32,6 +32,8 @@
 #include <cstring>
 #include <fcntl.h>
 #include <mach/mach.h>
+#include <sys/stat.h>
+#include <sys/sysctl.h>
 #include <thread>
 #include <unistd.h>
 #include <random>
@@ -321,9 +323,13 @@ int main(int argc, char* argv[]) {
     //   the expert table for the maximum padded_size and round up to 16 KB.
     //   The user can override with --slot-mb.
     //
-    // ring_size: target ≤ 25% of available physical RAM for the ring pool
-    //   so the OS is never pressured into OOM-killing us. On a 16 GB machine
-    //   this yields ~3 GB for the ring; on a 128 GB machine, ~24 GB.
+    // ring_size: subtractive budget — take the OS's own available-memory
+    //   estimate (kern.memorystatus_level, the signal `memory_pressure -Q`
+    //   prints) and reserve what the rest of the engine needs: the scout
+    //   mmap (fully resident after background prefault), a fixed engine
+    //   overhead, and an OS floor. Everything else becomes ring. The old
+    //   flat "25% of free+inactive" budget missed evictable file-backed
+    //   pages and left ~15 GB of a 48 GB machine idle.
     //   Minimum ring = 8 × num_active_experts (8 per layer) = 64 slots minimum.
     //   The user can override with --ring.
     {
@@ -353,10 +359,17 @@ int main(int argc, char* argv[]) {
                 (unsigned long long)(max_padded / 1024));
         }
 
-        // ── 2. Ring size: use 25% of free physical RAM ─────────
+        // ── 2. Ring size: available RAM minus the engine's fixed costs ──
         if (ring_size == 0) {
-            // Query available RAM via host_statistics64
-            uint64_t free_bytes = 0;
+            const uint64_t GB = 1024ULL * 1024 * 1024;
+
+            // (a) Availability. Primary signal: kern.memorystatus_level —
+            // the percentage of RAM the OS reports as usable before memory
+            // pressure. Unlike free+inactive page counts it includes
+            // evictable file-backed pages (e.g. a previous run's scout
+            // mmap), which is most reclaimable memory on a warm machine.
+            // Fallback: the old free+inactive scan.
+            uint64_t vmstat_avail = 0;
             vm_statistics64_data_t vmstat {};
             mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
             if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
@@ -364,24 +377,63 @@ int main(int argc, char* argv[]) {
                                   &count) == KERN_SUCCESS) {
                 // free_count includes pages that are available without swapping
                 uint64_t page_sz = static_cast<uint64_t>(vm_page_size);
-                free_bytes = (static_cast<uint64_t>(vmstat.free_count) +
-                              static_cast<uint64_t>(vmstat.inactive_count)) * page_sz;
+                vmstat_avail = (static_cast<uint64_t>(vmstat.free_count) +
+                                static_cast<uint64_t>(vmstat.inactive_count)) * page_sz;
             }
-            if (free_bytes < 512ULL * 1024 * 1024)
-                free_bytes = 512ULL * 1024 * 1024; // assume at least 512 MB
+            if (vmstat_avail < 512ULL * 1024 * 1024)
+                vmstat_avail = 512ULL * 1024 * 1024; // assume at least 512 MB
+
+            uint64_t mem_total = 0;
+            size_t   sc_len    = sizeof(mem_total);
+            if (::sysctlbyname("hw.memsize", &mem_total, &sc_len, nullptr, 0) != 0)
+                mem_total = 0;
+
+            uint64_t avail_bytes = 0;
+            uint32_t mem_level   = 0;
+            sc_len = sizeof(mem_level);
+            if (mem_total &&
+                ::sysctlbyname("kern.memorystatus_level", &mem_level, &sc_len, nullptr, 0) == 0 &&
+                mem_level > 0 && mem_level <= 100) {
+                avail_bytes = mem_total / 100 * mem_level;
+            }
+            if (avail_bytes == 0) avail_bytes = vmstat_avail;
+
+            // (b) Reserve what the ring must never take:
+            //   - the scout file: background prefault makes it fully resident
+            //   - fixed engine overhead: KV cache + activations + Metal scratch
+            //   - an OS floor of 1/8 physical RAM (≥ 4 GB) so ring growth can
+            //     never push the system into swap
+            uint64_t scout_bytes = 0;
+            if (scout_path) {
+                struct stat sst {};
+                if (::stat(scout_path, &sst) == 0)
+                    scout_bytes = static_cast<uint64_t>(sst.st_size);
+            }
+            uint64_t os_floor = mem_total ? std::max(mem_total / 8, 4 * GB) : 4 * GB;
+            uint64_t reserve  = scout_bytes + 3 * GB + os_floor;
+
+            // (c) Budget: subtractive, floored at the old 25%-of-free tuner
+            // (never regress), capped at half of physical RAM (the pool is
+            // wrapped in a single MTLBuffer — stay clear of device limits).
+            uint64_t legacy_budget = vmstat_avail / 4;
+            uint64_t ring_budget   = (avail_bytes > reserve) ? (avail_bytes - reserve)
+                                                             : legacy_budget;
+            if (ring_budget < legacy_budget) ring_budget = legacy_budget;
+            if (mem_total && ring_budget > mem_total / 2) ring_budget = mem_total / 2;
 
             uint64_t slot_bytes_now = slot_mb * 1024ULL * 1024ULL;
-            uint64_t ring_budget    = free_bytes / 4; // 25% of free RAM
             uint32_t auto_ring      = static_cast<uint32_t>(ring_budget / slot_bytes_now);
 
             // Clamp: minimum 64 (one full token's experts + spare), maximum 4096
             if (auto_ring < 64)   auto_ring = 64;
             if (auto_ring > 4096) auto_ring = 4096;
             ring_size = auto_ring;
-            std::fprintf(stderr, "[ring] Auto ring size : %u slots × %llu MB = %.1f GB  (free RAM: %.1f GB)\n",
+            std::fprintf(stderr, "[ring] Auto ring size : %u slots × %llu MB = %.1f GB  (avail: %.1f GB, reserved: %.1f GB, level: %u%%)\n",
                 ring_size, (unsigned long long)slot_mb,
                 static_cast<double>(ring_size) * slot_mb / 1024.0,
-                static_cast<double>(free_bytes) / (1024.0*1024*1024));
+                static_cast<double>(avail_bytes) / (1024.0*1024*1024),
+                static_cast<double>(reserve) / (1024.0*1024*1024),
+                mem_level);
         }
     }
 
