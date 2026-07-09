@@ -96,7 +96,13 @@ public:
     // LOADING or READY in the ring (no duplicate load).
     // Returns false under back-pressure (ring saturated or queue full).
     // Non-blocking. Zero allocations.
-    [[nodiscard]] bool prefetch(uint32_t layer_id, uint32_t expert_id) noexcept;
+    //
+    // speculative=true routes the request through a second, strictly
+    // lower-priority queue: workers only pop it when the demand queue
+    // is empty, so speculative reads (next-token expert bets) can never
+    // starve the demand fetches the current layer is spinning on.
+    [[nodiscard]] bool prefetch(uint32_t layer_id, uint32_t expert_id,
+                                bool speculative = false) noexcept;
 
     // Claim the next READY slot. Caller takes ownership; must call
     // claim_ready() / release() when the Metal kernel has finished with the data.

@@ -83,7 +83,6 @@ struct TelemetryState {
 // the measured token total — no double counting.
 struct InstrState {
     double   prune_ms    { 0.0 };  // prune_slots (both call sites)
-    double   scout_ms    { 0.0 };  // Phase A speculative scout pass
     double   dense_ms    { 0.0 };  // norms + QKV + attention + o_proj (+ shared)
     double   dispatch_ms { 0.0 };  // Phase 1 first claim + GPU dispatch pass
     double   io_spin_ms  { 0.0 };  // Phase 3 spin-wait on missing experts
@@ -94,12 +93,19 @@ struct InstrState {
     uint64_t bytes       { 0 };
     uint64_t ovl_hits    { 0 };    // experts shared with the previous token
     uint64_t ovl_total   { 0 };    // experts routed this token
+    uint64_t cov[4]      { 0, 0, 0, 0 };  // true experts inside prev token's top-8/16/24/32
+    uint64_t cov_total   { 0 };
     void reset() { *this = InstrState{}; }
 };
 
 // Previous token's routed-expert bitmask per layer, for the adjacent-
 // token overlap measurement (≤128 experts → two 64-bit words).
 static uint64_t g_instr_prev_mask[128][2];
+
+// Previous token's top-32 gate ranking per layer: measures how much of
+// the next token's true top-8 a top-M speculative prefetch would cover.
+static uint32_t g_instr_prev_top32[128][32];
+static uint8_t  g_instr_prev_top32_n[128];
 
 static void print_telemetry(
     uint32_t               token_n,
@@ -631,16 +637,23 @@ int main(int argc, char* argv[]) {
     float* shared_gate_out = smoe::allocate_aligned_float(shared_dim);
     float* shared_up_out   = smoe::allocate_aligned_float(shared_dim);
 
-    // Exact prefill routing scratch: during prompt steps the router gate
-    // is evaluated directly on the heavy hidden state (128×d_model matvec,
-    // ~0.5M MACs) instead of running the scout's full backbone pass.
-    float* prefill_gate_scores = smoe::allocate_aligned_float(vault_hdr.max_experts_per_layer);
-    smoe::scout::ExpertPrediction prefill_pred {};
-    // NOTE: replaying the previous token's routing as prefetch hints was
-    // tried and measured SLOWER (114s vs 84s TTFT on the 45-token bench):
-    // adjacent-token routing overlap is low in Qwen3-235B, so hints mostly
-    // stream in the wrong experts ahead of the demand fetches. Prefill
-    // I/O overlap comes from layer-major batched prefill instead.
+    // Exact routing scratch: at every step (prompt AND generation) the
+    // router gate is evaluated directly on the heavy hidden state
+    // (128×d_model matvec, ~0.5M MACs) — the true Qwen3 routing. Ranks
+    // beyond 8 (up to --spec extra) double as the next-token
+    // speculative prefetch.
+    const uint32_t spec_width = cli_cfg.spec_width;
+    float* exact_gate_scores = smoe::allocate_aligned_float(vault_hdr.max_experts_per_layer);
+    smoe::scout::ExpertPrediction exact_pred {};
+    static uint32_t exact_rank_ids[32];
+    static float    exact_rank_w[32];
+    // NOTE: replaying the previous token's routing as PREFILL prefetch
+    // hints was tried and measured SLOWER (114s vs 84s TTFT on the
+    // 45-token bench) — hints added wrong reads ahead of demand fetches.
+    // Prefill I/O overlap comes from layer-major batched prefill instead.
+    // Decode is different: measured adjacent-token expert overlap there
+    // is ~53%, which ring retention exploits for free (it skips reads
+    // rather than adding them).
 
     // RoPE tables: the rotation angle depends only on (position, dim) —
     // not on head or layer — so inv_freq is computed once and cos/sin
@@ -696,17 +709,14 @@ int main(int argc, char* argv[]) {
         pf.batch_out   = plane(size_t(CHUNK) * d_model, false);
     }
 
-    uint32_t heavy_cur_token = 0;
-    uint32_t scout_cur_token = 0;
-
-    // Speculative lookahead queue
-    static constexpr uint32_t GEN_LOOKAHEAD_K = 1;
-    static constexpr uint32_t MAX_LOOKAHEAD = 64;
-    static smoe::scout::ScoutOutput scout_queue[MAX_LOOKAHEAD];
-    uint32_t sq_head = 0;
-    uint32_t sq_tail = 0;
-    uint32_t sq_size = 0;
-
+    // NOTE: the decode-time scout speculation (Phase A lookahead queue +
+    // divergence rollback) was removed after measurement: the scout's
+    // full backbone pass cost ~265 ms/token, and its routing predictions
+    // matched the true exact-gate routing only 51.5% of the time —
+    // barely above the 46.4% the retained ring already provides for
+    // free. The decode prefetch oracle is now the previous token's own
+    // top-16 gate ranking (measured 63.7% coverage of the next token's
+    // true top-8), fired through the streamer's low-priority queue.
     uint32_t next_heavy_token = 0;
 
     const bool serve = cli_cfg.serve;
@@ -848,10 +858,7 @@ int main(int argc, char* argv[]) {
         ts.prev_ms    = ts.start_ms;
         ts.prev_bytes = 0;
 
-        heavy_cur_token = (prompt_len > 0) ? prompt_tokens[0] : 0;
-        scout_cur_token = heavy_cur_token;
         next_heavy_token = 0;
-        sq_head = 0; sq_tail = 0; sq_size = 0;
 
         uint32_t total_steps = prompt_len + req_max_tokens;
         if (prompt_len > 0) total_steps -= 1;
@@ -901,7 +908,6 @@ int main(int argc, char* argv[]) {
 
         if (is_prompt) {
             heavy_cur_token = prompt_tokens[n];
-            scout_cur_token = prompt_tokens[n];
         } else {
             heavy_cur_token = next_heavy_token;
             // The stream must contain exactly the tokens whose KV exists,
@@ -915,13 +921,6 @@ int main(int argc, char* argv[]) {
             if (stream_len < STREAM_CAP) {
                 stream_tokens[stream_len++] = heavy_cur_token;
             }
-        }
-
-        if (is_prompt) {
-            // During prompt, we do not lookahead. We only evaluate the exact token.
-            sq_size = 0;
-            sq_head = 0;
-            sq_tail = 0;
         }
 
         const uint16_t* emb = scout.get_embed() + heavy_cur_token * d_model;
@@ -950,57 +949,11 @@ int main(int argc, char* argv[]) {
         // the ENTIRE ring every generated token — zero cross-token reuse
         // despite a measured 53.5% adjacent-token expert overlap.
 
-        // If the lookahead queue is empty (due to prompt, divergence, or heavy catching up),
-        // the Scout MUST sync with the Heavy model's current token to provide accurate routing.
-        if (sq_size == 0) {
-            scout_cur_token = heavy_cur_token;
-        }
-
-        // ── Phase A: Scout Speculative Lookahead ──────────────
-        // During prompt: the scout is NOT run at all — routing is computed
-        // exactly from the heavy hidden state at each MoE layer (Phase B),
-        // which both removes a duplicate full-backbone pass per prompt
-        // token and gives the true Qwen3 routing instead of a prediction.
-        // During generation: keep GEN_LOOKAHEAD_K steps ahead for
-        // speculative execution.
-        uint32_t target_sq_size = is_prompt ? 0 : GEN_LOOKAHEAD_K;
-
-        // First generation step after a prompt: the scout skipped the
-        // prompt entirely, but its KV cache was filled by write_kv_cache
-        // from the heavy path. Align its ring position and RoPE step
-        // before speculation starts.
-        if (!is_prompt && prompt_len > 0 && n == prompt_len) {
-            scout.sync_position(stream_base + prompt_len);
-        }
-
-        while (sq_size < target_sq_size) {
-            uint32_t scout_input;
-            if (is_prompt && (n + sq_size < prompt_len)) {
-                scout_input = prompt_tokens[n + sq_size];
-            } else {
-                scout_input = scout_cur_token;
-            }
-            smoe::scout::ScoutOutput sout = scout.forward(scout_input);
-            scout_queue[sq_tail] = sout;
-            sq_tail = (sq_tail + 1) % MAX_LOOKAHEAD;
-            sq_size++;
-
-            // Prefetch the experts predicted by the Scout for this step
-            for (uint32_t l = 0; l < cfg.num_moe_layers; ++l) {
-                const smoe::scout::ExpertPrediction& pred = sout.routing[l];
-                for (uint32_t e = 0; e < pred.count; ++e) {
-                    (void)streamer.prefetch(pred.layer_id, pred.expert_ids[e]);
-                }
-            }
-            
-            // Advance the scout for the next speculative step
-            scout_cur_token = sout.next_token_id;
-        }
-        instr_bucket(instr.scout_ms);
-
         // ── Phase B: Heavy Model Execution ─────────────────────
-        // Claim the routing map for the current step from the queue head
-        smoe::scout::ScoutOutput scout_out = scout_queue[sq_head];
+        // The scout's backbone is not run at all — routing is computed
+        // exactly from the heavy hidden state at each MoE layer below,
+        // and next-token prefetch comes from each layer's own top-16
+        // gate ranking (speculative, low-priority queue).
         static float attn_scores[ATTN_CTX];
 
         const uint16_t* heavy_emb = scout.get_embed() + static_cast<size_t>(heavy_cur_token) * d_model;
@@ -1161,30 +1114,72 @@ int main(int argc, char* argv[]) {
                     std::fprintf(stderr, "\n[L0] hidden = %.4f %.4f %.4f %.4f\n", heavy_hidden[0], heavy_hidden[1], heavy_hidden[2], heavy_hidden[3]);
                 }
             } else {
-                // ── Phase 1: Dispatch Currently Available Routed Experts to GPU ──
-                instr_bucket(instr.dense_ms);   // norms + QKV + attention + o_proj
-                std::memset(routed_out, 0, d_model * sizeof(float));
-
-                // Prompt steps: exact routing from the real router gate on
-                // the heavy hidden state (norm_topk_prob re-normalisation
-                // per the Qwen3 spec). Prefetches fire immediately after.
-                // Generation steps: scout-predicted routing as before.
-                if (is_prompt) {
-                    smoe::matvec_bf16(prefill_gate_scores,
-                                      scout.get_gate(l - moe_start_layer),
-                                      heavy_normed,
-                                      cfg.max_experts_per_layer, d_model);
-                    prefill_pred.layer_id = l;
-                    prefill_pred.count = scout.compute_top_k(
-                        prefill_gate_scores, cfg.max_experts_per_layer, 8,
-                        prefill_pred.expert_ids, prefill_pred.expert_weights,
-                        cfg.norm_topk_prob);
-                    for (uint32_t e = 0; e < prefill_pred.count; ++e) {
-                        (void)streamer.prefetch(l, prefill_pred.expert_ids[e]);
-                    }
+                // Exact routing, ALL steps: the real router gate evaluated
+                // on the heavy hidden state. One ranked top-(8+spec)
+                // selection: ranks 0–7 are the true routing for THIS token
+                // (weights renormalised over the 8 per norm_topk_prob —
+                // identical to a direct top-8 selection); ranks beyond 8
+                // are the speculative prefetch bet for the NEXT token at
+                // this layer (measured coverage of the next token's top-8:
+                // 46.4% retention alone → 63.7% at +8 → 71.9% at +16).
+                // Speculative reads use the streamer's low-priority queue
+                // so they can never delay the demand fetches this token is
+                // spinning on.
+                smoe::matvec_bf16(exact_gate_scores,
+                                  scout.get_gate(l - moe_start_layer),
+                                  heavy_normed,
+                                  cfg.max_experts_per_layer, d_model);
+                const uint32_t nsel = scout.compute_top_k(
+                    exact_gate_scores, cfg.max_experts_per_layer, 8 + spec_width,
+                    exact_rank_ids, exact_rank_w, false);
+                const uint32_t n8 = (nsel < 8) ? nsel : 8;
+                exact_pred.layer_id = l;
+                exact_pred.count = n8;
+                float w_sum = 0.0f;
+                for (uint32_t e = 0; e < n8; ++e) w_sum += exact_rank_w[e];
+                const float w_inv =
+                    (cfg.norm_topk_prob && w_sum > 0.0f) ? 1.0f / w_sum : 1.0f;
+                for (uint32_t e = 0; e < n8; ++e) {
+                    exact_pred.expert_ids[e]     = exact_rank_ids[e];
+                    exact_pred.expert_weights[e] = exact_rank_w[e] * w_inv;
+                    (void)streamer.prefetch(l, exact_rank_ids[e]);
                 }
-                const smoe::scout::ExpertPrediction& pred =
-                    is_prompt ? prefill_pred : scout_out.routing[l - moe_start_layer];
+                for (uint32_t e = n8; e < nsel; ++e) {
+                    (void)streamer.prefetch(l, exact_rank_ids[e], /*speculative=*/true);
+                }
+                const smoe::scout::ExpertPrediction& pred = exact_pred;
+
+                // Rank coverage: would prefetching the PREVIOUS token's
+                // top-M gate ranking have covered this token's true top-8?
+                // Decides the width of a scout-free speculative prefetch.
+                if (g_instr && l < 128) {
+                    if (!is_prompt) {
+                        for (uint32_t e = 0; e < pred.count; ++e) {
+                            for (uint32_t r = 0; r < g_instr_prev_top32_n[l]; ++r) {
+                                if (g_instr_prev_top32[l][r] == pred.expert_ids[e]) {
+                                    if (r < 8)  instr.cov[0]++;
+                                    if (r < 16) instr.cov[1]++;
+                                    if (r < 24) instr.cov[2]++;
+                                    instr.cov[3]++;   // r < 32 by construction
+                                    break;
+                                }
+                            }
+                        }
+                        instr.cov_total += pred.count;
+                    }
+                    static uint32_t t32_ids[32];
+                    static float    t32_w[32];
+                    uint32_t n32 = scout.compute_top_k(
+                        exact_gate_scores, cfg.max_experts_per_layer, 32,
+                        t32_ids, t32_w, false);
+                    if (n32 > 32) n32 = 32;
+                    g_instr_prev_top32_n[l] = static_cast<uint8_t>(n32);
+                    std::memcpy(g_instr_prev_top32[l], t32_ids, n32 * sizeof(uint32_t));
+                }
+
+                // ── Phase 1: Dispatch Currently Available Routed Experts to GPU ──
+                instr_bucket(instr.dense_ms);   // norms+QKV+attention+o_proj+gate
+                std::memset(routed_out, 0, d_model * sizeof(float));
 
                 // Adjacent-token routed-expert overlap: how many of this
                 // token's experts were also routed by the previous token —
@@ -1379,9 +1374,9 @@ if (spin % 10000 == 0) {
                 if (l == 1 && n == 0 && g_debug) {
                     std::fprintf(stderr, "\n[L1] hidden after FFN = %.4f %.4f %.4f %.4f\n", heavy_hidden[0], heavy_hidden[1], heavy_hidden[2], heavy_hidden[3]);
                 }
-                
-                // Temporal routing feedback: pass the heavy state back to the Scout for the next token
-                scout.update_echo(l, heavy_hidden);
+                // (update_echo removed: heavy_echo was written every layer
+                // and read by nothing — dead machinery from the abandoned
+                // temporal-routing-feedback design.)
             }
         }
         
@@ -1435,31 +1430,6 @@ if (spin % 10000 == 0) {
             // enters the stream at the top of the step that processes it.
         }
         instr_bucket(instr.lm_ms);
-        uint32_t expected_scout_token = scout_out.next_token_id;
-        if (g_debug) {
-            std::fprintf(stderr, "[Scout:%u] ", expected_scout_token);
-            std::fflush(stderr);
-        }
-
-        // ── Phase C: Speculative Divergence Check ─────────────
-        if (!is_prompt && heavy_cur_token != expected_scout_token) {
-            // Divergence! Scout guessed wrong.
-            // Rollback scout KV-cache by the number of steps it is currently ahead.
-            if (sq_size > 1) {
-                scout.rollback(sq_size - 1);
-            }
-            
-            // Flush the lookahead queue
-            sq_size = 0;
-            sq_head = 0;
-            sq_tail = 0;
-        } else if (sq_size > 0) {
-            // Scout guessed correctly — consume the head of the queue.
-            // (During prompt steps the queue stays empty: exact routing
-            // replaces the scout, so there is nothing to consume.)
-            sq_head = (sq_head + 1) % MAX_LOOKAHEAD;
-            sq_size--;
-        }
 
         // Token accounting happens before the EOS break in Step 6 so the
         // final generated token's timing is not lost.
@@ -1499,7 +1469,7 @@ if (spin % 10000 == 0) {
         // ── Request epilogue ──────────────────────────────────
         if (g_instr && instr.tokens > 0) {
             const double nt = double(instr.tokens);
-            const double accounted = instr.prune_ms + instr.scout_ms + instr.dense_ms +
+            const double accounted = instr.prune_ms + instr.dense_ms +
                                      instr.dispatch_ms + instr.io_spin_ms +
                                      instr.gpu_wait_ms + instr.lm_ms;
             const double other_ms = instr.total_ms - accounted;
@@ -1508,7 +1478,6 @@ if (spin % 10000 == 0) {
             };
             std::fprintf(stderr,
                 "\n[instr] %llu generated tokens, %.0f ms/token (%.2f t/s)\n"
-                "[instr]   scout    %8.1f ms/tok  %5.1f%%\n"
                 "[instr]   dense    %8.1f ms/tok  %5.1f%%\n"
                 "[instr]   dispatch %8.1f ms/tok  %5.1f%%\n"
                 "[instr]   io-spin  %8.1f ms/tok  %5.1f%%\n"
@@ -1517,10 +1486,10 @@ if (spin % 10000 == 0) {
                 "[instr]   prune    %8.1f ms/tok  %5.1f%%\n"
                 "[instr]   other    %8.1f ms/tok  %5.1f%%\n"
                 "[instr]   NVMe %.2f GB/token, effective %.2f GB/s over decode\n"
-                "[instr]   adjacent-token expert overlap: %.1f%%  (%llu / %llu)\n",
+                "[instr]   adjacent-token expert overlap: %.1f%%  (%llu / %llu)\n"
+                "[instr]   prev-token top-8/16/24/32 coverage of true top-8: %.1f%% / %.1f%% / %.1f%% / %.1f%%\n",
                 static_cast<unsigned long long>(instr.tokens),
                 instr.total_ms / nt, nt * 1000.0 / instr.total_ms,
-                instr.scout_ms / nt,    pct(instr.scout_ms),
                 instr.dense_ms / nt,    pct(instr.dense_ms),
                 instr.dispatch_ms / nt, pct(instr.dispatch_ms),
                 instr.io_spin_ms / nt,  pct(instr.io_spin_ms),
@@ -1532,7 +1501,11 @@ if (spin % 10000 == 0) {
                 instr.total_ms > 0.0 ? double(instr.bytes) / 1e6 / instr.total_ms : 0.0,
                 instr.ovl_total ? 100.0 * double(instr.ovl_hits) / double(instr.ovl_total) : 0.0,
                 static_cast<unsigned long long>(instr.ovl_hits),
-                static_cast<unsigned long long>(instr.ovl_total));
+                static_cast<unsigned long long>(instr.ovl_total),
+                instr.cov_total ? 100.0 * double(instr.cov[0]) / double(instr.cov_total) : 0.0,
+                instr.cov_total ? 100.0 * double(instr.cov[1]) / double(instr.cov_total) : 0.0,
+                instr.cov_total ? 100.0 * double(instr.cov[2]) / double(instr.cov_total) : 0.0,
+                instr.cov_total ? 100.0 * double(instr.cov[3]) / double(instr.cov_total) : 0.0);
             instr.reset();
         }
 

@@ -29,6 +29,14 @@ struct EngineConfig {
     uint32_t    top_k       = 50;
     float       rep_penalty = 1.0f;
     std::vector<uint32_t> eos_ids = {151645, 151643};
+    uint32_t    spec_width  = 0;   // extra gate ranks (9..8+N) prefetched
+                                   // speculatively for the next token; 0 = off.
+                                   // Measured NET-NEGATIVE at Q4 (spec 8:
+                                   // +242ms dense from memory-bandwidth
+                                   // contention, +144ms io-spin from worker
+                                   // occupancy) despite lifting ring coverage
+                                   // 46→64%. Re-test with Q2 vaults: half the
+                                   // bytes, double the idle bandwidth.
     bool        debug       = false;
     bool        raw_ids     = false;
     bool        serve       = false;
@@ -91,6 +99,8 @@ static inline EngineConfig parse_args(int argc, char* argv[]) {
         else if (arg("--top-p"))      { cfg.top_p = static_cast<float>(std::atof(argv[++i])); }
         else if (arg("--top-k"))      { cfg.top_k = static_cast<uint32_t>(std::atoi(argv[++i])); }
         else if (arg("--rep-penalty")){ cfg.rep_penalty = static_cast<float>(std::atof(argv[++i])); }
+        else if (arg("--spec"))       { cfg.spec_width = static_cast<uint32_t>(std::atoi(argv[++i]));
+                                        if (cfg.spec_width > 24) cfg.spec_width = 24; }
         else if (arg("--eos-ids")) {
             cfg.eos_ids.clear();
             std::string ids_str = argv[++i];

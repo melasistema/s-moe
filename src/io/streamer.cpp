@@ -155,8 +155,12 @@ struct Streamer::Impl {
     RingSlot* slots     { nullptr };  // ring_sz slots, cache-line-aligned
     uint8_t*  data_pool { nullptr };  // one posix_memalign block, 16 KB-aligned
 
-    // ── Request queue ─────────────────────────────────────────
+    // ── Request queues ────────────────────────────────────────
+    // Two priorities: workers drain request_queue (demand) first and
+    // touch spec_queue (speculative next-token bets) only when demand
+    // is empty. Same lock-free MPMC structure for both.
     MPMCQueue<REQUEST_QUEUE_CAPACITY> request_queue;
+    MPMCQueue<REQUEST_QUEUE_CAPACITY> spec_queue;
 
     // ── LRU Cache Tick ────────────────────────────────────────
     std::atomic<uint64_t> global_tick { 0 };
@@ -230,8 +234,7 @@ static void parse_vault(int fd,
 void Streamer::Impl::run(Impl* impl, uint32_t worker_id)
 {
     PrefetchRequest req {};
-    uint32_t scan_start = worker_id;   // stagger starting search offset
-    uint32_t backoff    = 1;           // exponential yield backoff
+    uint32_t backoff = 1;              // exponential yield backoff
 
     // macOS kernel serializes F_NOCACHE preads on the same file descriptor.
     // Give every thread its own independent FD to unlock full NVMe queue depth.
@@ -242,8 +245,8 @@ void Streamer::Impl::run(Impl* impl, uint32_t worker_id)
 
     while (!impl->shutdown.load(std::memory_order_relaxed)) {
 
-        // ── 1. Get a pending request ──────────────────────────
-        if (!impl->request_queue.pop(req)) {
+        // ── 1. Get a pending request — demand first, then spec ─
+        if (!impl->request_queue.pop(req) && !impl->spec_queue.pop(req)) {
             // No work — exponential yield to avoid busy-spin
             for (uint32_t i = 0; i < backoff; ++i)
                 std::this_thread::yield();
@@ -409,7 +412,8 @@ void Streamer::shutdown() noexcept {
     }
 }
 
-bool Streamer::prefetch(uint32_t layer_id, uint32_t expert_id) noexcept {
+bool Streamer::prefetch(uint32_t layer_id, uint32_t expert_id,
+                        bool speculative) noexcept {
     Impl& im = *impl_;
 
     // ── Idempotency check: already in the ring? ───────────────
@@ -492,8 +496,11 @@ bool Streamer::prefetch(uint32_t layer_id, uint32_t expert_id) noexcept {
         im.global_tick.fetch_add(1, std::memory_order_relaxed),
         std::memory_order_relaxed);
 
-    // ── Enqueue the request ───────────────────────────────────
-    if (!im.request_queue.push({ layer_id, expert_id, slot })) {
+    // ── Enqueue the request (priority by class) ───────────────
+    const bool pushed = speculative
+        ? im.spec_queue.push({ layer_id, expert_id, slot })
+        : im.request_queue.push({ layer_id, expert_id, slot });
+    if (!pushed) {
         slot->state.store(SlotState::EMPTY, std::memory_order_release);
         return false;
     }
