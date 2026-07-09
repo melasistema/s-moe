@@ -76,6 +76,31 @@ struct TelemetryState {
     double   prev_ms     { 0.0 };
 };
 
+// ── Decode instrumentation (--instrument) ─────────────────────
+// Wall-time buckets over the serial generation loop, accumulated per
+// request and printed at request end. Buckets are contiguous segments
+// between marks on the main thread, so their sum plus "other" equals
+// the measured token total — no double counting.
+struct InstrState {
+    double   prune_ms    { 0.0 };  // prune_slots (both call sites)
+    double   scout_ms    { 0.0 };  // Phase A speculative scout pass
+    double   dense_ms    { 0.0 };  // norms + QKV + attention + o_proj (+ shared)
+    double   dispatch_ms { 0.0 };  // Phase 1 first claim + GPU dispatch pass
+    double   io_spin_ms  { 0.0 };  // Phase 3 spin-wait on missing experts
+    double   gpu_wait_ms { 0.0 };  // Phase 4 kernel wait + accumulate
+    double   lm_ms       { 0.0 };  // final norm + LM head + sampling
+    double   total_ms    { 0.0 };
+    uint64_t tokens      { 0 };
+    uint64_t bytes       { 0 };
+    uint64_t ovl_hits    { 0 };    // experts shared with the previous token
+    uint64_t ovl_total   { 0 };    // experts routed this token
+    void reset() { *this = InstrState{}; }
+};
+
+// Previous token's routed-expert bitmask per layer, for the adjacent-
+// token overlap measurement (≤128 experts → two 64-bit words).
+static uint64_t g_instr_prev_mask[128][2];
+
 static void print_telemetry(
     uint32_t               token_n,
     const smoe::io::Streamer& streamer,
@@ -179,6 +204,7 @@ static bool g_vocab_loaded = false;
 static std::string g_vocab[151936];
 static bool g_debug = false;
 static bool g_raw_ids = false;
+static bool g_instr = false;
 
 // ── Expert popularity histogram (prewarm ordering) ────────────
 // Claim counts per (absolute layer, expert), persisted across runs so
@@ -287,6 +313,7 @@ int main(int argc, char* argv[]) {
     std::vector<uint32_t> eos_ids = cli_cfg.eos_ids;
     g_debug = cli_cfg.debug;
     g_raw_ids = cli_cfg.raw_ids;
+    g_instr = cli_cfg.instrument;
 
     // ── Vault header read ────────────────────────────────────────────────────────────────────────
     smoe::SmoeHeader vault_hdr {};
@@ -545,6 +572,19 @@ int main(int argc, char* argv[]) {
     smoe::SamplerScratch sampler_scratch(top_k, cfg.vocab_size);
     TelemetryState ts;
 
+    // Instrumentation marks: instr_bucket() charges the wall time since
+    // the previous mark to one bucket and advances the mark. No-op when
+    // the current step is not an instrumented generation step.
+    InstrState instr {};
+    bool   instr_gen = false;
+    double it_mark   = 0.0;
+    auto instr_bucket = [&](double& acc) {
+        if (!instr_gen) return;
+        const double now = wall_ms();
+        acc += now - it_mark;
+        it_mark = now;
+    };
+
     // ── Token Generation Loop ─────────────────────────────────
     //
     // Invariant per token step N:
@@ -666,34 +706,6 @@ int main(int argc, char* argv[]) {
     uint32_t sq_head = 0;
     uint32_t sq_tail = 0;
     uint32_t sq_size = 0;
-
-    struct ActiveExpertsContext {
-        const smoe::scout::ScoutOutput* queue;
-        uint32_t head;
-        uint32_t size;
-        uint32_t num_layers;
-        uint32_t moe_start_layer;
-    };
-
-    auto is_expert_active = [](uint32_t layer_id, uint32_t expert_id, void* ctx) -> bool {
-        auto* c = static_cast<ActiveExpertsContext*>(ctx);
-        for (uint32_t i = 0; i < c->size; ++i) {
-            uint32_t idx = (c->head + i) % MAX_LOOKAHEAD;
-            const auto& scout_out = c->queue[idx];
-            const uint32_t moe_start = c->moe_start_layer;
-            if (layer_id < moe_start) continue;
-            const uint32_t routing_idx = layer_id - moe_start;
-            if (routing_idx < c->num_layers) {
-                const auto& pred = scout_out.routing[routing_idx];
-                for (uint32_t e = 0; e < pred.count; ++e) {
-                    if (pred.expert_ids[e] == expert_id) {
-                        return true;
-                    }
-                }
-            }
-        }
-        return false;
-    };
 
     uint32_t next_heavy_token = 0;
 
@@ -878,6 +890,15 @@ int main(int argc, char* argv[]) {
         uint32_t heavy_cur_token;
         bool is_prompt = (n < prompt_len);
 
+        instr_gen = g_instr && !is_prompt;
+        double   it_tok0  = 0.0;
+        uint64_t it_bytes0 = 0;
+        if (instr_gen) {
+            it_tok0   = wall_ms();
+            it_mark   = it_tok0;
+            it_bytes0 = streamer.bytes_read();
+        }
+
         if (is_prompt) {
             heavy_cur_token = prompt_tokens[n];
             scout_cur_token = prompt_tokens[n];
@@ -921,16 +942,13 @@ int main(int argc, char* argv[]) {
             std::fprintf(stderr, "\n[Token %u] emb = %.4f %.4f %.4f %.4f\n", heavy_cur_token, heavy_hidden[0], heavy_hidden[1], heavy_hidden[2], heavy_hidden[3]);
         }
 
-        // Clean up any leaked/discarded slots in the streamer.
-        // NOT during prompt steps: the lookahead queue is empty then, so
-        // this would mark every slot inactive and evict the entire ring
-        // each prompt token (zero cross-token reuse, ~7 GB re-read per
-        // token). During prefill, capacity is reclaimed lazily by
-        // prefetch()'s CONSUMED/LRU-READY eviction instead.
-        if (!is_prompt) {
-            ActiveExpertsContext act_ctx { scout_queue, sq_head, sq_size, cfg.num_moe_layers, moe_start_layer };
-            streamer.prune_slots(is_expert_active, &act_ctx);
-        }
+        // No per-token pruning: the ring retains CONSUMED slots as an LRU
+        // cache across tokens (and across serve-mode requests). Capacity
+        // is reclaimed lazily by prefetch()'s ref-count-guarded LRU
+        // eviction, exactly as prefill already does. The old prune ran
+        // with an empty lookahead queue at steady state, so it evicted
+        // the ENTIRE ring every generated token — zero cross-token reuse
+        // despite a measured 53.5% adjacent-token expert overlap.
 
         // If the lookahead queue is empty (due to prompt, divergence, or heavy catching up),
         // the Scout MUST sync with the Heavy model's current token to provide accurate routing.
@@ -978,6 +996,7 @@ int main(int argc, char* argv[]) {
             // Advance the scout for the next speculative step
             scout_cur_token = sout.next_token_id;
         }
+        instr_bucket(instr.scout_ms);
 
         // ── Phase B: Heavy Model Execution ─────────────────────
         // Claim the routing map for the current step from the queue head
@@ -1143,6 +1162,7 @@ int main(int argc, char* argv[]) {
                 }
             } else {
                 // ── Phase 1: Dispatch Currently Available Routed Experts to GPU ──
+                instr_bucket(instr.dense_ms);   // norms + QKV + attention + o_proj
                 std::memset(routed_out, 0, d_model * sizeof(float));
 
                 // Prompt steps: exact routing from the real router gate on
@@ -1165,6 +1185,26 @@ int main(int argc, char* argv[]) {
                 }
                 const smoe::scout::ExpertPrediction& pred =
                     is_prompt ? prefill_pred : scout_out.routing[l - moe_start_layer];
+
+                // Adjacent-token routed-expert overlap: how many of this
+                // token's experts were also routed by the previous token —
+                // the upper bound on what cross-token ring retention buys.
+                // Prompt steps seed the masks without counting.
+                if (g_instr && l < 128) {
+                    uint64_t cur0 = 0, cur1 = 0;
+                    for (uint32_t e = 0; e < pred.count; ++e) {
+                        const uint32_t id = pred.expert_ids[e];
+                        if (id < 64)        cur0 |= 1ULL << id;
+                        else if (id < 128)  cur1 |= 1ULL << (id - 64);
+                    }
+                    if (!is_prompt) {
+                        instr.ovl_hits  += __builtin_popcountll(cur0 & g_instr_prev_mask[l][0])
+                                         + __builtin_popcountll(cur1 & g_instr_prev_mask[l][1]);
+                        instr.ovl_total += pred.count;
+                    }
+                    g_instr_prev_mask[l][0] = cur0;
+                    g_instr_prev_mask[l][1] = cur1;
+                }
                 bool executed[16] = {false};
                 uint32_t num_executed = 0;
                 uint64_t spin = 0;
@@ -1221,6 +1261,7 @@ int main(int argc, char* argv[]) {
                         num_executed++;
                     }
                 }
+                instr_bucket(instr.dispatch_ms);
 
                 // ── Phase 2: Compute Shared Expert on CPU while GPU/SSD works ──
                 std::memset(shared_out, 0, d_model * sizeof(float));
@@ -1247,6 +1288,8 @@ int main(int argc, char* argv[]) {
                         smoe::matvec_bf16(shared_out, scout.get_shared_down(l), shared_gate_out, d_model, shared_dim);
                     }
                 }
+
+                instr_bucket(instr.dense_ms);   // shared expert (none on Qwen3)
 
                 // ── Phase 3: Spin-wait for any remaining missing experts ──
                 while (num_executed < pred.count) {
@@ -1301,6 +1344,7 @@ if (spin % 10000 == 0) {
                         spin++;
                     }
                 }
+                instr_bucket(instr.io_spin_ms);
 
                 // ── Phase 4: Wait for GPU and accumulate ──
                 for (uint32_t e = 0; e < pred.count; ++e) {
@@ -1320,6 +1364,7 @@ if (spin % 10000 == 0) {
                     }
                 }
                 smoe_metal_swap_buffers(metal);
+                instr_bucket(instr.gpu_wait_ms);
 
                 if (l == 1 && n == 0 && g_debug) {
                     std::fprintf(stderr, "\n[L1] shared_out = %.4f %.4f %.4f %.4f\n", shared_out[0], shared_out[1], shared_out[2], shared_out[3]);
@@ -1389,6 +1434,7 @@ if (spin % 10000 == 0) {
             // NOTE: best_tok is NOT appended to stream_tokens here — it
             // enters the stream at the top of the step that processes it.
         }
+        instr_bucket(instr.lm_ms);
         uint32_t expected_scout_token = scout_out.next_token_id;
         if (g_debug) {
             std::fprintf(stderr, "[Scout:%u] ", expected_scout_token);
@@ -1415,11 +1461,12 @@ if (spin % 10000 == 0) {
             sq_size--;
         }
 
-        // Prune discarded experts (LRU cache eviction) — generation only;
-        // during prefill retention is handled by prefetch()'s lazy eviction.
-        if (!is_prompt) {
-            ActiveExpertsContext act_ctx { scout_queue, sq_head, sq_size, cfg.num_moe_layers, moe_start_layer };
-            streamer.prune_slots(is_expert_active, &act_ctx);
+        // Token accounting happens before the EOS break in Step 6 so the
+        // final generated token's timing is not lost.
+        if (instr_gen) {
+            instr.total_ms += wall_ms() - it_tok0;
+            instr.bytes    += streamer.bytes_read() - it_bytes0;
+            instr.tokens   += 1;
         }
 
         // ── Step 6: Emit token ────────────────────────────────
@@ -1450,6 +1497,45 @@ if (spin % 10000 == 0) {
     }
 
         // ── Request epilogue ──────────────────────────────────
+        if (g_instr && instr.tokens > 0) {
+            const double nt = double(instr.tokens);
+            const double accounted = instr.prune_ms + instr.scout_ms + instr.dense_ms +
+                                     instr.dispatch_ms + instr.io_spin_ms +
+                                     instr.gpu_wait_ms + instr.lm_ms;
+            const double other_ms = instr.total_ms - accounted;
+            auto pct = [&](double v) {
+                return instr.total_ms > 0.0 ? 100.0 * v / instr.total_ms : 0.0;
+            };
+            std::fprintf(stderr,
+                "\n[instr] %llu generated tokens, %.0f ms/token (%.2f t/s)\n"
+                "[instr]   scout    %8.1f ms/tok  %5.1f%%\n"
+                "[instr]   dense    %8.1f ms/tok  %5.1f%%\n"
+                "[instr]   dispatch %8.1f ms/tok  %5.1f%%\n"
+                "[instr]   io-spin  %8.1f ms/tok  %5.1f%%\n"
+                "[instr]   gpu-wait %8.1f ms/tok  %5.1f%%\n"
+                "[instr]   lm-head  %8.1f ms/tok  %5.1f%%\n"
+                "[instr]   prune    %8.1f ms/tok  %5.1f%%\n"
+                "[instr]   other    %8.1f ms/tok  %5.1f%%\n"
+                "[instr]   NVMe %.2f GB/token, effective %.2f GB/s over decode\n"
+                "[instr]   adjacent-token expert overlap: %.1f%%  (%llu / %llu)\n",
+                static_cast<unsigned long long>(instr.tokens),
+                instr.total_ms / nt, nt * 1000.0 / instr.total_ms,
+                instr.scout_ms / nt,    pct(instr.scout_ms),
+                instr.dense_ms / nt,    pct(instr.dense_ms),
+                instr.dispatch_ms / nt, pct(instr.dispatch_ms),
+                instr.io_spin_ms / nt,  pct(instr.io_spin_ms),
+                instr.gpu_wait_ms / nt, pct(instr.gpu_wait_ms),
+                instr.lm_ms / nt,       pct(instr.lm_ms),
+                instr.prune_ms / nt,    pct(instr.prune_ms),
+                other_ms / nt,          pct(other_ms),
+                double(instr.bytes) / nt / 1e9,
+                instr.total_ms > 0.0 ? double(instr.bytes) / 1e6 / instr.total_ms : 0.0,
+                instr.ovl_total ? 100.0 * double(instr.ovl_hits) / double(instr.ovl_total) : 0.0,
+                static_cast<unsigned long long>(instr.ovl_hits),
+                static_cast<unsigned long long>(instr.ovl_total));
+            instr.reset();
+        }
+
         // Resume prewarm with the freshly updated popularity histogram:
         // it re-warms the ring while the user types the next message.
         save_expert_freq("vault/expert_freq.bin");

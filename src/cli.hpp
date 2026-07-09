@@ -32,6 +32,7 @@ struct EngineConfig {
     bool        debug       = false;
     bool        raw_ids     = false;
     bool        serve       = false;
+    bool        instrument  = false;
     bool        valid       = true;
 };
 
@@ -57,6 +58,8 @@ static inline void print_usage(const char* argv0) {
         "    --raw-ids           Print raw token IDs as integers instead of text\n"
         "    --serve             Persistent server mode: read GEN/RESET requests\n"
         "                        on stdin, reuse KV cache across requests\n"
+        "    --instrument        Print a per-request decode timing breakdown\n"
+        "                        (scout/dense/io/gpu buckets) on stderr\n"
         "\n"
         "  Example:\n"
         "    %s --vault vault/deepseek.smoe --prompt \"Explain MoE routing\" --tokens 200\n"
@@ -101,6 +104,7 @@ static inline EngineConfig parse_args(int argc, char* argv[]) {
         else if (std::strcmp(argv[i], "--debug") == 0) { cfg.debug = true; }
         else if (std::strcmp(argv[i], "--raw-ids") == 0) { cfg.raw_ids = true; }
         else if (std::strcmp(argv[i], "--serve") == 0) { cfg.serve = true; }
+        else if (std::strcmp(argv[i], "--instrument") == 0) { cfg.instrument = true; }
         else if (std::strcmp(argv[i], "--help") == 0 ||
                  std::strcmp(argv[i], "-h")     == 0) {
             print_usage(argv[0]);
