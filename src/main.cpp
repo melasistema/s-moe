@@ -488,6 +488,9 @@ int main(int argc, char* argv[]) {
     uint32_t  prompt_len = 0;
 
     std::mt19937 rng(1337); // Fixed seed for deterministic debug, can be randomized later
+    // Top-K candidate buffer for the sampler — allocated once here so the
+    // token loop stays heap-free.
+    smoe::SamplerScratch sampler_scratch(top_k, cfg.vocab_size);
     TelemetryState ts;
 
     // ── Token Generation Loop ─────────────────────────────────
@@ -1310,7 +1313,7 @@ if (spin % 10000 == 0) {
                 .top_k = top_k,
                 .rep_penalty = rep_penalty
             };
-            uint32_t best_tok = smoe::sample_token(scores, sampler_cfg, stream_tokens, stream_len, rng);
+            uint32_t best_tok = smoe::sample_token(scores, sampler_cfg, stream_tokens, stream_len, rng, sampler_scratch);
 
             heavy_cur_token = best_tok;
             if (g_debug) {

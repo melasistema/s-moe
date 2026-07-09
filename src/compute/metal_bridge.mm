@@ -133,8 +133,8 @@ inline float smoeq2_dequant(
     uint8_t code  = (packed[pack_idx] >> bit_shift) & 0x3u;
     float   scale = float(scales[group_idx]);
 
-    // Affine mapping: centre 0–3 around zero, then scale
-    return (float(code) - 1.5f) * scale;
+    // Affine mapping: centre 0–3 around 1.5, then scale
+    return (float(code) - 1.5f) * (1.0f / 1.5f) * scale;
 }
 
 inline float smoeq4_dequant(
@@ -258,8 +258,8 @@ kernel void smoe_gate_up(
                 for (uint b = 0; b < 4; ++b) {
                     float gcode = float((gbyte >> (b * 2)) & 0x3u);
                     float ucode = float((ubyte >> (b * 2)) & 0x3u);
-                    float gw    = (gcode - 1.5f) * gs;
-                    float uw    = (ucode - 1.5f) * us;
+                    float gw    = (gcode - 1.5f) * (1.0f / 1.5f) * gs;
+                    float uw    = (ucode - 1.5f) * (1.0f / 1.5f) * us;
                     float x_k   = tg_input[k + b];
                     gate_acc   += gw * x_k;
                     up_acc     += uw * x_k;
@@ -345,7 +345,7 @@ kernel void smoe_down(
 
                 for (uint b = 0; b < 4; ++b) {
                     float dcode = float((dbyte >> (b * 2)) & 0x3u);
-                    float dw    = (dcode - 1.5f) * ds;
+                    float dw    = (dcode - 1.5f) * (1.0f / 1.5f) * ds;
                     acc        += dw * tg_hidden[k + b];
                 }
             }
@@ -910,9 +910,12 @@ void* smoe_metal_fused_ffn(SmoeMetalCtx*   ctx,
     [enc setThreadgroupMemoryLength:256 * 2 * sizeof(float) atIndex:0];
 
     {
+        // One thread per output row: ceil(rows/256) threadgroups. The old
+        // MTLSizeMake(gate_rows,…) grid launched one threadgroup PER ROW —
+        // a 256× overdispatch the batch kernels never had.
         NSUInteger tgroup = 256;
         MTLSize tgSize    = MTLSizeMake(tgroup, 1, 1);
-        MTLSize gridGroups  = MTLSizeMake(gate_rows,   1, 1);
+        MTLSize gridGroups  = MTLSizeMake((gate_rows + tgroup - 1) / tgroup, 1, 1);
         [enc dispatchThreadgroups:gridGroups threadsPerThreadgroup:tgSize];
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
     }
@@ -937,7 +940,7 @@ void* smoe_metal_fused_ffn(SmoeMetalCtx*   ctx,
     {
         NSUInteger tgroup = 256;
         MTLSize tgSize   = MTLSizeMake(tgroup, 1, 1);
-        MTLSize gridGroups = MTLSizeMake(down_rows,   1, 1);
+        MTLSize gridGroups = MTLSizeMake((down_rows + tgroup - 1) / tgroup, 1, 1);
         [enc dispatchThreadgroups:gridGroups threadsPerThreadgroup:tgSize];
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
     }
@@ -1287,7 +1290,10 @@ void smoe_metal_scout_matvec_batch_bf16(SmoeMetalCtx* ctx,
         [enc setThreadgroupMemoryLength:tgroup * sizeof(float) atIndex:0];
 
         MTLSize tgSize     = MTLSizeMake(tgroup, 1, 1);
-        MTLSize gridGroups = MTLSizeMake(rows[i], 1, 1);
+        // ceil(rows/256) threadgroups, one thread per row. This path runs
+        // the 151936-row LM head once per generated token — the old
+        // one-threadgroup-per-row grid was a 256× overdispatch.
+        MTLSize gridGroups = MTLSizeMake((rows[i] + tgroup - 1) / tgroup, 1, 1);
         [enc dispatchThreadgroups:gridGroups threadsPerThreadgroup:tgSize];
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
     }
