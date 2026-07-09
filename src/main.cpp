@@ -883,6 +883,17 @@ int main(int argc, char* argv[]) {
             scout_cur_token = prompt_tokens[n];
         } else {
             heavy_cur_token = next_heavy_token;
+            // The stream must contain exactly the tokens whose KV exists,
+            // so a generated token joins it when it is PROCESSED (its KV
+            // is written this step), not when it is sampled. The final
+            // sampled token of a request (EOS or cap-end) is never
+            // processed; appending it at sampling time left a stream
+            // position with no KV entry, so every later serve-mode turn
+            // wrote slot = position − 1 while RoPE used the true position,
+            // shifting attention one token per turn boundary.
+            if (stream_len < STREAM_CAP) {
+                stream_tokens[stream_len++] = heavy_cur_token;
+            }
         }
 
         if (is_prompt) {
@@ -1375,9 +1386,8 @@ if (spin % 10000 == 0) {
                 std::fflush(stderr);
             }
             next_heavy_token = best_tok; // Save for the next contiguous iteration
-            if (stream_len < STREAM_CAP) {
-                stream_tokens[stream_len++] = heavy_cur_token;
-            }
+            // NOTE: best_tok is NOT appended to stream_tokens here — it
+            // enters the stream at the top of the step that processes it.
         }
         uint32_t expected_scout_token = scout_out.next_token_id;
         if (g_debug) {
