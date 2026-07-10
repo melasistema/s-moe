@@ -4,6 +4,8 @@
 
 <div align="center">
 
+![s-moe-seismic-mixture-of-experts](assets/images/smoe-seismic-mixture-of-experts.png)
+
 ### The Cartography of the Mountain
 
 Every byte, every struct field, every atomic flag — mapped, explained, and public.
