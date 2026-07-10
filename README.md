@@ -4,7 +4,7 @@
 
 <div align="center">
 
-![s-moe-seismic-mixture-of-experts](assets/images/smoe-seismic-mixture-of-experts.png)
+![s-moe-seismic-mixture-of-experts](https://docs.s-moe.com/images/smoe-seismic-mixture-of-experts.png)
 
 ### The Cartography of the Mountain
 
