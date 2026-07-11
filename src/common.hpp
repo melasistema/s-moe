@@ -22,6 +22,10 @@
 #include <cstdint>
 #include <cstring>
 
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
 namespace smoe {
 
 // ── Format constants ──────────────────────────────────────────
@@ -201,11 +205,46 @@ inline void rms_norm_bf16(float* x, const uint16_t* w, uint32_t n) noexcept {
     }
 }
 
+#if defined(__ARM_NEON)
+// NEON path: bf16 rows are widened in-register (u16 << 16 is exactly
+// the bf16→f32 bit pattern — vshll does conversion and load-spread in
+// one instruction) and accumulated with fused multiply-add across four
+// independent lanes to keep the FMA pipes full. This is the decode
+// hot path: the exact-routing gate matvec reads ~94 MB of bf16 per
+// generated token; the scalar loop ran it at ~1 GB/s.
+//
+// NOT bit-exact with the scalar loop: vector lanes reassociate the
+// float sum. Near-tie gate scores can therefore flip routing picks —
+// verified coherent, not verified identical.
 inline void matvec_bf16(float* __restrict__ out,
                    const uint16_t* __restrict__ weight,
                    const float* __restrict__ in,
                    uint32_t rows, uint32_t cols) noexcept {
-    #pragma omp parallel for if(rows > 128)
+    for (uint32_t i = 0; i < rows; ++i) {
+        const uint16_t* w_row = weight + static_cast<size_t>(i) * cols;
+        float32x4_t acc0 = vdupq_n_f32(0.0f);
+        float32x4_t acc1 = vdupq_n_f32(0.0f);
+        float32x4_t acc2 = vdupq_n_f32(0.0f);
+        float32x4_t acc3 = vdupq_n_f32(0.0f);
+        uint32_t j = 0;
+        for (; j + 16 <= cols; j += 16) {
+            uint16x8_t h0 = vld1q_u16(w_row + j);
+            uint16x8_t h1 = vld1q_u16(w_row + j + 8);
+            acc0 = vfmaq_f32(acc0, vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(h0), 16)),  vld1q_f32(in + j));
+            acc1 = vfmaq_f32(acc1, vreinterpretq_f32_u32(vshll_high_n_u16(h0, 16)),           vld1q_f32(in + j + 4));
+            acc2 = vfmaq_f32(acc2, vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(h1), 16)),  vld1q_f32(in + j + 8));
+            acc3 = vfmaq_f32(acc3, vreinterpretq_f32_u32(vshll_high_n_u16(h1, 16)),           vld1q_f32(in + j + 12));
+        }
+        float sum = vaddvq_f32(vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3)));
+        for (; j < cols; ++j) sum += bf16_to_f32(w_row[j]) * in[j];
+        out[i] = sum;
+    }
+}
+#else
+inline void matvec_bf16(float* __restrict__ out,
+                   const uint16_t* __restrict__ weight,
+                   const float* __restrict__ in,
+                   uint32_t rows, uint32_t cols) noexcept {
     for (uint32_t i = 0; i < rows; ++i) {
         float sum = 0.0f;
         const uint16_t* w_row = weight + i * cols;
@@ -215,6 +254,50 @@ inline void matvec_bf16(float* __restrict__ out,
         out[i] = sum;
     }
 }
+#endif
+
+// Attention primitives. Clang cannot auto-vectorize float reductions
+// without -ffast-math (reassociation), so the scalar loops ran one
+// FMA per cycle. head_dim is 128 — the tails never run in practice.
+// Same caveat as matvec_bf16: lane reassociation ≠ bit-exact scalar.
+#if defined(__ARM_NEON)
+inline float dot_f32(const float* __restrict__ a,
+                     const float* __restrict__ b, uint32_t n) noexcept {
+    float32x4_t acc0 = vdupq_n_f32(0.0f);
+    float32x4_t acc1 = vdupq_n_f32(0.0f);
+    uint32_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        acc0 = vfmaq_f32(acc0, vld1q_f32(a + i),     vld1q_f32(b + i));
+        acc1 = vfmaq_f32(acc1, vld1q_f32(a + i + 4), vld1q_f32(b + i + 4));
+    }
+    float s = vaddvq_f32(vaddq_f32(acc0, acc1));
+    for (; i < n; ++i) s += a[i] * b[i];
+    return s;
+}
+
+inline void axpy_f32(float* __restrict__ y, float a,
+                     const float* __restrict__ x, uint32_t n) noexcept {
+    const float32x4_t va = vdupq_n_f32(a);
+    uint32_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        vst1q_f32(y + i,     vfmaq_f32(vld1q_f32(y + i),     va, vld1q_f32(x + i)));
+        vst1q_f32(y + i + 4, vfmaq_f32(vld1q_f32(y + i + 4), va, vld1q_f32(x + i + 4)));
+    }
+    for (; i < n; ++i) y[i] += a * x[i];
+}
+#else
+inline float dot_f32(const float* __restrict__ a,
+                     const float* __restrict__ b, uint32_t n) noexcept {
+    float s = 0.0f;
+    for (uint32_t i = 0; i < n; ++i) s += a[i] * b[i];
+    return s;
+}
+
+inline void axpy_f32(float* __restrict__ y, float a,
+                     const float* __restrict__ x, uint32_t n) noexcept {
+    for (uint32_t i = 0; i < n; ++i) y[i] += a * x[i];
+}
+#endif
 
 inline void rms_norm(float* x, const float* w, uint32_t n) noexcept {
     if (!w) return;

@@ -1,61 +1,39 @@
 // ═══════════════════════════════════════════════════════════════
-// scout.cpp — S-MoE Engine · Surface Scout (Week 5: Neural)
+// scout.cpp — S-MoE Engine · Surface Scout (resident backbone)
 // ═══════════════════════════════════════════════════════════════
-// Phase 5 — Week 5
+// The Surface Scout is the heavy model's own dense trunk — the
+// ~16 GB of bf16 tensors the sculptor did not exile into the
+// expert vault: embeddings, attention projections, norms, router
+// gates, LM head. This file does three jobs:
 //
-// Architecture: SAR-phonon analogy
-// ──────────────────────────────────────────────────────────────
-// The Surface Scout is a lightweight distilled model (~1.5B params)
-// that runs two heads simultaneously:
+//   ① Parse the safetensors header (hand-rolled, no JSON library)
+//      and wire weight pointers directly into the mmap region.
+//   ② Auto-detect model topology (GQA shape, QK-norm, dense L0,
+//      shared experts) from the tensor names present.
+//   ③ Serve those weights to the engine through const accessors,
+//      plus top-k expert selection for exact routing.
 //
-//   ① Language head — standard autoregressive next-token prediction
-//      via a final linear projection (lm_head) over the hidden state.
+// Memory invariants:
+//   ① The safetensors file is mmap()-ed MAP_SHARED and stays
+//     resident (a background page-toucher prefaults it once).
+//     F_NOCACHE is NOT applied here — that is reserved for the
+//     vault streamer, which must bypass the page cache.
+//   ② The only runtime allocation is the lm_head scores scratch,
+//     made once in the constructor.
 //
-//   ② Routing head — for each MoE layer L in [1..27], a small gate
-//      projection (shape [64, 2048]) predicts which 8 of 64 experts
-//      the heavy frontier model will activate K steps ahead.
-//      This decouples routing-matrix evaluation from the current
-//      execution step — the phonon analogy: we measure the *echo*
-//      of the routing decision before it's needed by the GPU.
-//
-// Week 5 neural pass (single token, no KV-cache):
-//   1. Embed:          hidden = embed_tokens[token_id]        (2048,)
-//   2. Attention-1:    run layer-1 self-attention on hidden
-//      a. RMS norm    (input_layernorm.weight)
-//      b. Q/K/V proj  (q/k/v_proj.weight)
-//      c. Scaled dot-product attention over a 64-token ring cache
-//      d. O proj      (o_proj.weight)  + residual
-//      e. Post-attn RMS norm
-//   3. Gate routing:   for L in [1..27]:
-//                         scores = hidden @ gate[L].T → softmax → top-8
-//   4. Next token:     lm_head_scores = hidden @ lm_head.T → argmax
-//
-// Weight format: safetensors (parsed from scratch, no external libs)
-//   • 8-byte little-endian uint64 header_len
-//   • header_len bytes of UTF-8 JSON metadata
-//   • raw bf16 data (data_offsets relative to end of JSON)
-//
-// Memory invariants (GEMINI.md):
-//   ① Zero heap allocations inside forward() — all buffers are
-//     members of Impl, pre-allocated in the constructor.
-//   ② Synchronisation is via std::atomic only — no OS mutexes.
-//   ③ The safetensors file is mmap()‐ed in MAP_PRIVATE mode and
-//     stays resident (scout stays in DRAM). The F_NOCACHE Direct
-//     I/O flag is NOT applied here — that is reserved for the
-//     vault streamer which must bypass the page cache.
-//
-// Fallback:
-//   When scout_safetensors_path == nullptr (or file cannot be
-//   opened), the implementation reverts to the Week 4 heuristic
-//   triple-strategy oracle (n-gram / recency / uniform).
+// History: this class once ran a full speculative forward pass
+// (neural + Week-4 heuristic oracle) to predict expert routing
+// ahead of the heavy model. Measurement retired it — 51.5% oracle
+// accuracy at ~265 ms/token vs 46.4% free coverage from ring
+// retention — and with it went the forward scratch buffers, the
+// ~1.6 GB KV mirror, and the heuristic tables. The Scout is now
+// an artifact, not an agent.
 // ═══════════════════════════════════════════════════════════════
 
 #include "scout.hpp"
 #include "../compute/metal_bridge.h"
 
 #include <algorithm>
-#include <array>
-#include <cassert>
 #include <cerrno>
 #include <cmath>
 #include <cstdint>
@@ -84,115 +62,8 @@ static void info_printf(const char* format, ...) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// §1  Compile-time constants
+// §1  Top-k expert selection
 // ═══════════════════════════════════════════════════════════════
-
-// ── Model dimensions (Dynamic now, stored in config) ─────────
-// Removed cfg.d_model, cfg.vocab_size, cfg.gate_rows().
-
-// Context ring depth for the single-layer attention
-inline constexpr uint32_t ATTN_CTX       = 4096;
-
-// ── Heuristic constants (fallback path, unchanged from Week 4) ─
-inline constexpr uint32_t NGRAM_WINDOW    = 4;
-inline constexpr uint32_t NGRAM_TABLE     = 4096;
-inline constexpr uint32_t N_HIST          = MAX_ACTIVE;
-inline constexpr uint32_t EXPERT_UNIVERSE = 256;
-inline constexpr uint32_t MAX_LAYERS      = 128;
-inline constexpr uint32_t RECENCY_DELTA   = 3;
-inline constexpr uint32_t HISTORY_CAP     = 1024;
-
-// ═══════════════════════════════════════════════════════════════
-// §2  Bfloat16 conversion
-// ═══════════════════════════════════════════════════════════════
-
-// bf16 is the top 16 bits of IEEE-754 float32.
-// Conversion: sign-extend the 16-bit value into the upper word.
-inline float bf16_to_f32(uint16_t bf) noexcept {
-    uint32_t bits = static_cast<uint32_t>(bf) << 16;
-    float f;
-    std::memcpy(&f, &bits, sizeof(f));
-    return f;
-}
-
-// Convert a packed bf16 array to float32 in-place into dst.
-static void convert_bf16_block(float* dst, const uint16_t* src, size_t n) noexcept {
-    if (!dst || !src) return;
-    for (size_t i = 0; i < n; ++i) {
-        dst[i] = bf16_to_f32(src[i]);
-    }
-}
-
-
-// RMS LayerNorm: out[i] = x[i] / rms(x) * weight[i]
-// Applied in-place.
-static void rms_norm(float* x, const float* w, uint32_t n) noexcept {
-    if (!w) return;
-    float sum_sq = 0.0f;
-    for (uint32_t i = 0; i < n; ++i) {
-        sum_sq += x[i] * x[i];
-    }
-    float rms = std::sqrt(sum_sq / static_cast<float>(n) + 1e-6f);
-    float inv_rms = 1.0f / rms;
-    for (uint32_t i = 0; i < n; ++i) {
-        x[i] = x[i] * inv_rms * w[i];
-    }
-}
-
-// Matrix-vector multiply: out[i] = dot(weight[i*cols .. i*cols+cols-1], x)
-// weight is row-major [rows × cols].
-
-static void rms_norm_bf16(float* x, const uint16_t* w, uint32_t n) noexcept {
-    float ss = 0.0f;
-    for (uint32_t i = 0; i < n; ++i) ss += x[i] * x[i];
-    ss /= n;
-    ss += 1e-6f;
-    ss = 1.0f / std::sqrt(ss);
-    for (uint32_t i = 0; i < n; ++i) x[i] = (x[i] * ss) * bf16_to_f32(w[i]);
-}
-
-void matvec_bf16(float* out, const uint16_t* weight, const float* in, uint32_t rows, uint32_t cols) noexcept {
-    for (uint32_t r = 0; r < rows; ++r) {
-        float sum = 0.0f;
-        const uint16_t* w_row = weight + static_cast<size_t>(r) * cols;
-        for (uint32_t c = 0; c < cols; ++c) {
-            sum += bf16_to_f32(w_row[c]) * in[c];
-        }
-        out[r] = sum;
-    }
-}
-
-static void matvec(float* __restrict__ out,
-                   const float* __restrict__ weight,
-                   const float* __restrict__ x,
-                   uint32_t rows, uint32_t cols) noexcept {
-    if (!weight) return;
-    for (uint32_t r = 0; r < rows; ++r) {
-        float acc = 0.0f;
-        const float* row = weight + static_cast<size_t>(r) * cols;
-        for (uint32_t c = 0; c < cols; ++c) {
-            acc += row[c] * x[c];
-        }
-        out[r] = acc;
-    }
-}
-
-// In-place softmax over n elements.
-static void softmax(float* x, uint32_t n) noexcept {
-    float max_val = x[0];
-    for (uint32_t i = 1; i < n; ++i) {
-        if (x[i] > max_val) max_val = x[i];
-    }
-    float sum = 0.0f;
-    for (uint32_t i = 0; i < n; ++i) {
-        x[i] = std::exp(x[i] - max_val);
-        sum  += x[i];
-    }
-    float inv_sum = (sum > 0.0f) ? 1.0f / sum : 0.0f;
-    for (uint32_t i = 0; i < n; ++i) {
-        x[i] *= inv_sum;
-    }
-}
 
 // Select top-k indices from scores[n] into out_indices[k].
 // Returns k (or fewer if n < k).
@@ -249,7 +120,7 @@ static uint32_t top_k(const float* scores, uint32_t n, uint32_t k,
 }
 
 // ═══════════════════════════════════════════════════════════════
-// §4  Minimal safetensors header parser
+// §2  Minimal safetensors header parser
 // ═══════════════════════════════════════════════════════════════
 // Parses just enough of the JSON header to extract:
 //   {"tensor_name": {"dtype": "BF16", "shape": [...], "data_offsets": [start, end]}}
@@ -368,37 +239,14 @@ static TensorMeta parse_tensor_meta(const char* json_start,
 }
 
 // ═══════════════════════════════════════════════════════════════
-// §5  Weight tensor pointers (into mmap)
-// ═══════════════════════════════════════════════════════════════
-
-// All weight arrays as pointers into the mmap region.
-// The bf16 data is converted to float32 at construction time and
-// stored in pre-allocated Impl member arrays.
-
-// ═══════════════════════════════════════════════════════════════
-// §6  Heuristic data structures (Week 4 fallback, unchanged)
-// ═══════════════════════════════════════════════════════════════
-
-struct NgramBucket {
-    uint32_t experts[MAX_LAYERS][N_HIST] {};
-    uint32_t counts [MAX_LAYERS][N_HIST] {};
-    uint32_t head   [MAX_LAYERS]         {};
-};
-
-struct LayerRecency {
-    uint32_t last_experts[MAX_ACTIVE] {};
-    uint32_t count { 0 };
-};
-
-// ═══════════════════════════════════════════════════════════════
-// §7  Scout::Impl
+// §3  Scout::Impl
 // ═══════════════════════════════════════════════════════════════
 
 struct Scout::Impl {
     // ── Model configuration ───────────────────────────────────
     SmoeModelConfig cfg {};
 
-    // ── Mode flag ──────────────────────────────────────────────
+    // ── Load-success flag ──────────────────────────────────────
     bool neural_mode { false };   // true ↔ safetensors loaded
 
     // ── Metal context ─────────────────────────────────────────
@@ -412,15 +260,11 @@ struct Scout::Impl {
     // joined in the destructor before munmap.
     std::thread prefault_thread;
 
-    // ── Neural weight storage (float32, pre-allocated) ────────
-    // Each array is large enough for the tensor it represents.
-    // All allocated as flat C arrays — no std::vector, no new[].
+    // ── Weight tensor pointers (bf16, into the mmap region) ───
 
-    // Embedding table: [cfg.vocab_size × cfg.d_model]
-    // ~800 MB for 102400 × 2048 × 4 bytes — huge but fits in 16 GB UMA.
-    // We use a pointer into a heap allocation done ONCE at constructor time.
-    const uint16_t* w_embed      { nullptr };   // [cfg.vocab_size × cfg.d_model]
-    const uint16_t* w_lm_head    { nullptr };   // [cfg.vocab_size × cfg.d_model]
+    // Embedding table / LM head: [cfg.vocab_size × cfg.d_model]
+    const uint16_t* w_embed      { nullptr };
+    const uint16_t* w_lm_head    { nullptr };
 
     // Layers 0..N attention weights
     const uint16_t* w_q_proj[MAX_MOE_LAYERS] {};
@@ -450,75 +294,17 @@ struct Scout::Impl {
     // Final norm: [cfg.d_model]
     const uint16_t* w_model_norm { nullptr };
 
-    // Gate weights for MoE layers 1..N
-    // gate[l] points to gate_weights_storage + l * gate_rows * d_model
-    
-    // Convenience: gate_w[l] for MoE layer l+1
+    // Router gate weights for MoE layers: gate_w[l] for MoE layer l
+    // (offset by has_dense_layer_0 in the loader)
     const uint16_t* gate_w[MAX_MOE_LAYERS] {};
 
-    // ── Pre-allocated compute buffers (forward(), zero alloc) ─
-    float* hidden       { nullptr };       // current hidden state
-    float* normed       { nullptr };       // scratch for post-norm
-    float* qbuf         { nullptr };
-    float* kbuf         { nullptr };
-    float* vbuf         { nullptr };
-    float* attn_out     { nullptr };
-
-    float* heavy_echo   { nullptr }; // Temporal Routing buffer [MAX_LAYERS * d_model]
-
-    // Attention context ring: full full K/V caches
-    float* k_cache  { nullptr }; // [28 × ATTN_CTX × cfg.d_model]
-    float* v_cache  { nullptr }; // [28 × ATTN_CTX × cfg.d_model]
-    uint32_t ctx_pos  { 0 };   // write head into ring
-    uint32_t ctx_fill { 0 };   // number of valid entries
-
-
-    // Attention score buffer [ATTN_CTX]
-    float attn_scores[ATTN_CTX] {};
-
-    // RoPE tables [head_dim/2]: angle depends only on (position, dim),
-    // so inv_freq is fixed and cos/sin are refreshed once per forward().
-    float* rope_inv_freq { nullptr };
-    float* rope_cos      { nullptr };
-    float* rope_sin      { nullptr };
-
-    // Gate score buffer [cfg.gate_rows()]
-    float* gate_scores  { nullptr };
-    float* gate_scores_batch { nullptr }; // [num_moe_layers * cfg.gate_rows()] for GPU batching
-
-    // LM head score buffer — we compute via GPU matvec and scan.
-    float* lm_head_scores { nullptr };     // [cfg.vocab_size]
-
-    // ── Heuristic fallback state (Week 4, preserved) ──────────
-    NgramBucket ngram_table[NGRAM_TABLE] {};
-    LayerRecency recency   [MAX_LAYERS]  {};
-    uint32_t context_ring  [NGRAM_WINDOW] {};
-    uint32_t context_pos_h { 0 };
-    uint32_t context_fill_h{ 0 };
-    uint32_t history       [HISTORY_CAP] {};
-    uint32_t history_pos   { 0 };
-    uint32_t history_fill  { 0 };
-    static constexpr uint32_t FREQ_TABLE_SIZE = 65536;
-    uint32_t token_freq    [FREQ_TABLE_SIZE] {};
-    uint32_t num_moe_layers    { 21 };
-    uint32_t experts_per_layer { EXPERT_UNIVERSE };
-    uint64_t step              { 0 };
+    // LM head score buffer [cfg.vocab_size] — the engine computes the
+    // final logits into this via GPU matvec. The only runtime allocation.
+    float* lm_head_scores { nullptr };
 
     // ── Constructor: load safetensors ─────────────────────────
     Impl(const char* path, SmoeMetalCtx* metal_ctx, const SmoeHeader* vault_hdr);
     ~Impl();
-
-    // ── Helpers: neural path ──────────────────────────────────
-    // Run the full neural forward pass.  NO allocations here.
-    ScoutOutput neural_forward(uint32_t token_id) noexcept;
-
-    // ── Helpers: heuristic path (Week 4) ─────────────────────
-    uint32_t ngram_hash() const noexcept;
-    void     observe(uint32_t layer_id, uint32_t expert_id) noexcept;
-    uint32_t predict(uint32_t layer_id, uint32_t* out) const noexcept;
-    uint32_t next_token_heuristic(uint32_t current_token) const noexcept;
-    void     push_token(uint32_t token_id) noexcept;
-    ScoutOutput heuristic_forward(uint32_t token_id) noexcept;
 };
 
 // ── Impl constructor ──────────────────────────────────────────
@@ -540,7 +326,7 @@ Scout::Impl::Impl(const char* path, SmoeMetalCtx* metal_ctx, const SmoeHeader* v
 
     if (!path) {
         std::fprintf(stderr,
-            "[scout] Heuristic mode — no weight path provided.\n");
+            "[scout] ✗ No weight path provided — engine cannot run without the dense backbone.\n");
         return;
     }
 
@@ -548,8 +334,7 @@ Scout::Impl::Impl(const char* path, SmoeMetalCtx* metal_ctx, const SmoeHeader* v
     int fd = ::open(path, O_RDONLY);
     if (fd < 0) {
         std::fprintf(stderr,
-            "[scout] ✗ Cannot open '%s': %s\n"
-            "[scout]   Falling back to heuristic mode.\n",
+            "[scout] ✗ Cannot open '%s': %s\n",
             path, std::strerror(errno));
         return;
     }
@@ -557,7 +342,7 @@ Scout::Impl::Impl(const char* path, SmoeMetalCtx* metal_ctx, const SmoeHeader* v
     struct stat st {};
     if (::fstat(fd, &st) != 0) {
         std::fprintf(stderr,
-            "[scout] ✗ fstat failed: %s — heuristic fallback.\n",
+            "[scout] ✗ fstat failed: %s\n",
             std::strerror(errno));
         ::close(fd);
         return;
@@ -567,7 +352,7 @@ Scout::Impl::Impl(const char* path, SmoeMetalCtx* metal_ctx, const SmoeHeader* v
         "[scout] Loading scout weights: %s  (%.2f GB)\n",
         path, static_cast<double>(mmap_size) / 1e9);
 
-    // ── mmap (MAP_PRIVATE — stays in unified DRAM, NOT Direct I/O) ──
+    // ── mmap (MAP_SHARED — stays in unified DRAM, NOT Direct I/O) ──
     // F_NOCACHE is reserved for the vault streamer.
     // The scout file stays resident — no need to bypass the page cache.
     mmap_base = ::mmap(nullptr, mmap_size,
@@ -576,7 +361,7 @@ Scout::Impl::Impl(const char* path, SmoeMetalCtx* metal_ctx, const SmoeHeader* v
     if (mmap_base == MAP_FAILED) {
         mmap_base = nullptr;
         std::fprintf(stderr,
-            "[scout] ✗ mmap failed: %s — heuristic fallback.\n",
+            "[scout] ✗ mmap failed: %s\n",
             std::strerror(errno));
         return;
     }
@@ -585,7 +370,7 @@ Scout::Impl::Impl(const char* path, SmoeMetalCtx* metal_ctx, const SmoeHeader* v
 
     // ── Parse safetensors header ──────────────────────────────
     if (mmap_size < 8) {
-        std::fprintf(stderr, "[scout] ✗ File too small — heuristic fallback.\n");
+        std::fprintf(stderr, "[scout] ✗ File too small.\n");
         ::munmap(mmap_base, mmap_size); mmap_base = nullptr;
         return;
     }
@@ -595,7 +380,7 @@ Scout::Impl::Impl(const char* path, SmoeMetalCtx* metal_ctx, const SmoeHeader* v
 
     if (header_len > mmap_size - 8) {
         std::fprintf(stderr,
-            "[scout] ✗ header_len %llu exceeds file size — heuristic fallback.\n",
+            "[scout] ✗ header_len %llu exceeds file size.\n",
             static_cast<unsigned long long>(header_len));
         ::munmap(mmap_base, mmap_size); mmap_base = nullptr;
         return;
@@ -698,59 +483,22 @@ Scout::Impl::Impl(const char* path, SmoeMetalCtx* metal_ctx, const SmoeHeader* v
         cfg.num_kv_heads = 16;
         cfg.head_dim = 128;
     }
-    
+
     std::fprintf(stderr, "[scout] GQA config: heads=%u, kv_heads=%u, head_dim=%u\n", cfg.num_heads, cfg.num_kv_heads, cfg.head_dim);
 
-    // ── Allocate float32 weight arrays (ONE-TIME, in constructor) ──
+    // ── Tensor shape expectations ─────────────────────────────
     const size_t EMBED_ELEMS  = static_cast<size_t>(cfg.vocab_size) * cfg.d_model;
     const size_t Q_PROJ_ELEMS = static_cast<size_t>(cfg.num_heads * cfg.head_dim) * cfg.d_model;
     const size_t KV_PROJ_ELEMS = static_cast<size_t>(cfg.num_kv_heads * cfg.head_dim) * cfg.d_model;
     const size_t O_PROJ_ELEMS = static_cast<size_t>(cfg.d_model) * (cfg.num_heads * cfg.head_dim);
     const size_t L0_DENSE_ELEMS = static_cast<size_t>(cfg.ffn_dim) * cfg.d_model;
-    const size_t SHARED_EXPERT_ELEMS = static_cast<size_t>(cfg.ffn_dim) * cfg.d_model;
 
     bool ok = true;
-    
 
-
-    // ── Allocate compute scratch vectors ──────────────────────
-    hidden               = allocate_aligned_float(cfg.d_model);
-    normed               = allocate_aligned_float(cfg.d_model);
-    qbuf                 = allocate_aligned_float(cfg.num_heads * cfg.head_dim);
-    kbuf                 = allocate_aligned_float(cfg.num_kv_heads * cfg.head_dim);
-    vbuf                 = allocate_aligned_float(cfg.num_kv_heads * cfg.head_dim);
-    attn_out             = allocate_aligned_float(cfg.num_heads * cfg.head_dim);
-    gate_scores          = allocate_aligned_float(cfg.gate_rows());
-    gate_scores_batch    = allocate_aligned_float(cfg.num_moe_layers * cfg.gate_rows());
-    lm_head_scores       = allocate_aligned_float(cfg.vocab_size);
-    
-    uint32_t total_layers = cfg.num_moe_layers + (cfg.has_dense_layer_0 ? 1 : 0);
-    k_cache              = allocate_aligned_float(total_layers * ATTN_CTX * (cfg.num_kv_heads * cfg.head_dim));
-    v_cache              = allocate_aligned_float(total_layers * ATTN_CTX * (cfg.num_kv_heads * cfg.head_dim));
-    heavy_echo           = allocate_aligned_float(total_layers * cfg.d_model);
-
-    rope_inv_freq        = allocate_aligned_float(cfg.head_dim / 2);
-    rope_cos             = allocate_aligned_float(cfg.head_dim / 2);
-    rope_sin             = allocate_aligned_float(cfg.head_dim / 2);
-    if (rope_inv_freq) {
-        for (uint32_t d = 0; d < cfg.head_dim / 2; ++d) {
-            rope_inv_freq[d] = 1.0f / std::pow(cfg.rope_theta,
-                static_cast<float>(d * 2) / static_cast<float>(cfg.head_dim));
-        }
-    }
-
-    if (!hidden || !normed || !qbuf || !kbuf || !vbuf || !attn_out || !gate_scores || !gate_scores_batch || !lm_head_scores || !k_cache || !v_cache || !heavy_echo
-        || !rope_inv_freq || !rope_cos || !rope_sin) {
-        ok = false;
-    }
-    
-
-
-    // Wire up gate_w convenience pointers
-    if (ok) {
-        for (uint32_t l = 0; l < cfg.num_moe_layers; ++l) {
-        }
-    }
+    // The engine's final logits land here via GPU matvec — the Scout's
+    // only runtime allocation, made once here.
+    lm_head_scores = allocate_aligned_float(cfg.vocab_size);
+    if (!lm_head_scores) ok = false;
 
     // ── Helper: map one tensor into the bf16 mmap region ─────────
     auto load_tensor = [&](const char* name, const uint16_t*& dst, size_t expected_elems) -> bool {
@@ -853,47 +601,20 @@ Scout::Impl::Impl(const char* path, SmoeMetalCtx* metal_ctx, const SmoeHeader* v
         }
     }
 
-    experts_per_layer = cfg.max_experts_per_layer;
-    neural_mode = ok;
-
-    if (!ok) {
-        std::fprintf(stderr,
-            "[scout] ⚠  Some tensors failed to load or allocate — falling back to heuristic.\n");
-        // DO NOT free buffers! The heavy engine needs w_embed, w_lm_head, w_model_norm!
-        // We will just run in neural_mode = false and use heuristics.
-    }
-
     if (ok && metal_ctx) {
         info_printf("[scout] Registering buffers with GPU for zero-copy JIT execution ...\n");
         smoe_metal_register_buffer(metal_ctx, w_embed, EMBED_ELEMS * sizeof(uint16_t));
         smoe_metal_register_buffer(metal_ctx, w_lm_head, EMBED_ELEMS * sizeof(uint16_t));
-        
-        // Wait, registering 28 arrays for q,k,v,o is probably overkill for Metal registrations right now.
-        // We can just register the ones we need or skip it if main.cpp uses CPU attention.
-        // I will omit registering q,k,v,o for all all layers as that's > 100 buffers and Metal might have a limit.
-        // Actually, main.cpp's generation loop will use smoe_metal_scout_matvec which might need them registered.
-        // I'll register just the 27 gate buffers and the scratch buffers.
-        
-        
-
-        smoe_metal_register_buffer(metal_ctx, hidden, cfg.d_model * sizeof(float));
-        smoe_metal_register_buffer(metal_ctx, normed, cfg.d_model * sizeof(float));
-        smoe_metal_register_buffer(metal_ctx, qbuf, cfg.num_heads * cfg.head_dim * sizeof(float));
-        smoe_metal_register_buffer(metal_ctx, kbuf, cfg.num_kv_heads * cfg.head_dim * sizeof(float));
-        smoe_metal_register_buffer(metal_ctx, vbuf, cfg.num_kv_heads * cfg.head_dim * sizeof(float));
-        smoe_metal_register_buffer(metal_ctx, attn_out, cfg.num_heads * cfg.head_dim * sizeof(float));
-        smoe_metal_register_buffer(metal_ctx, gate_scores_batch, cfg.num_moe_layers * cfg.gate_rows() * sizeof(float));
         smoe_metal_register_buffer(metal_ctx, lm_head_scores, cfg.vocab_size * sizeof(float));
     }
 
-    experts_per_layer = cfg.max_experts_per_layer;
     neural_mode = ok;
     if (ok) {
         info_printf(
-            "[scout] ✓ Neural scout ready (Week 5 · D=%u · vocab=%u · %u MoE gates)\n",
+            "[scout] ✓ Backbone weights ready (D=%u · vocab=%u · %u MoE gates)\n",
             cfg.d_model, cfg.vocab_size, cfg.num_moe_layers);
     } else {
-        std::fprintf(stderr, "[scout] ⚠  Some tensors failed to load or allocate — falling back to heuristic.\n");
+        std::fprintf(stderr, "[scout] ✗ Some tensors failed to load or allocate.\n");
     }
 }
 
@@ -911,7 +632,18 @@ Scout::Impl::~Impl() {
     }
 }
 
-// ── Getters for full-model execution ────────────────────────
+// ═══════════════════════════════════════════════════════════════
+// §4  Scout public API
+// ═══════════════════════════════════════════════════════════════
+
+Scout::Scout(const char* scout_safetensors_path, SmoeMetalCtx* metal_ctx, const SmoeHeader* vault_hdr)
+    : impl_(new Impl(scout_safetensors_path, metal_ctx, vault_hdr))
+{}
+
+Scout::~Scout() {
+    delete impl_;
+}
+
 const SmoeModelConfig& Scout::config() const noexcept {
     return impl_->cfg;
 }
@@ -939,480 +671,13 @@ const uint16_t* Scout::get_input_norm(uint32_t layer) const noexcept { return im
 const uint16_t* Scout::get_post_norm(uint32_t layer) const noexcept { return impl_->w_post_norm[layer]; }
 const uint16_t* Scout::get_gate(uint32_t layer) const noexcept { return impl_->gate_w[layer]; }
 
-
-void Scout::update_echo(uint32_t layer, const float* hidden) noexcept {
-    if (layer < impl_->cfg.num_moe_layers + (impl_->cfg.has_dense_layer_0 ? 1 : 0)) {
-        std::memcpy(impl_->heavy_echo + layer * impl_->cfg.d_model, hidden, impl_->cfg.d_model * sizeof(float));
-    }
-}
-
-void rope_inplace(float* x, uint32_t pos, uint32_t heads, uint32_t head_dim, float rope_theta) noexcept {
-    uint32_t half_dim = head_dim / 2;
-    for (uint32_t h = 0; h < heads; ++h) {
-        float* head_vec = x + h * head_dim;
-        for (uint32_t i = 0; i < half_dim; ++i) {
-            float freq = pos / std::pow(rope_theta, static_cast<float>(2 * i) / head_dim);
-            float cos_val = std::cos(freq);
-            float sin_val = std::sin(freq);
-            float x0 = head_vec[i];
-            float x1 = head_vec[i + half_dim];
-            head_vec[i]            = x0 * cos_val - x1 * sin_val;
-            head_vec[i + half_dim] = x1 * cos_val + x0 * sin_val;
-        }
-    }
-}
-
 float* Scout::get_lm_head_scores() const noexcept { return impl_->lm_head_scores; }
 
 const uint16_t* Scout::get_shared_gate(uint32_t layer) const noexcept { return impl_->w_shared_gate[layer]; }
 const uint16_t* Scout::get_shared_up(uint32_t l) const noexcept { return impl_->w_shared_up[l]; }
 const uint16_t* Scout::get_shared_down(uint32_t l) const noexcept { return impl_->w_shared_down[l]; }
 
-
-// ═══════════════════════════════════════════════════════════════
-// §8  Neural forward pass (zero allocation)
-// ═══════════════════════════════════════════════════════════════
-
-ScoutOutput Scout::Impl::neural_forward(uint32_t token_id) noexcept {
-    ScoutOutput out {};
-
-    // ── 1. Token embedding lookup ─────────────────────────────
-    const uint32_t safe_id = (token_id < cfg.vocab_size) ? token_id : 0;
-    const uint16_t* emb_row = w_embed + static_cast<size_t>(safe_id) * cfg.d_model;
-    for (uint32_t d = 0; d < cfg.d_model; ++d) {
-        hidden[d] = bf16_to_f32(emb_row[d]);
-    }
-
-    // ── 2. Full 28-Layer Backbone Execution ───────────────────
-    // RoPE rotation for this position, shared by all heads and layers
-    for (uint32_t d = 0; d < cfg.head_dim / 2; ++d) {
-        float angle = static_cast<float>(step) * rope_inv_freq[d];
-        rope_cos[d] = std::cos(angle);
-        rope_sin[d] = std::sin(angle);
-    }
-
-    uint32_t total_layers = cfg.num_moe_layers + (cfg.has_dense_layer_0 ? 1 : 0);
-    for (uint32_t l = 0; l < total_layers; ++l) {
-        
-        // a. Input RMS LayerNorm
-        std::memcpy(normed, hidden, cfg.d_model * sizeof(float));
-        rms_norm_bf16(normed, w_input_norm[l], cfg.d_model);
-
-        // b. Q/K/V projections
-        uint32_t q_dim = cfg.num_heads * cfg.head_dim;
-        uint32_t kv_dim = cfg.num_kv_heads * cfg.head_dim;
-        
-        if (metal_ctx) {
-            const uint16_t* weights[3] = { w_q_proj[l], w_k_proj[l], w_v_proj[l] };
-            const float* inputs[3]  = { normed, normed, normed };
-            float* outputs[3]       = { qbuf, kbuf, vbuf };
-            uint32_t rows[3]        = { q_dim, kv_dim, kv_dim };
-            uint32_t cols[3]        = { cfg.d_model, cfg.d_model, cfg.d_model };
-            smoe_metal_scout_matvec_batch_bf16(metal_ctx, weights, inputs, outputs, rows, cols, 3);
-        } else {
-            matvec_bf16(qbuf, w_q_proj[l], normed, q_dim, cfg.d_model);
-            matvec_bf16(kbuf, w_k_proj[l], normed, kv_dim, cfg.d_model);
-            matvec_bf16(vbuf, w_v_proj[l], normed, kv_dim, cfg.d_model);
-        }
-
-        // b2. Qwen3-specific: per-head Q/K RMS norm before RoPE
-        if (cfg.has_qk_norm && w_q_norm[l] && w_k_norm[l]) {
-            for (uint32_t h = 0; h < cfg.num_heads; ++h) {
-                float* qh = qbuf + h * cfg.head_dim;
-                float ss = 0.0f;
-                for (uint32_t d = 0; d < cfg.head_dim; ++d) ss += qh[d] * qh[d];
-                ss = 1.0f / std::sqrt(ss / cfg.head_dim + 1e-6f);
-                for (uint32_t d = 0; d < cfg.head_dim; ++d)
-                    qh[d] = qh[d] * ss * bf16_to_f32(w_q_norm[l][d]);
-            }
-            for (uint32_t h = 0; h < cfg.num_kv_heads; ++h) {
-                float* kh = kbuf + h * cfg.head_dim;
-                float ss = 0.0f;
-                for (uint32_t d = 0; d < cfg.head_dim; ++d) ss += kh[d] * kh[d];
-                ss = 1.0f / std::sqrt(ss / cfg.head_dim + 1e-6f);
-                for (uint32_t d = 0; d < cfg.head_dim; ++d)
-                    kh[d] = kh[d] * ss * bf16_to_f32(w_k_norm[l][d]);
-            }
-        }
-
-        // Apply RoPE to Q — tables hold the per-position rotation
-        const uint32_t rope_half = cfg.head_dim / 2;
-        for (uint32_t h = 0; h < cfg.num_heads; ++h) {
-            for (uint32_t d = 0; d < rope_half; ++d) {
-                float q0 = qbuf[h * cfg.head_dim + d];
-                float q1 = qbuf[h * cfg.head_dim + d + rope_half];
-                qbuf[h * cfg.head_dim + d]             = q0 * rope_cos[d] - q1 * rope_sin[d];
-                qbuf[h * cfg.head_dim + d + rope_half] = q0 * rope_sin[d] + q1 * rope_cos[d];
-            }
-        }
-
-        // Apply RoPE to K
-        for (uint32_t h = 0; h < cfg.num_kv_heads; ++h) {
-            for (uint32_t d = 0; d < rope_half; ++d) {
-                float k0 = kbuf[h * cfg.head_dim + d];
-                float k1 = kbuf[h * cfg.head_dim + d + rope_half];
-                kbuf[h * cfg.head_dim + d]             = k0 * rope_cos[d] - k1 * rope_sin[d];
-                kbuf[h * cfg.head_dim + d + rope_half] = k0 * rope_sin[d] + k1 * rope_cos[d];
-            }
-        }
-
-        // c. Write K/V into ring cache for this layer
-        const uint32_t slot = ctx_pos % ATTN_CTX;
-        float* layer_k = k_cache + (l * ATTN_CTX + slot) * kv_dim;
-        float* layer_v = v_cache + (l * ATTN_CTX + slot) * kv_dim;
-        std::memcpy(layer_k, kbuf, kv_dim * sizeof(float));
-        std::memcpy(layer_v, vbuf, kv_dim * sizeof(float));
-
-        // d. Scaled dot-product MHA (GQA)
-        const float scale = 1.0f / std::sqrt(static_cast<float>(cfg.head_dim));
-        const uint32_t valid = (ctx_fill < ATTN_CTX) ? ctx_fill + 1 : ATTN_CTX;
-        std::memset(attn_out, 0, q_dim * sizeof(float));
-        
-        uint32_t heads_per_kv = cfg.num_heads / cfg.num_kv_heads;
-
-        for (uint32_t h = 0; h < cfg.num_heads; ++h) {
-            uint32_t kv_h = h / heads_per_kv;
-            for (uint32_t i = 0; i < valid; ++i) {
-                uint32_t ki = (ctx_pos - i + ATTN_CTX) % ATTN_CTX;
-                float dot_qk = 0.0f;
-                const float* krow = k_cache + (l * ATTN_CTX + ki) * kv_dim + kv_h * cfg.head_dim;
-                const float* qhead = qbuf + h * cfg.head_dim;
-                for (uint32_t d = 0; d < cfg.head_dim; ++d) {
-                    dot_qk += qhead[d] * krow[d];
-                }
-                attn_scores[i] = dot_qk * scale;
-            }
-            float max_val = attn_scores[0];
-            for (uint32_t i = 1; i < valid; ++i) {
-                if (attn_scores[i] > max_val) max_val = attn_scores[i];
-            }
-            float sum = 0.0f;
-            for (uint32_t i = 0; i < valid; ++i) {
-                attn_scores[i] = std::exp(attn_scores[i] - max_val);
-                sum += attn_scores[i];
-            }
-            float inv_sum = (sum > 0.0f) ? 1.0f / sum : 0.0f;
-            for (uint32_t i = 0; i < valid; ++i) {
-                attn_scores[i] *= inv_sum;
-            }
-
-            for (uint32_t i = 0; i < valid; ++i) {
-                uint32_t vi = (ctx_pos - i + ATTN_CTX) % ATTN_CTX;
-                const float alpha = attn_scores[i];
-                const float* vrow = v_cache + (l * ATTN_CTX + vi) * kv_dim + kv_h * cfg.head_dim;
-                float* out_head = attn_out + h * cfg.head_dim;
-                for (uint32_t d = 0; d < cfg.head_dim; ++d) {
-                    out_head[d] += alpha * vrow[d];
-                }
-            }
-        }
-
-        if (metal_ctx) {
-            smoe_metal_scout_matvec_bf16(metal_ctx, w_o_proj[l], attn_out, normed, cfg.d_model, q_dim);
-        } else {
-            matvec_bf16(normed, w_o_proj[l], attn_out, cfg.d_model, q_dim);
-        }
-        for (uint32_t i = 0; i < cfg.d_model; ++i) {
-            hidden[i] += normed[i];
-        }
-
-        // f. Post-attention RMS norm
-        std::memcpy(normed, hidden, cfg.d_model * sizeof(float));
-        rms_norm_bf16(normed, w_post_norm[l], cfg.d_model);
-
-        // g. Heavy Expert Gate Prediction
-        uint32_t moe_start_layer = cfg.has_dense_layer_0 ? 1 : 0;
-        if (l >= moe_start_layer) {
-            uint32_t layer_idx = l - moe_start_layer;
-            float* scores = gate_scores_batch + layer_idx * cfg.gate_rows();
-            
-            if (metal_ctx) {
-                smoe_metal_scout_matvec_bf16(metal_ctx, gate_w[layer_idx], normed, scores, cfg.gate_rows(), cfg.d_model);
-            } else {
-                matvec_bf16(scores, gate_w[layer_idx], normed, cfg.gate_rows(), cfg.d_model);
-            }
-
-            // Extract results for this specific layer
-            ExpertPrediction& pred = out.routing[layer_idx];
-            pred.layer_id = l;
-            pred.count = top_k(scores, cfg.gate_rows(), 8, pred.expert_ids, pred.expert_weights, cfg.norm_topk_prob);
-        }
-
-        // h. Dense / Shared Experts FFN
-        if (l == 0 && cfg.has_dense_layer_0) {
-            std::vector<float> l0_gate_out_vec(cfg.ffn_dim); float* l0_gate_out = l0_gate_out_vec.data();
-            std::vector<float> l0_up_out_vec(cfg.ffn_dim); float* l0_up_out = l0_up_out_vec.data();
-            if (metal_ctx) {
-                const uint16_t* weights[2] = { w_l0_gate, w_l0_up };
-                const float* inputs[2]  = { normed, normed };
-                float* outputs[2]       = { l0_gate_out, l0_up_out };
-                uint32_t rows[2]        = { cfg.ffn_dim, cfg.ffn_dim };
-                uint32_t cols[2]        = { cfg.d_model, cfg.d_model };
-                smoe_metal_scout_matvec_batch_bf16(metal_ctx, weights, inputs, outputs, rows, cols, 2);
-            } else {
-                matvec_bf16(l0_gate_out, w_l0_gate, normed, cfg.ffn_dim, cfg.d_model);
-                matvec_bf16(l0_up_out, w_l0_up, normed, cfg.ffn_dim, cfg.d_model);
-            }
-            for (uint32_t i = 0; i < cfg.ffn_dim; ++i) {
-                float val = l0_gate_out[i];
-                l0_gate_out[i] = (val / (1.0f + std::exp(-val))) * l0_up_out[i];
-            }
-            if (metal_ctx) smoe_metal_scout_matvec_bf16(metal_ctx, w_l0_down, l0_gate_out, normed, cfg.d_model, cfg.ffn_dim);
-            else matvec_bf16(normed, w_l0_down, l0_gate_out, cfg.d_model, cfg.ffn_dim);
-            for (uint32_t d = 0; d < cfg.d_model; ++d) hidden[d] += normed[d];
-        } else if (w_shared_gate[l]) {
-            static float shared_gate_out[16384];
-            static float shared_up_out[16384];
-            if (metal_ctx) {
-                const uint16_t* weights[2] = { w_shared_gate[l], w_shared_up[l] };
-                const float* inputs[2]  = { normed, normed };
-                float* outputs[2]       = { shared_gate_out, shared_up_out };
-                uint32_t rows[2]        = { cfg.ffn_dim, cfg.ffn_dim };
-                uint32_t cols[2]        = { cfg.d_model, cfg.d_model };
-                smoe_metal_scout_matvec_batch_bf16(metal_ctx, weights, inputs, outputs, rows, cols, 2);
-            } else {
-                matvec_bf16(shared_gate_out, w_shared_gate[l], normed, cfg.ffn_dim, cfg.d_model);
-                matvec_bf16(shared_up_out, w_shared_up[l], normed, cfg.ffn_dim, cfg.d_model);
-            }
-            for (uint32_t i = 0; i < cfg.ffn_dim; ++i) {
-                float val = shared_gate_out[i];
-                shared_gate_out[i] = (val / (1.0f + std::exp(-val))) * shared_up_out[i];
-            }
-            if (metal_ctx) smoe_metal_scout_matvec_bf16(metal_ctx, w_shared_down[l], shared_gate_out, normed, cfg.d_model, cfg.ffn_dim);
-            else matvec_bf16(normed, w_shared_down[l], shared_gate_out, cfg.d_model, cfg.ffn_dim);
-            for (uint32_t d = 0; d < cfg.d_model; ++d) hidden[d] += normed[d];
-        }
-    }
-
-    ctx_pos = (ctx_pos + 1) % ATTN_CTX;
-    if (ctx_fill < ATTN_CTX) ++ctx_fill;
-
-    // ── 3. Final model norm ───────────────────────────────────
-    rms_norm_bf16(hidden, w_model_norm, cfg.d_model);
-
-    // ── 4. LM Head ────────────────────────────────────────────
-    if (metal_ctx) {
-        smoe_metal_scout_matvec_bf16(metal_ctx, w_lm_head, hidden, lm_head_scores, cfg.vocab_size, cfg.d_model);
-    } else {
-        for (uint32_t v = 0; v < cfg.vocab_size; ++v) {
-            const uint16_t* row = w_lm_head + static_cast<size_t>(v) * cfg.d_model;
-            float score = 0.0f;
-            for (uint32_t d = 0; d < cfg.d_model; ++d) score += bf16_to_f32(row[d]) * hidden[d];
-            lm_head_scores[v] = score;
-        }
-    }
-
-    uint32_t best_tok   = 0;
-    float    best_score = -1e38f;
-    for (uint32_t v = 0; v < cfg.vocab_size; ++v) {
-        if (lm_head_scores[v] > best_score) {
-            best_score = lm_head_scores[v];
-            best_tok   = v;
-        }
-    }
-    const char* sm_dbg = std::getenv("SMOE_DEBUG");
-    if (sm_dbg && (std::strcmp(sm_dbg, "1") == 0 || std::strcmp(sm_dbg, "true") == 0)) {
-        std::fprintf(stderr, "\n[DEBUG SCOUT] step=%llu, token_id=%u -> predicted=%u (score=%f)\n", 
-                     static_cast<unsigned long long>(step), token_id, best_tok, best_score);
-        std::fprintf(stderr, "[DEBUG SCOUT] scores[0..4]: %f, %f, %f, %f, %f\n", 
-                     lm_head_scores[0], lm_head_scores[1], lm_head_scores[2], lm_head_scores[3], lm_head_scores[4]);
-    }
-    out.next_token_id = best_tok;
-
-    ++step;
-    return out;
-}
-
-// ═══════════════════════════════════════════════════════════════
-
-uint32_t Scout::Impl::ngram_hash() const noexcept {
-    uint32_t h = 2166136261u;
-    for (uint32_t i = 0; i < NGRAM_WINDOW; ++i) {
-        uint32_t tok = context_ring[(context_pos_h + i) % NGRAM_WINDOW];
-        h ^= tok;
-        h *= 16777619u;
-    }
-    return h & (NGRAM_TABLE - 1);
-}
-
-void Scout::Impl::observe(uint32_t layer_id, uint32_t expert_id) noexcept {
-    if (layer_id >= MAX_LAYERS) return;
-    NgramBucket& bucket = ngram_table[ngram_hash()];
-    uint32_t     slot   = bucket.head[layer_id] % N_HIST;
-    bucket.experts[layer_id][slot] = expert_id;
-    bucket.counts [layer_id][slot]++;
-    bucket.head   [layer_id] = slot + 1;
-
-    LayerRecency& rec = recency[layer_id];
-    if (rec.count < MAX_ACTIVE) {
-        rec.last_experts[rec.count++] = expert_id;
-    } else {
-        rec.last_experts[step % MAX_ACTIVE] = expert_id;
-    }
-}
-
-uint32_t Scout::Impl::predict(uint32_t layer_id, uint32_t* out) const noexcept {
-    if (layer_id >= MAX_LAYERS) return 0;
-
-    uint32_t n = 0;
-    bool     seen[EXPERT_UNIVERSE] {};
-
-    // Strategy 1: n-gram bucket
-    const NgramBucket& bucket = ngram_table[ngram_hash()];
-    for (uint32_t i = 0; i < N_HIST && n < MAX_ACTIVE; ++i) {
-        uint32_t e = bucket.experts[layer_id][i];
-        if (e < experts_per_layer && !seen[e]) {
-            out[n++] = e; seen[e] = true;
-        }
-    }
-
-    // Strategy 2: recency neighbourhood
-    const LayerRecency& rec = recency[layer_id];
-    for (uint32_t r = 0; r < rec.count && n < MAX_ACTIVE; ++r) {
-        uint32_t center = rec.last_experts[r];
-        for (int32_t d = -int32_t(RECENCY_DELTA);
-             d <= int32_t(RECENCY_DELTA) && n < MAX_ACTIVE; ++d)
-        {
-            int32_t e = int32_t(center) + d;
-            if (e < 0 || uint32_t(e) >= experts_per_layer) continue;
-            if (!seen[uint32_t(e)]) {
-                out[n++]          = uint32_t(e);
-                seen[uint32_t(e)] = true;
-            }
-        }
-    }
-
-    // Strategy 3: uniform fallback
-    if (n < MAX_ACTIVE && experts_per_layer > 0) {
-        uint32_t step_size = experts_per_layer / MAX_ACTIVE;
-        if (step_size == 0) step_size = 1;
-        for (uint32_t i = 0; i < experts_per_layer && n < MAX_ACTIVE; i += step_size) {
-            if (!seen[i]) { out[n++] = i; seen[i] = true; }
-        }
-    }
-
-    return n;
-}
-
-uint32_t Scout::Impl::next_token_heuristic(uint32_t current_token) const noexcept {
-    uint32_t best_tok   = (current_token + 1) % FREQ_TABLE_SIZE;
-    uint32_t best_count = 0;
-    for (uint32_t i = 0; i + 1 < std::min(history_fill, HISTORY_CAP); ++i) {
-        uint32_t h_idx = (history_pos + i) % HISTORY_CAP;
-        uint32_t n_idx = (h_idx + 1) % HISTORY_CAP;
-        if (history[h_idx] == current_token) {
-            uint32_t candidate = history[n_idx];
-            if (candidate < FREQ_TABLE_SIZE &&
-                token_freq[candidate] > best_count)
-            {
-                best_count = token_freq[candidate];
-                best_tok   = candidate;
-            }
-        }
-    }
-    return best_tok;
-}
-
-void Scout::Impl::push_token(uint32_t token_id) noexcept {
-    context_ring[context_pos_h % NGRAM_WINDOW] = token_id;
-    context_pos_h  = (context_pos_h + 1) % NGRAM_WINDOW;
-    context_fill_h = std::min(context_fill_h + 1, NGRAM_WINDOW);
-
-    history[history_pos] = token_id;
-    history_pos          = (history_pos + 1) % HISTORY_CAP;
-    history_fill         = std::min(history_fill + 1, HISTORY_CAP);
-
-    if (token_id < FREQ_TABLE_SIZE) token_freq[token_id]++;
-}
-
-ScoutOutput Scout::Impl::heuristic_forward(uint32_t token_id) noexcept {
-    ScoutOutput out {};
-    push_token(token_id);
-    out.next_token_id = next_token_heuristic(token_id);
-    for (uint32_t k = 0; k < cfg.num_moe_layers; ++k) {
-        ExpertPrediction& pred = out.routing[k];
-        pred.layer_id = k + (cfg.has_dense_layer_0 ? 1 : 0);
-        pred.count    = predict(pred.layer_id, pred.expert_ids);
-    }
-    ++step;
-    return out;
-}
-
-// ═══════════════════════════════════════════════════════════════
-// §10  Scout public API
-// ═══════════════════════════════════════════════════════════════
-
-Scout::Scout(const char* scout_safetensors_path, SmoeMetalCtx* metal_ctx, const SmoeHeader* vault_hdr)
-    : impl_(new Impl(scout_safetensors_path, metal_ctx, vault_hdr))
-{}
-
-Scout::~Scout() {
-    delete impl_;
-}
-
-ScoutOutput Scout::forward(uint32_t token_id, bool is_prompt) {
-    if (impl_->neural_mode) {
-        return impl_->neural_forward(token_id);
-    }
-    return impl_->heuristic_forward(token_id);
-}
-
-void Scout::reset_context() {
-    // Neural: reset KV-cache ring
-    impl_->ctx_pos  = 0;
-    impl_->ctx_fill = 0;
-    std::memset(impl_->k_cache, 0, (impl_->cfg.num_moe_layers + 1) * ATTN_CTX * (impl_->cfg.num_kv_heads * impl_->cfg.head_dim) * sizeof(float));
-    std::memset(impl_->v_cache, 0, (impl_->cfg.num_moe_layers + 1) * ATTN_CTX * (impl_->cfg.num_kv_heads * impl_->cfg.head_dim) * sizeof(float));
-
-    // Heuristic: reset context ring + history (preserve learned freq tables)
-    std::memset(impl_->context_ring, 0, sizeof(impl_->context_ring));
-    impl_->context_pos_h  = 0;
-    impl_->context_fill_h = 0;
-
-    std::memset(impl_->history, 0, sizeof(impl_->history));
-    impl_->history_pos  = 0;
-    impl_->history_fill = 0;
-
-    for (auto& rec : impl_->recency) {
-        rec = LayerRecency{};
-    }
-
-    impl_->step = 0;
-    info_printf("[scout] Context reset.\n");
-}
-
-void Scout::sync_position(uint64_t pos) {
-    impl_->ctx_pos  = static_cast<uint32_t>(pos % ATTN_CTX);
-    impl_->ctx_fill = (pos < ATTN_CTX) ? static_cast<uint32_t>(pos) : ATTN_CTX;
-    impl_->step     = pos;
-}
-
-void Scout::rollback(uint32_t steps) {
-    if (steps == 0) return;
-    impl_->ctx_pos = (impl_->ctx_pos + ATTN_CTX - steps) % ATTN_CTX;
-    if (impl_->ctx_fill > 0) {
-        impl_->ctx_fill = (impl_->ctx_fill > steps) ? impl_->ctx_fill - steps : 0;
-    }
-    if (impl_->step >= steps) {
-        impl_->step -= steps;
-    } else {
-        impl_->step = 0;
-    }
-}
-
-void Scout::write_kv_cache(uint32_t layer, uint32_t slot, const float* k, const float* v) {
-    if (!impl_->neural_mode) return;
-    if (layer > impl_->cfg.num_moe_layers || slot >= ATTN_CTX) return;
-    size_t kv_dim = impl_->cfg.num_kv_heads * impl_->cfg.head_dim;
-    float* layer_k = impl_->k_cache + (layer * ATTN_CTX + slot) * kv_dim;
-    float* layer_v = impl_->v_cache + (layer * ATTN_CTX + slot) * kv_dim;
-    std::memcpy(layer_k, k, kv_dim * sizeof(float));
-    std::memcpy(layer_v, v, kv_dim * sizeof(float));
-}
-
 const void* Scout::get_mapped_ptr() const noexcept { return impl_->mmap_base; }
 size_t      Scout::get_mapped_size() const noexcept { return impl_->mmap_size; }
 
 } // namespace smoe::scout
-
-

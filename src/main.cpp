@@ -433,7 +433,9 @@ int main(int argc, char* argv[]) {
 
             // (b) Reserve what the ring must never take:
             //   - the scout file: background prefault makes it fully resident
-            //   - fixed engine overhead: KV cache + activations + Metal scratch
+            //   - fixed engine overhead: heavy KV cache (~1.6 GB at 4096 ctx)
+            //     + activations + Metal scratch. Was 3 GB while the scout
+            //     kept a duplicate ~1.6 GB KV mirror; that mirror is gone.
             //   - an OS floor of 1/8 physical RAM (≥ 4 GB) so ring growth can
             //     never push the system into swap
             uint64_t scout_bytes = 0;
@@ -443,7 +445,7 @@ int main(int argc, char* argv[]) {
                     scout_bytes = static_cast<uint64_t>(sst.st_size);
             }
             uint64_t os_floor = mem_total ? std::max(mem_total / 8, 4 * GB) : 4 * GB;
-            uint64_t reserve  = scout_bytes + 3 * GB + os_floor;
+            uint64_t reserve  = scout_bytes + 2 * GB + os_floor;
 
             // (c) Budget: subtractive, floored at the old 25%-of-free tuner
             // (never regress), capped at half of physical RAM (the pool is
@@ -593,14 +595,9 @@ int main(int argc, char* argv[]) {
 
     // ── Token Generation Loop ─────────────────────────────────
     //
-    // Invariant per token step N:
-    //
-    //   1. Scout runs ahead up to K steps, queueing its predicted tokens
-    //      and routing gates, firing prefetch requests.
-    //   2. Heavy Model executes one step.
-    //   3. Compare Heavy token vs Scout token.
-    //   4. If mismatch, rollback Scout KV-cache and flush queue.
-    //   5. Every TELEMETRY_EVERY tokens: update telemetry bar
+    // Per token step: exact routing at every MoE layer (real gate
+    // matvec on the heavy hidden state), demand prefetch of the
+    // top-8, speculative prefetch of the deeper gate ranks.
 
     // Multi-layer KV cache (static to avoid heap allocation)
     static constexpr uint32_t ATTN_CTX = 4096;
@@ -765,7 +762,6 @@ int main(int argc, char* argv[]) {
             if (req_line == "RESET") {
                 ctx_pos = 0; ctx_fill = 0;
                 stream_len = 0;
-                scout.reset_context();
                 std::printf("<<DONE>>\n");
                 std::fflush(stdout);
                 continue;
@@ -816,7 +812,6 @@ int main(int argc, char* argv[]) {
                 // divergence point is invalid. Full reset, full prefill.
                 ctx_pos = 0; ctx_fill = 0;
                 stream_len = 0;
-                scout.reset_context();
                 lcp = 0;
             }
 
@@ -1025,7 +1020,6 @@ int main(int argc, char* argv[]) {
             const uint32_t slot = ctx_pos % ATTN_CTX;
             std::memcpy(k_cache + slot * kv_dim, heavy_kbuf, kv_dim * sizeof(float));
             std::memcpy(v_cache + slot * kv_dim, heavy_vbuf, kv_dim * sizeof(float));
-            scout.write_kv_cache(l, slot, heavy_kbuf, heavy_vbuf);
 
             // Multi-Head Attention CPU (with GQA support)
             const float scale = 1.0f / std::sqrt(static_cast<float>(cfg.head_dim));
@@ -1036,15 +1030,11 @@ int main(int argc, char* argv[]) {
 
             for (uint32_t h = 0; h < cfg.num_heads; ++h) {
                 uint32_t kv_h = h / heads_per_kv;
+                const float* qhead = heavy_qbuf + h * cfg.head_dim;
                 for (uint32_t i = 0; i < valid; ++i) {
                     uint32_t ki = (ctx_pos - i + ATTN_CTX) % ATTN_CTX;
-                    float dot_qk = 0.0f;
                     const float* krow = k_cache + ki * kv_dim + kv_h * cfg.head_dim;
-                    const float* qhead = heavy_qbuf + h * cfg.head_dim;
-                    for (uint32_t d = 0; d < cfg.head_dim; ++d) {
-                        dot_qk += qhead[d] * krow[d];
-                    }
-                    attn_scores[i] = dot_qk * scale;
+                    attn_scores[i] = smoe::dot_f32(qhead, krow, cfg.head_dim) * scale;
                 }
 
                 float max_val = attn_scores[0];
@@ -1061,14 +1051,12 @@ int main(int argc, char* argv[]) {
                     attn_scores[i] *= inv_sum;
                 }
 
+                float* out_head = heavy_attn_out + h * cfg.head_dim;
                 for (uint32_t i = 0; i < valid; ++i) {
                     uint32_t vi = (ctx_pos - i + ATTN_CTX) % ATTN_CTX;
-                    const float alpha = attn_scores[i];
-                    const float* vrow = v_cache + vi * kv_dim + kv_h * cfg.head_dim;
-                    float* out_head = heavy_attn_out + h * cfg.head_dim;
-                    for (uint32_t d = 0; d < cfg.head_dim; ++d) {
-                        out_head[d] += alpha * vrow[d];
-                    }
+                    smoe::axpy_f32(out_head, attn_scores[i],
+                                   v_cache + vi * kv_dim + kv_h * cfg.head_dim,
+                                   cfg.head_dim);
                 }
             }
 
@@ -1206,12 +1194,39 @@ int main(int argc, char* argv[]) {
                 
                 void* wait_handles[16] = {nullptr};
                 smoe::io::RingSlot* active_slots[16] = {nullptr};
-                static std::vector<float*> expert_hidden_scratch(16, nullptr);
                 static std::vector<float*> expert_output_vec(16, nullptr);
                 for (int i = 0; i < 16; ++i) {
-                    if (!expert_hidden_scratch[i]) expert_hidden_scratch[i] = smoe::allocate_aligned_float(ffn_dim);
                     if (!expert_output_vec[i]) expert_output_vec[i] = smoe::allocate_aligned_float(d_model);
                 }
+
+                // Grouped dispatch staging: every expert whose slot is
+                // ready in the same sweep rides ONE command buffer
+                // (was: one command buffer per expert — 752/token).
+                SmoeExpertBlob group_blobs[16];
+                uint32_t group_n = 0;
+                auto stage_expert = [&](smoe::io::RingSlot* slot, uint32_t e) {
+                    group_blobs[group_n++] = SmoeExpertBlob{
+                        slot->data + expert_layout.gate_packed_offset,
+                        reinterpret_cast<const uint16_t*>(slot->data + expert_layout.gate_scales_offset),
+                        slot->data + expert_layout.up_packed_offset,
+                        reinterpret_cast<const uint16_t*>(slot->data + expert_layout.up_scales_offset),
+                        slot->data + expert_layout.down_packed_offset,
+                        reinterpret_cast<const uint16_t*>(slot->data + expert_layout.down_scales_offset),
+                        e
+                    };
+                };
+                auto dispatch_group = [&]() {
+                    if (group_n == 0) return;
+                    void* h = smoe_metal_fused_ffn_group(
+                        metal, group_blobs, group_n, heavy_normed,
+                        expert_layout.gate_rows, expert_layout.gate_cols,
+                        expert_layout.down_rows, expert_layout.down_cols,
+                        vault_hdr.group_size, vault_hdr.bits);
+                    for (uint32_t i = 0; i < group_n; ++i)
+                        wait_handles[group_blobs[i].slot] = h;
+                    group_n = 0;
+                };
+
                 // Initial non-blocking pass
                 if (g_debug) {
                     std::fprintf(stderr, "[DEBUG] layer %u: pred.count = %u. Experts: ", l, pred.count);
@@ -1219,43 +1234,21 @@ int main(int argc, char* argv[]) {
                         std::fprintf(stderr, "%u ", pred.expert_ids[e]);
                     }
                     std::fprintf(stderr, "\n");
+                    std::fflush(stderr);
                 }
-                std::fflush(stderr);
-                
+
                 for (uint32_t e = 0; e < pred.count; ++e) {
                     smoe::io::RingSlot* slot = streamer.claim_specific(pred.layer_id, pred.expert_ids[e]);
                     if (slot) {
                         active_slots[e] = slot;
                         if (pred.layer_id < 128 && pred.expert_ids[e] < smoe::prefill::HITS_STRIDE)
                             g_expert_hits[pred.layer_id * smoe::prefill::HITS_STRIDE + pred.expert_ids[e]]++;
-                        if (slot->data_size > 0) {
-                            const uint8_t*  packed_gate = slot->data + expert_layout.gate_packed_offset;
-                            const uint16_t* scales_gate = reinterpret_cast<const uint16_t*>(slot->data + expert_layout.gate_scales_offset);
-                            const uint8_t*  packed_up   = slot->data + expert_layout.up_packed_offset;
-                            const uint16_t* scales_up   = reinterpret_cast<const uint16_t*>(slot->data + expert_layout.up_scales_offset);
-                            const uint8_t*  packed_down = slot->data + expert_layout.down_packed_offset;
-                            const uint16_t* scales_down = reinterpret_cast<const uint16_t*>(slot->data + expert_layout.down_scales_offset);
-
-                            if (g_debug) {
-                                std::fprintf(stderr, "[DEBUG] e=%u, ffn_dim=%u, d_model=%u, scratch=%p, out=%p\n", e, ffn_dim, d_model, expert_hidden_scratch[e], expert_output_vec[e]);
-                                std::fflush(stderr);
-                            }
-                            std::memset(expert_hidden_scratch[e], 0, ffn_dim * sizeof(float));
-                            std::memset(expert_output_vec[e], 0, d_model * sizeof(float));
-
-                            wait_handles[e] = smoe_metal_fused_ffn(
-                                metal,
-                                packed_gate, scales_gate, packed_up, scales_up, packed_down, scales_down,
-                                heavy_normed, expert_hidden_scratch[e], expert_output_vec[e],
-                                expert_layout.gate_rows, expert_layout.gate_cols,
-                                expert_layout.down_rows, expert_layout.down_cols,
-                                vault_hdr.group_size, vault_hdr.bits, e
-                            );
-                        }
+                        if (slot->data_size > 0) stage_expert(slot, e);
                         executed[e] = true;
                         num_executed++;
                     }
                 }
+                dispatch_group();   // all ring hits in one command buffer
                 instr_bucket(instr.dispatch_ms);
 
                 // ── Phase 2: Compute Shared Expert on CPU while GPU/SSD works ──
@@ -1287,6 +1280,9 @@ int main(int argc, char* argv[]) {
                 instr_bucket(instr.dense_ms);   // shared expert (none on Qwen3)
 
                 // ── Phase 3: Spin-wait for any remaining missing experts ──
+                // Each sweep groups everything that became READY since
+                // the last one into a single command buffer, so a burst
+                // of completed reads costs one commit, not one each.
                 while (num_executed < pred.count) {
                     bool made_progress = false;
                     for (uint32_t e = 0; e < pred.count; ++e) {
@@ -1297,42 +1293,17 @@ int main(int argc, char* argv[]) {
                             active_slots[e] = slot;
                             if (pred.layer_id < 128 && pred.expert_ids[e] < smoe::prefill::HITS_STRIDE)
                                 g_expert_hits[pred.layer_id * smoe::prefill::HITS_STRIDE + pred.expert_ids[e]]++;
-                            if (slot->data_size > 0) {
-                                const uint8_t*  packed_gate = slot->data + expert_layout.gate_packed_offset;
-                                const uint16_t* scales_gate = reinterpret_cast<const uint16_t*>(slot->data + expert_layout.gate_scales_offset);
-                                const uint8_t*  packed_up   = slot->data + expert_layout.up_packed_offset;
-                                const uint16_t* scales_up   = reinterpret_cast<const uint16_t*>(slot->data + expert_layout.up_scales_offset);
-                                const uint8_t*  packed_down = slot->data + expert_layout.down_packed_offset;
-                                const uint16_t* scales_down = reinterpret_cast<const uint16_t*>(slot->data + expert_layout.down_scales_offset);
-
-                                std::memset(expert_hidden_scratch[e], 0, ffn_dim * sizeof(float));
-                                std::memset(expert_output_vec[e], 0, d_model * sizeof(float));
-
-                                wait_handles[e] = smoe_metal_fused_ffn(
-                                    metal,
-                                    packed_gate, scales_gate, packed_up, scales_up, packed_down, scales_down,
-                                    heavy_normed, expert_hidden_scratch[e], expert_output_vec[e],
-                                    expert_layout.gate_rows, expert_layout.gate_cols,
-                                    expert_layout.down_rows, expert_layout.down_cols,
-                                    vault_hdr.group_size, vault_hdr.bits, e
-                                );
-                            }
+                            if (slot->data_size > 0) stage_expert(slot, e);
                             executed[e] = true;
                             num_executed++;
-                            if (g_debug) {
-                                float test_sum = 0;
-                                for (int i=0; i<10; ++i) test_sum += expert_output_vec[e][i];
-                                std::fprintf(stderr, "[DEBUG] layer=%u e=%d weight=%f sum_10=%f\n", l, e, pred.expert_weights[e], test_sum);
-                            }
                             made_progress = true;
                         } else {
-                            
-if (spin % 10000 == 0) {
-
-                                streamer.prefetch(pred.layer_id, pred.expert_ids[e]);
+                            if (spin % 10000 == 0) {
+                                (void)streamer.prefetch(pred.layer_id, pred.expert_ids[e]);
                             }
                         }
                     }
+                    dispatch_group();
 
                     if (!made_progress) {
                         std::this_thread::yield();

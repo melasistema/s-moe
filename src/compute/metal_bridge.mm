@@ -862,8 +862,6 @@ void* smoe_metal_fused_ffn(SmoeMetalCtx*   ctx,
     FusedFFNParamsC params { gate_rows, gate_cols, down_rows, down_cols, group_size, bits };
 
     // ── Wrap raw pointers in MTLBuffers (no-copy) ─────────────
-    MTLResourceOptions uma = MTLResourceStorageModeShared;
-
     @autoreleasepool {
         // Compute byte sizes for each sub-tensor (assuming gate/up are same shape and down is transpose)
         uint64_t packed_bytes = static_cast<uint64_t>(gate_rows) * gate_cols * bits / 8;
@@ -888,11 +886,6 @@ void* smoe_metal_fused_ffn(SmoeMetalCtx*   ctx,
 
         std::memcpy([buf_in contents], input_vec, input_bytes);
 
-        // Params as a tiny inline buffer
-        id<MTLBuffer> buf_pa = [ctx->device newBufferWithBytes:&params
-                                                        length:sizeof(params)
-                                                       options:uma];
-
         // ── Encode and commit ─────────────────────────────────────
         id<MTLCommandBuffer>         cmd  = [ctx->queue commandBuffer];
         id<MTLComputeCommandEncoder> enc  = [cmd computeCommandEncoder];
@@ -905,7 +898,10 @@ void* smoe_metal_fused_ffn(SmoeMetalCtx*   ctx,
         [enc setBuffer:buf_us offset:off_us atIndex:3];
         [enc setBuffer:buf_in offset:0      atIndex:6];
         [enc setBuffer:buf_hd offset:hd_offset atIndex:7];
-        [enc setBuffer:buf_pa offset:0      atIndex:9];
+        // setBytes: the params struct is 24 bytes — inlined into the
+        // command stream. The old newBufferWithBytes here was a heap
+        // allocation per dispatch, in the hot loop.
+        [enc setBytes:&params length:sizeof(params) atIndex:9];
     // Threadgroup SRAM: TGROUP_SIZE floats for the input tile
     [enc setThreadgroupMemoryLength:256 * 2 * sizeof(float) atIndex:0];
 
@@ -973,6 +969,104 @@ void smoe_metal_wait(SmoeMetalCtx* ctx, void* handle, float* output_vec, uint32_
         std::this_thread::yield();
     }
     std::memcpy(output_vec, ((float*)[ctx->output_buf contents]) + expert_index * ctx->max_rows, cols * sizeof(float));
+}
+
+void* smoe_metal_fused_ffn_group(SmoeMetalCtx*        ctx,
+                                 const SmoeExpertBlob* experts,
+                                 uint32_t              n_experts,
+                                 const float*          input_vec,
+                                 uint32_t              gate_rows,
+                                 uint32_t              gate_cols,
+                                 uint32_t              down_rows,
+                                 uint32_t              down_cols,
+                                 uint32_t              group_size,
+                                 uint32_t              bits)
+{
+    if (!ctx || n_experts == 0) return nullptr;
+
+    struct FusedFFNParamsC { uint32_t gate_rows, gate_cols, down_rows, down_cols, group_size, bits; };
+    FusedFFNParamsC params { gate_rows, gate_cols, down_rows, down_cols, group_size, bits };
+
+    @autoreleasepool {
+        const uint64_t packed_bytes = static_cast<uint64_t>(gate_rows) * gate_cols * bits / 8;
+        const uint64_t scale_bytes  = static_cast<uint64_t>(gate_rows) * gate_cols / group_size * sizeof(uint16_t);
+        const uint64_t input_bytes  = static_cast<uint64_t>(gate_cols) * sizeof(float);
+
+        // One input copy for the whole group — every expert of a layer
+        // consumes the same normed hidden state.
+        std::memcpy([ctx->input_buf contents], input_vec, input_bytes);
+
+        id<MTLCommandBuffer>         cmd = [ctx->queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+
+        const NSUInteger tgroup = 256;
+        const MTLSize tgSize    = MTLSizeMake(tgroup, 1, 1);
+        const MTLSize gridGate  = MTLSizeMake((gate_rows + tgroup - 1) / tgroup, 1, 1);
+        const MTLSize gridDown  = MTLSizeMake((down_rows + tgroup - 1) / tgroup, 1, 1);
+
+        // ── Pass 1: smoe_gate_up for every expert ─────────────────
+        // Shape/params/input are identical across the group — bound
+        // once. Only the weight buffers and the per-expert hidden
+        // region change between dispatches.
+        [enc setComputePipelineState:ctx->gate_up_pso];
+        [enc setBuffer:ctx->input_buf offset:0 atIndex:6];
+        [enc setBytes:&params length:sizeof(params) atIndex:9];
+        [enc setThreadgroupMemoryLength:256 * 2 * sizeof(float) atIndex:0];
+
+        for (uint32_t i = 0; i < n_experts; ++i) {
+            NSUInteger off_gp = 0, off_gs = 0, off_up = 0, off_us = 0;
+            id<MTLBuffer> buf_gp = get_registered_buffer(ctx, experts[i].packed_gate, packed_bytes, off_gp);
+            id<MTLBuffer> buf_gs = get_registered_buffer(ctx, experts[i].scales_gate, scale_bytes,  off_gs);
+            id<MTLBuffer> buf_up = get_registered_buffer(ctx, experts[i].packed_up,   packed_bytes, off_up);
+            id<MTLBuffer> buf_us = get_registered_buffer(ctx, experts[i].scales_up,   scale_bytes,  off_us);
+
+            [enc setBuffer:buf_gp offset:off_gp atIndex:0];
+            [enc setBuffer:buf_gs offset:off_gs atIndex:1];
+            [enc setBuffer:buf_up offset:off_up atIndex:2];
+            [enc setBuffer:buf_us offset:off_us atIndex:3];
+            [enc setBuffer:ctx->hidden_buf
+                   offset:experts[i].slot * ctx->max_rows * sizeof(float)
+                  atIndex:7];
+            [enc dispatchThreadgroups:gridGate threadsPerThreadgroup:tgSize];
+        }
+
+        // One barrier for the whole group: every down pass reads only
+        // its own expert's hidden region, written by pass 1 above.
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        // ── Pass 2: smoe_down for every expert ────────────────────
+        [enc setComputePipelineState:ctx->down_pso];
+        [enc setBytes:&params length:sizeof(params) atIndex:9];
+        [enc setThreadgroupMemoryLength:256 * sizeof(float) atIndex:0];
+
+        for (uint32_t i = 0; i < n_experts; ++i) {
+            NSUInteger off_dp = 0, off_ds = 0;
+            id<MTLBuffer> buf_dp = get_registered_buffer(ctx, experts[i].packed_down, packed_bytes, off_dp);
+            id<MTLBuffer> buf_ds = get_registered_buffer(ctx, experts[i].scales_down, scale_bytes,  off_ds);
+
+            const NSUInteger region = experts[i].slot * ctx->max_rows * sizeof(float);
+            [enc setBuffer:buf_dp offset:off_dp atIndex:4];
+            [enc setBuffer:buf_ds offset:off_ds atIndex:5];
+            [enc setBuffer:ctx->hidden_buf offset:region atIndex:7];
+            [enc setBuffer:ctx->output_buf offset:region atIndex:8];
+            [enc dispatchThreadgroups:gridDown threadsPerThreadgroup:tgSize];
+        }
+
+        [enc endEncoding];
+
+        [cmd addCompletedHandler:^(id<MTLCommandBuffer> buffer) {
+            (void)buffer;
+            ctx->dispatch_count.fetch_add(n_experts, std::memory_order_relaxed);
+        }];
+
+        ctx->signaled_value++;
+        uint64_t wait_val = ctx->signaled_value;
+        [cmd encodeSignalEvent:ctx->shared_event value:wait_val];
+
+        [cmd commit];
+
+        return (void*)(uintptr_t)wait_val;
+    } // end @autoreleasepool
 }
 
 void* smoe_metal_fused_ffn_batch(SmoeMetalCtx*   ctx,

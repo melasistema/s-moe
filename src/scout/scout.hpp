@@ -1,19 +1,21 @@
 // ═══════════════════════════════════════════════════════════════
 // scout.hpp — S-MoE Engine · Surface Scout Interface
 // ═══════════════════════════════════════════════════════════════
-// Phase 3/4 stub — to be implemented in Week 4+.
+// The Surface Scout is the heavy model's own dense backbone
+// (~16 GB bf16 for Qwen3-235B): embeddings, attention projections,
+// norms, router gates, and the LM head — everything the sculptor
+// did NOT exile into the .smoe expert vault.
 //
-// The Surface Scout is a lightweight (~1.5B param) model that:
-//   ① Performs standard autoregressive token generation.
-//   ② Runs a secondary routing head that predicts which expert
-//      IDs will be activated up to K steps into the future.
+// It is a weights artifact, not a running model. The engine's
+// forward pass (main.cpp / prefill.cpp) reads these tensors
+// directly via the accessors below; routing is computed exactly
+// from the heavy hidden state with get_gate() + compute_top_k().
 //
-// Contract for the core loop (main.cpp):
-//   scout.forward(context) →
-//     { next_token_id, predicted_expert_ids[K][MAX_ACTIVE] }
-//
-// Week 4 (heuristic): expert prediction via n-gram attention maps.
-// Week 5+:            replace with distilled neural routing head.
+// History: this class once ran its own speculative forward pass
+// to predict expert routing K steps ahead. Measurement retired it
+// (51.5% oracle accuracy vs 46.4% free ring retention) — the
+// forward machinery, its KV mirror (~1.6 GB), and the Week-4
+// heuristic oracle were deleted, not just bypassed.
 // ═══════════════════════════════════════════════════════════════
 
 #pragma once
@@ -21,19 +23,15 @@
 #include "../common.hpp"
 
 #include <cstdint>
-#include <span>
-#include <vector>
 
 struct SmoeMetalCtx;
 
 namespace smoe::scout {
 
-// Lookahead window depth — how many future steps to predict
-inline constexpr uint32_t LOOKAHEAD_K   = 10;
 // Maximum simultaneously active experts per token per layer
 inline constexpr uint32_t MAX_ACTIVE    =  16;
 
-// ── Expert prediction for one future step ────────────────────
+// ── Expert selection for one token step at one layer ─────────
 struct ExpertPrediction {
     uint32_t layer_id;
     uint32_t expert_ids[MAX_ACTIVE];
@@ -43,50 +41,21 @@ struct ExpertPrediction {
 
 inline constexpr uint32_t MAX_MOE_LAYERS = 128;
 
-// ── Scout forward-pass result ────────────────────────────────
-struct ScoutOutput {
-    uint32_t next_token_id;
-    // Predicted experts for the current token for all MoE layers
-    ExpertPrediction routing[MAX_MOE_LAYERS];
-};
-
-// ── Surface Scout — Week 4 interface stub ────────────────────
+// ── Surface Scout — resident dense-backbone weights ──────────
 class Scout {
 public:
-    // Load Scout weights from a .safetensors file.
+    // Load Scout weights from a .safetensors file (mmap, resident).
     Scout(const char* scout_safetensors_path, SmoeMetalCtx* metal_ctx, const SmoeHeader* vault_hdr = nullptr);
     ~Scout();
 
-    // Run one forward step, updating internal KV-cache context.
-    // Returns next token + expert routing for the current token.
-    ScoutOutput forward(uint32_t token_id, bool is_prompt = false);
-
-    // Rollback the internal KV-cache state by K steps to recover from
-    // speculative divergence.
-    void rollback(uint32_t steps);
-
-    // Align the scout's KV ring position and RoPE step with the heavy
-    // stream. Used when the prompt was prefilled without scout forwards
-    // (exact routing) but the KV cache was populated via write_kv_cache.
-    void sync_position(uint64_t pos);
-
-    // Reset KV-cache for a new prompt.
-    void reset_context();
-
-    // Write key/value directly to the Scout's KV cache to keep it in sync with Heavy model.
-    void write_kv_cache(uint32_t layer, uint32_t slot, const float* k, const float* v);
-
     // Get the dynamically parsed model configuration
     const SmoeModelConfig& config() const noexcept;
-
-    // ── Heavy Echo (Temporal Routing) ─────────────────────────────────
-    void update_echo(uint32_t layer, const float* hidden) noexcept;
 
     // ── Accessors (for heavy-model / debugger) ────────────────────────
     const uint16_t* get_embed() const noexcept;
     const uint16_t* get_lm_head() const noexcept;
     const uint16_t* get_model_norm() const noexcept;
-    
+
     // Layer 0: dense MLP
     const uint16_t* get_l0_gate() const noexcept;
     const uint16_t* get_l0_up() const noexcept;
@@ -102,14 +71,14 @@ public:
     uint32_t compute_top_k(const float* scores, uint32_t n, uint32_t k, uint32_t* out_indices, float* out_weights, bool norm_topk) const noexcept;
     const uint16_t* get_input_norm(uint32_t layer) const noexcept;
     [[nodiscard]] const uint16_t* get_post_norm(uint32_t l) const noexcept;
-    
+
     // Mmapped memory access
     [[nodiscard]] const void* get_mapped_ptr() const noexcept;
     [[nodiscard]] size_t      get_mapped_size() const noexcept;
     const uint16_t* get_gate(uint32_t layer) const noexcept;
-    
+
     float* get_lm_head_scores() const noexcept;
-    
+
     // Layers 1..27 shared experts
     const uint16_t* get_shared_gate(uint32_t layer) const noexcept;
     const uint16_t* get_shared_up(uint32_t layer) const noexcept;

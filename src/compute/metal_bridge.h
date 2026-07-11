@@ -100,6 +100,39 @@ void* smoe_metal_fused_ffn(SmoeMetalCtx*   ctx,
 
 void smoe_metal_wait(SmoeMetalCtx* ctx, void* handle, float* output_vec, uint32_t expert_index, uint32_t cols);
 
+// ── Grouped expert dispatch (decode hot loop) ─────────────────
+// Encodes N same-shaped experts into ONE command buffer:
+// all gate_up passes, one barrier, all down passes, one signal.
+// Replaces N per-expert command buffers (commit/schedule overhead
+// ~0.1–0.3 ms each) with one. The layer input is copied into the
+// shared input buffer once per call — every expert of a layer
+// consumes the same normed hidden state.
+//
+// `slot` selects the expert's private region in the pre-allocated
+// hidden/output scratch (same indexing as smoe_metal_fused_ffn's
+// expert_index). Fetch each expert's result with smoe_metal_wait
+// using the returned handle and its slot.
+typedef struct {
+    const uint8_t*  packed_gate;
+    const uint16_t* scales_gate;
+    const uint8_t*  packed_up;
+    const uint16_t* scales_up;
+    const uint8_t*  packed_down;
+    const uint16_t* scales_down;
+    uint32_t        slot;
+} SmoeExpertBlob;
+
+void* smoe_metal_fused_ffn_group(SmoeMetalCtx*        ctx,
+                                 const SmoeExpertBlob* experts,
+                                 uint32_t              n_experts,
+                                 const float*          input_vec,
+                                 uint32_t              gate_rows,
+                                 uint32_t              gate_cols,
+                                 uint32_t              down_rows,
+                                 uint32_t              down_cols,
+                                 uint32_t              group_size,
+                                 uint32_t              bits);
+
 // ── Token-batch fused FFN (layer-major prefill) ──────────────
 // Applies ONE expert to `batch` token activations in a single
 // two-pass dispatch. input_mat is row-major [batch × gate_cols];

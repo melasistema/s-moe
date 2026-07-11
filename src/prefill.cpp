@@ -167,7 +167,6 @@ void run_layer_major(const Params& P,
                 const uint32_t slot = (base_slot + i) % ATTN_CTX;
                 std::memcpy(k_cache + static_cast<size_t>(slot) * kv_dim, ki, kv_dim * sizeof(float));
                 std::memcpy(v_cache + static_cast<size_t>(slot) * kv_dim, vi, kv_dim * sizeof(float));
-                scout.write_kv_cache(l, slot, ki, vi);
             }
 
             // ── ③ Causal attention + ④ o_proj/residual/FFN-norm ──
@@ -190,9 +189,7 @@ void run_layer_major(const Params& P,
                     for (uint32_t j = 0; j < valid; ++j) {
                         uint32_t kslot = (slot_i - j + ATTN_CTX) % ATTN_CTX;
                         const float* krow = k_cache + static_cast<size_t>(kslot) * kv_dim + kv_h * cfg.head_dim;
-                        float dot = 0.0f;
-                        for (uint32_t d = 0; d < cfg.head_dim; ++d) dot += qhead[d] * krow[d];
-                        attn_scores[j] = dot * attn_scale;
+                        attn_scores[j] = smoe::dot_f32(qhead, krow, cfg.head_dim) * attn_scale;
                     }
 
                     float max_val = attn_scores[0];
@@ -207,9 +204,8 @@ void run_layer_major(const Params& P,
                     float* out_head = ao + hh * cfg.head_dim;
                     for (uint32_t j = 0; j < valid; ++j) {
                         uint32_t vslot = (slot_i - j + ATTN_CTX) % ATTN_CTX;
-                        const float alpha = attn_scores[j] * inv_sum;
                         const float* vrow = v_cache + static_cast<size_t>(vslot) * kv_dim + kv_h * cfg.head_dim;
-                        for (uint32_t d = 0; d < cfg.head_dim; ++d) out_head[d] += alpha * vrow[d];
+                        smoe::axpy_f32(out_head, attn_scores[j] * inv_sum, vrow, cfg.head_dim);
                     }
                 }
 
