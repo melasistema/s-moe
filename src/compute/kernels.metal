@@ -394,6 +394,195 @@ kernel void scout_matvec_bf16(
 }
 
 // ═══════════════════════════════════════════════════════════════
+// Decode attention (single token) — one command buffer per layer
+// ═══════════════════════════════════════════════════════════════
+// Two kernels bridge the gap between the QKV and O projections so
+// the whole attention block runs GPU-resident with ONE CPU sync per
+// layer instead of two (the CPU previously did QK-norm/RoPE/attention
+// between two synchronous matvec roundtrips).
+// NOTE: like the kernels above, this source is duplicated as an
+// embedded string in metal_bridge.mm (kMetalSource) — keep in sync.
+
+struct AttnPrepParams {
+    uint head_dim;      // per-head dim (Qwen3: 128)
+    uint num_heads;     // query heads
+    uint num_kv_heads;  // KV heads (GQA)
+    uint rope_half;     // head_dim / 2
+    uint slot;          // KV ring write slot (ctx_pos % attn_ctx)
+    uint kv_dim;        // num_kv_heads * head_dim
+    uint has_qk_norm;   // 0 → skip per-head RMS norm entirely
+};
+
+// Per-head QK RMS-norm + RoPE + KV-cache append.
+// Grid: (num_heads + num_kv_heads) threadgroups × head_dim threads.
+// Threadgroups < num_heads process a Q head in place; the rest
+// process a K head and write the rotated K row plus the raw V row
+// straight into the layer's KV ring at `slot`.
+// Threadgroup memory: (head_dim + 32) floats — staged head vector
+// followed by per-simdgroup reduction scratch.
+kernel void attn_prep(
+    device       float*    qbuf      [[buffer(0)]],
+    device       float*    kbuf      [[buffer(1)]],
+    device const float*    vbuf      [[buffer(2)]],
+    device const uint16_t* q_norm_w  [[buffer(3)]],
+    device const uint16_t* k_norm_w  [[buffer(4)]],
+    device const float*    rope_cos  [[buffer(5)]],
+    device const float*    rope_sin  [[buffer(6)]],
+    device       float*    k_cache   [[buffer(7)]],
+    device       float*    v_cache   [[buffer(8)]],
+    constant AttnPrepParams& p       [[buffer(9)]],
+    uint hg   [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]],
+    uint ntid [[threads_per_threadgroup]],
+    uint sgi  [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    threadgroup float* tg [[threadgroup(0)]])
+{
+    const bool is_q = (hg < p.num_heads);
+    const uint h    = is_q ? hg : (hg - p.num_heads);
+    device float* head = is_q ? (qbuf + h * p.head_dim)
+                              : (kbuf + h * p.head_dim);
+
+    threadgroup float* vec = tg;
+    threadgroup float* red = tg + p.head_dim;
+
+    float x = (tid < p.head_dim) ? head[tid] : 0.0f;
+
+    if (p.has_qk_norm != 0) {
+        // Must match smoe::rms_norm_bf16: mean-of-squares + 1e-6.
+        // simd_sum reassociates the reduction — not bit-exact vs CPU.
+        float ss = simd_sum(x * x);
+        if (lane == 0) red[sgi] = ss;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) {
+            float tot = 0.0f;
+            uint nsg = (ntid + 31u) / 32u;
+            for (uint i = 0; i < nsg; ++i) tot += red[i];
+            red[0] = 1.0f / sqrt(tot / float(p.head_dim) + 1e-6f);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float inv = red[0];
+        device const uint16_t* nw = is_q ? q_norm_w : k_norm_w;
+        if (tid < p.head_dim) x = (x * inv) * bf16_to_f32(nw[tid]);
+    }
+    if (tid < p.head_dim) vec[tid] = x;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // RoPE pair rotation: (d, d + rope_half) share angle d.
+    float rot = x;
+    if (tid < p.rope_half) {
+        rot = vec[tid] * rope_cos[tid] - vec[tid + p.rope_half] * rope_sin[tid];
+    } else if (tid < p.head_dim) {
+        uint d = tid - p.rope_half;
+        rot = vec[d] * rope_sin[d] + vec[tid] * rope_cos[d];
+    }
+
+    if (tid < p.head_dim) {
+        if (is_q) {
+            head[tid] = rot;
+        } else {
+            uint co = p.slot * p.kv_dim + h * p.head_dim + tid;
+            k_cache[co] = rot;
+            v_cache[co] = vbuf[h * p.head_dim + tid];
+        }
+    }
+}
+
+struct AttnDecodeParams {
+    uint  head_dim;
+    uint  num_heads;
+    uint  heads_per_kv;  // num_heads / num_kv_heads (GQA fan-in)
+    uint  kv_dim;
+    uint  slot;          // ring slot of the CURRENT token
+    uint  valid;         // attended positions incl. current (≤ attn_ctx)
+    uint  attn_ctx;      // KV ring capacity
+    float scale;         // 1/sqrt(head_dim)
+};
+
+// Single-token GQA attention over the KV ring.
+// Grid: num_heads threadgroups × TGROUP_SIZE threads.
+// Threadgroup memory: (head_dim + valid + 32) floats —
+//   staged Q head | score row | per-simdgroup reduction scratch.
+// valid ≤ 4096 keeps this under the 32 KB threadgroup limit.
+kernel void attn_decode(
+    device const float* qbuf     [[buffer(0)]],
+    device const float* k_cache  [[buffer(1)]],
+    device const float* v_cache  [[buffer(2)]],
+    device       float* attn_out [[buffer(3)]],
+    constant AttnDecodeParams& p [[buffer(4)]],
+    uint h    [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]],
+    uint ntid [[threads_per_threadgroup]],
+    uint sgi  [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    threadgroup float* tg [[threadgroup(0)]])
+{
+    threadgroup float* qvec   = tg;
+    threadgroup float* scores = tg + p.head_dim;
+    threadgroup float* red    = scores + p.valid;
+
+    const uint kv_off = (h / p.heads_per_kv) * p.head_dim;
+
+    for (uint d = tid; d < p.head_dim; d += ntid) {
+        qvec[d] = qbuf[h * p.head_dim + d];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Scores: position i counts back from the current slot.
+    float lmax = -INFINITY;
+    for (uint i = tid; i < p.valid; i += ntid) {
+        uint ki = (p.slot + p.attn_ctx - i) % p.attn_ctx;
+        device const float* krow = k_cache + ki * p.kv_dim + kv_off;
+        float acc = 0.0f;
+        for (uint d = 0; d < p.head_dim; ++d) acc += qvec[d] * krow[d];
+        acc *= p.scale;
+        scores[i] = acc;
+        lmax = max(lmax, acc);
+    }
+    lmax = simd_max(lmax);
+    if (lane == 0) red[sgi] = lmax;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float m = red[0];
+        uint nsg = (ntid + 31u) / 32u;
+        for (uint i = 1; i < nsg; ++i) m = max(m, red[i]);
+        red[0] = m;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float gmax = red[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup); // red[0] reused below
+
+    float lsum = 0.0f;
+    for (uint i = tid; i < p.valid; i += ntid) {
+        float e = exp(scores[i] - gmax);
+        scores[i] = e;
+        lsum += e;
+    }
+    lsum = simd_sum(lsum);
+    if (lane == 0) red[sgi] = lsum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float s = 0.0f;
+        uint nsg = (ntid + 31u) / 32u;
+        for (uint i = 0; i < nsg; ++i) s += red[i];
+        red[0] = (s > 0.0f) ? (1.0f / s) : 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float inv_sum = red[0];
+
+    // Weighted V sum: thread d owns output dim d; consecutive threads
+    // read consecutive addresses of each V row (coalesced).
+    for (uint d = tid; d < p.head_dim; d += ntid) {
+        float acc = 0.0f;
+        for (uint i = 0; i < p.valid; ++i) {
+            uint vi = (p.slot + p.attn_ctx - i) % p.attn_ctx;
+            acc += scores[i] * v_cache[vi * p.kv_dim + kv_off + d];
+        }
+        attn_out[h * p.head_dim + d] = acc * inv_sum;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
 // Token-batch fused FFN (layer-major prefill)
 // ═══════════════════════════════════════════════════════════════
 // One dispatch applies one expert to `batch` token activations:

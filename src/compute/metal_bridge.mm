@@ -445,6 +445,193 @@ kernel void scout_matvec_bf16(
     }
 }
 
+// ═══════════════════════════════════════════════════════════════
+// Decode attention (single token) — one command buffer per layer
+// ═══════════════════════════════════════════════════════════════
+// Two kernels bridge the gap between the QKV and O projections so
+// the whole attention block runs GPU-resident with ONE CPU sync per
+// layer instead of two (the CPU previously did QK-norm/RoPE/attention
+// between two synchronous matvec roundtrips).
+
+struct AttnPrepParams {
+    uint head_dim;      // per-head dim (Qwen3: 128)
+    uint num_heads;     // query heads
+    uint num_kv_heads;  // KV heads (GQA)
+    uint rope_half;     // head_dim / 2
+    uint slot;          // KV ring write slot (ctx_pos % attn_ctx)
+    uint kv_dim;        // num_kv_heads * head_dim
+    uint has_qk_norm;   // 0 → skip per-head RMS norm entirely
+};
+
+// Per-head QK RMS-norm + RoPE + KV-cache append.
+// Grid: (num_heads + num_kv_heads) threadgroups × head_dim threads.
+// Threadgroups < num_heads process a Q head in place; the rest
+// process a K head and write the rotated K row plus the raw V row
+// straight into the layer's KV ring at `slot`.
+// Threadgroup memory: (head_dim + 32) floats — staged head vector
+// followed by per-simdgroup reduction scratch.
+kernel void attn_prep(
+    device       float*    qbuf      [[buffer(0)]],
+    device       float*    kbuf      [[buffer(1)]],
+    device const float*    vbuf      [[buffer(2)]],
+    device const uint16_t* q_norm_w  [[buffer(3)]],
+    device const uint16_t* k_norm_w  [[buffer(4)]],
+    device const float*    rope_cos  [[buffer(5)]],
+    device const float*    rope_sin  [[buffer(6)]],
+    device       float*    k_cache   [[buffer(7)]],
+    device       float*    v_cache   [[buffer(8)]],
+    constant AttnPrepParams& p       [[buffer(9)]],
+    uint hg   [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]],
+    uint ntid [[threads_per_threadgroup]],
+    uint sgi  [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    threadgroup float* tg [[threadgroup(0)]])
+{
+    const bool is_q = (hg < p.num_heads);
+    const uint h    = is_q ? hg : (hg - p.num_heads);
+    device float* head = is_q ? (qbuf + h * p.head_dim)
+                              : (kbuf + h * p.head_dim);
+
+    threadgroup float* vec = tg;
+    threadgroup float* red = tg + p.head_dim;
+
+    float x = (tid < p.head_dim) ? head[tid] : 0.0f;
+
+    if (p.has_qk_norm != 0) {
+        // Must match smoe::rms_norm_bf16: mean-of-squares + 1e-6.
+        // simd_sum reassociates the reduction — not bit-exact vs CPU.
+        float ss = simd_sum(x * x);
+        if (lane == 0) red[sgi] = ss;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) {
+            float tot = 0.0f;
+            uint nsg = (ntid + 31u) / 32u;
+            for (uint i = 0; i < nsg; ++i) tot += red[i];
+            red[0] = 1.0f / sqrt(tot / float(p.head_dim) + 1e-6f);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float inv = red[0];
+        device const uint16_t* nw = is_q ? q_norm_w : k_norm_w;
+        if (tid < p.head_dim) x = (x * inv) * bf16_to_f32(nw[tid]);
+    }
+    if (tid < p.head_dim) vec[tid] = x;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // RoPE pair rotation: (d, d + rope_half) share angle d.
+    float rot = x;
+    if (tid < p.rope_half) {
+        rot = vec[tid] * rope_cos[tid] - vec[tid + p.rope_half] * rope_sin[tid];
+    } else if (tid < p.head_dim) {
+        uint d = tid - p.rope_half;
+        rot = vec[d] * rope_sin[d] + vec[tid] * rope_cos[d];
+    }
+
+    if (tid < p.head_dim) {
+        if (is_q) {
+            head[tid] = rot;
+        } else {
+            uint co = p.slot * p.kv_dim + h * p.head_dim + tid;
+            k_cache[co] = rot;
+            v_cache[co] = vbuf[h * p.head_dim + tid];
+        }
+    }
+}
+
+struct AttnDecodeParams {
+    uint  head_dim;
+    uint  num_heads;
+    uint  heads_per_kv;  // num_heads / num_kv_heads (GQA fan-in)
+    uint  kv_dim;
+    uint  slot;          // ring slot of the CURRENT token
+    uint  valid;         // attended positions incl. current (≤ attn_ctx)
+    uint  attn_ctx;      // KV ring capacity
+    float scale;         // 1/sqrt(head_dim)
+};
+
+// Single-token GQA attention over the KV ring.
+// Grid: num_heads threadgroups × TGROUP_SIZE threads.
+// Threadgroup memory: (head_dim + valid + 32) floats —
+//   staged Q head | score row | per-simdgroup reduction scratch.
+// valid ≤ 4096 keeps this under the 32 KB threadgroup limit.
+kernel void attn_decode(
+    device const float* qbuf     [[buffer(0)]],
+    device const float* k_cache  [[buffer(1)]],
+    device const float* v_cache  [[buffer(2)]],
+    device       float* attn_out [[buffer(3)]],
+    constant AttnDecodeParams& p [[buffer(4)]],
+    uint h    [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]],
+    uint ntid [[threads_per_threadgroup]],
+    uint sgi  [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    threadgroup float* tg [[threadgroup(0)]])
+{
+    threadgroup float* qvec   = tg;
+    threadgroup float* scores = tg + p.head_dim;
+    threadgroup float* red    = scores + p.valid;
+
+    const uint kv_off = (h / p.heads_per_kv) * p.head_dim;
+
+    for (uint d = tid; d < p.head_dim; d += ntid) {
+        qvec[d] = qbuf[h * p.head_dim + d];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Scores: position i counts back from the current slot.
+    float lmax = -INFINITY;
+    for (uint i = tid; i < p.valid; i += ntid) {
+        uint ki = (p.slot + p.attn_ctx - i) % p.attn_ctx;
+        device const float* krow = k_cache + ki * p.kv_dim + kv_off;
+        float acc = 0.0f;
+        for (uint d = 0; d < p.head_dim; ++d) acc += qvec[d] * krow[d];
+        acc *= p.scale;
+        scores[i] = acc;
+        lmax = max(lmax, acc);
+    }
+    lmax = simd_max(lmax);
+    if (lane == 0) red[sgi] = lmax;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float m = red[0];
+        uint nsg = (ntid + 31u) / 32u;
+        for (uint i = 1; i < nsg; ++i) m = max(m, red[i]);
+        red[0] = m;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float gmax = red[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup); // red[0] reused below
+
+    float lsum = 0.0f;
+    for (uint i = tid; i < p.valid; i += ntid) {
+        float e = exp(scores[i] - gmax);
+        scores[i] = e;
+        lsum += e;
+    }
+    lsum = simd_sum(lsum);
+    if (lane == 0) red[sgi] = lsum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float s = 0.0f;
+        uint nsg = (ntid + 31u) / 32u;
+        for (uint i = 0; i < nsg; ++i) s += red[i];
+        red[0] = (s > 0.0f) ? (1.0f / s) : 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float inv_sum = red[0];
+
+    // Weighted V sum: thread d owns output dim d; consecutive threads
+    // read consecutive addresses of each V row (coalesced).
+    for (uint d = tid; d < p.head_dim; d += ntid) {
+        float acc = 0.0f;
+        for (uint i = 0; i < p.valid; ++i) {
+            uint vi = (p.slot + p.attn_ctx - i) % p.attn_ctx;
+            acc += scores[i] * v_cache[vi * p.kv_dim + kv_off + d];
+        }
+        attn_out[h * p.head_dim + d] = acc * inv_sum;
+    }
+}
+
 )MSL";
 
 // Token-batch fused FFN kernels, concatenated after kMetalSource at JIT
@@ -579,6 +766,8 @@ struct SmoeMetalCtx {
     id<MTLComputePipelineState> down_pso     = nil;
     id<MTLComputePipelineState> scout_matvec_pso = nil;
     id<MTLComputePipelineState> scout_matvec_bf16_pso = nil;
+    id<MTLComputePipelineState> attn_prep_pso   = nil;
+    id<MTLComputePipelineState> attn_decode_pso = nil;
     id<MTLComputePipelineState> gate_up_batch_pso = nil;
     id<MTLComputePipelineState> down_batch_pso    = nil;
 
@@ -780,6 +969,15 @@ SmoeMetalCtx* smoe_metal_init(size_t slot_bytes) {
         return nullptr;
     }
     ctx->scout_matvec_bf16_pso = scout_matvec_bf16_pso;
+
+    ctx->attn_prep_pso   = make_pso(dev, lib, "attn_prep", &err);
+    ctx->attn_decode_pso = make_pso(dev, lib, "attn_decode", &err);
+    if (!ctx->attn_prep_pso || !ctx->attn_decode_pso) {
+        std::fprintf(stderr,
+            "[smoe_metal] ERROR: attention PSO build failed:\n%s\n",
+            err ? [[err localizedDescription] UTF8String] : "(no detail)");
+        return nullptr;
+    }
 
     // Token-batch FFN: non-fatal if unavailable — callers fall back to
     // the per-token fused FFN path when these PSOs/buffers are nil.
@@ -1419,4 +1617,170 @@ void smoe_metal_scout_matvec_bf16(SmoeMetalCtx* ctx,
     uint32_t r[1] = { rows };
     uint32_t c[1] = { cols };
     smoe_metal_scout_matvec_batch_bf16(ctx, weights, inputs, outputs, r, c, 1);
+}
+
+// Host-side mirrors of the MSL param structs (4-byte fields only —
+// identical layout on both sides, safe for setBytes).
+struct AttnPrepParamsHost {
+    uint32_t head_dim, num_heads, num_kv_heads, rope_half;
+    uint32_t slot, kv_dim, has_qk_norm;
+};
+struct AttnDecodeParamsHost {
+    uint32_t head_dim, num_heads, heads_per_kv, kv_dim;
+    uint32_t slot, valid, attn_ctx;
+    float    scale;
+};
+
+void smoe_metal_attention_layer(SmoeMetalCtx* ctx, const SmoeAttnLayerArgs* a)
+{
+    if (!ctx || !a) return;
+
+    @autoreleasepool {
+    id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+
+    const size_t in_bytes  = size_t(a->d_model) * sizeof(float);
+    const size_t cache_bytes = size_t(a->attn_ctx) * a->kv_dim * sizeof(float);
+
+    // ── Pass 1: Q/K/V projections (independent — one barrier after) ──
+    [enc setComputePipelineState:ctx->scout_matvec_bf16_pso];
+    {
+        const uint16_t* w[3]   = { a->w_q,  a->w_k,  a->w_v  };
+        float*          o[3]   = { a->qbuf, a->kbuf, a->vbuf };
+        const uint32_t  rows[3]= { a->q_dim, a->kv_dim, a->kv_dim };
+
+        NSUInteger off_in = 0;
+        id<MTLBuffer> buf_in = get_registered_buffer(ctx, a->normed_in, in_bytes, off_in);
+        for (int i = 0; i < 3; ++i) {
+            size_t w_bytes = size_t(rows[i]) * a->d_model * sizeof(uint16_t);
+            NSUInteger off_wt = 0, off_ou = 0;
+            id<MTLBuffer> buf_wt = get_registered_buffer(ctx, w[i], w_bytes, off_wt);
+            id<MTLBuffer> buf_ou = get_registered_buffer(ctx, o[i], size_t(rows[i]) * sizeof(float), off_ou);
+            if (!buf_wt || !buf_in || !buf_ou) {
+                std::fprintf(stderr, "[smoe_metal] ERROR: attention QKV wrap failed.\n");
+                [enc endEncoding];
+                return;
+            }
+            Dims dims { rows[i], a->d_model };
+            [enc setBuffer:buf_wt offset:off_wt atIndex:0];
+            [enc setBuffer:buf_in offset:off_in atIndex:1];
+            [enc setBuffer:buf_ou offset:off_ou atIndex:2];
+            [enc setBytes:&dims length:sizeof(dims) atIndex:3];
+            NSUInteger tgroup = 256;
+            [enc setThreadgroupMemoryLength:tgroup * sizeof(float) atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake((rows[i] + tgroup - 1) / tgroup, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(tgroup, 1, 1)];
+        }
+    }
+    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+    // ── Pass 2: per-head QK norm + RoPE + KV ring append ──
+    {
+        NSUInteger off_q = 0, off_k = 0, off_v = 0, off_qn = 0, off_kn = 0,
+                   off_c = 0, off_s = 0, off_kc = 0, off_vc = 0;
+        size_t head_bytes = size_t(a->head_dim) * sizeof(uint16_t);
+        size_t rope_bytes = size_t(a->head_dim / 2) * sizeof(float);
+        id<MTLBuffer> buf_q  = get_registered_buffer(ctx, a->qbuf, size_t(a->q_dim) * sizeof(float), off_q);
+        id<MTLBuffer> buf_k  = get_registered_buffer(ctx, a->kbuf, size_t(a->kv_dim) * sizeof(float), off_k);
+        id<MTLBuffer> buf_v  = get_registered_buffer(ctx, a->vbuf, size_t(a->kv_dim) * sizeof(float), off_v);
+        // QK-norm weights may be absent: bind qbuf as a placeholder so
+        // the slots are valid; the kernel never reads them then.
+        id<MTLBuffer> buf_qn = a->q_norm_w ? get_registered_buffer(ctx, a->q_norm_w, head_bytes, off_qn) : buf_q;
+        id<MTLBuffer> buf_kn = a->k_norm_w ? get_registered_buffer(ctx, a->k_norm_w, head_bytes, off_kn) : buf_q;
+        id<MTLBuffer> buf_c  = get_registered_buffer(ctx, a->rope_cos, rope_bytes, off_c);
+        id<MTLBuffer> buf_s  = get_registered_buffer(ctx, a->rope_sin, rope_bytes, off_s);
+        id<MTLBuffer> buf_kc = get_registered_buffer(ctx, a->k_cache, cache_bytes, off_kc);
+        id<MTLBuffer> buf_vc = get_registered_buffer(ctx, a->v_cache, cache_bytes, off_vc);
+        if (!buf_q || !buf_k || !buf_v || !buf_qn || !buf_kn || !buf_c || !buf_s || !buf_kc || !buf_vc) {
+            std::fprintf(stderr, "[smoe_metal] ERROR: attention prep wrap failed.\n");
+            [enc endEncoding];
+            return;
+        }
+        AttnPrepParamsHost pp {
+            a->head_dim, a->num_heads, a->num_kv_heads, a->head_dim / 2,
+            a->slot, a->kv_dim,
+            (a->q_norm_w && a->k_norm_w) ? 1u : 0u
+        };
+        [enc setComputePipelineState:ctx->attn_prep_pso];
+        [enc setBuffer:buf_q  offset:off_q  atIndex:0];
+        [enc setBuffer:buf_k  offset:off_k  atIndex:1];
+        [enc setBuffer:buf_v  offset:off_v  atIndex:2];
+        [enc setBuffer:buf_qn offset:(a->q_norm_w ? off_qn : off_q) atIndex:3];
+        [enc setBuffer:buf_kn offset:(a->k_norm_w ? off_kn : off_q) atIndex:4];
+        [enc setBuffer:buf_c  offset:off_c  atIndex:5];
+        [enc setBuffer:buf_s  offset:off_s  atIndex:6];
+        [enc setBuffer:buf_kc offset:off_kc atIndex:7];
+        [enc setBuffer:buf_vc offset:off_vc atIndex:8];
+        [enc setBytes:&pp length:sizeof(pp) atIndex:9];
+        [enc setThreadgroupMemoryLength:(a->head_dim + 32) * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(a->num_heads + a->num_kv_heads, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(a->head_dim, 1, 1)];
+    }
+    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+    // ── Pass 3: GQA attention over the KV ring ──
+    {
+        NSUInteger off_q = 0, off_kc = 0, off_vc = 0, off_o = 0;
+        id<MTLBuffer> buf_q  = get_registered_buffer(ctx, a->qbuf, size_t(a->q_dim) * sizeof(float), off_q);
+        id<MTLBuffer> buf_kc = get_registered_buffer(ctx, a->k_cache, cache_bytes, off_kc);
+        id<MTLBuffer> buf_vc = get_registered_buffer(ctx, a->v_cache, cache_bytes, off_vc);
+        id<MTLBuffer> buf_o  = get_registered_buffer(ctx, a->attn_out, size_t(a->q_dim) * sizeof(float), off_o);
+        if (!buf_q || !buf_kc || !buf_vc || !buf_o) {
+            std::fprintf(stderr, "[smoe_metal] ERROR: attention decode wrap failed.\n");
+            [enc endEncoding];
+            return;
+        }
+        AttnDecodeParamsHost dp {
+            a->head_dim, a->num_heads, a->num_heads / a->num_kv_heads, a->kv_dim,
+            a->slot, a->valid, a->attn_ctx,
+            a->attn_scale
+        };
+        [enc setComputePipelineState:ctx->attn_decode_pso];
+        [enc setBuffer:buf_q  offset:off_q  atIndex:0];
+        [enc setBuffer:buf_kc offset:off_kc atIndex:1];
+        [enc setBuffer:buf_vc offset:off_vc atIndex:2];
+        [enc setBuffer:buf_o  offset:off_o  atIndex:3];
+        [enc setBytes:&dp length:sizeof(dp) atIndex:4];
+        // Threadgroup plan: staged Q head + score row + simd scratch.
+        [enc setThreadgroupMemoryLength:(a->head_dim + a->valid + 32) * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(a->num_heads, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    }
+    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+    // ── Pass 4: O projection ──
+    {
+        size_t w_bytes = size_t(a->d_model) * a->q_dim * sizeof(uint16_t);
+        NSUInteger off_wt = 0, off_in = 0, off_ou = 0;
+        id<MTLBuffer> buf_wt = get_registered_buffer(ctx, a->w_o, w_bytes, off_wt);
+        id<MTLBuffer> buf_in = get_registered_buffer(ctx, a->attn_out, size_t(a->q_dim) * sizeof(float), off_in);
+        id<MTLBuffer> buf_ou = get_registered_buffer(ctx, a->o_out, size_t(a->d_model) * sizeof(float), off_ou);
+        if (!buf_wt || !buf_in || !buf_ou) {
+            std::fprintf(stderr, "[smoe_metal] ERROR: attention o_proj wrap failed.\n");
+            [enc endEncoding];
+            return;
+        }
+        Dims dims { a->d_model, a->q_dim };
+        [enc setComputePipelineState:ctx->scout_matvec_bf16_pso];
+        [enc setBuffer:buf_wt offset:off_wt atIndex:0];
+        [enc setBuffer:buf_in offset:off_in atIndex:1];
+        [enc setBuffer:buf_ou offset:off_ou atIndex:2];
+        [enc setBytes:&dims length:sizeof(dims) atIndex:3];
+        NSUInteger tgroup = 256;
+        [enc setThreadgroupMemoryLength:tgroup * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake((a->d_model + tgroup - 1) / tgroup, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tgroup, 1, 1)];
+    }
+
+    [enc endEncoding];
+
+    ctx->signaled_value++;
+    uint64_t wait_val = ctx->signaled_value;
+    [cmd encodeSignalEvent:ctx->shared_event value:wait_val];
+    [cmd commit];
+
+    while (ctx->shared_event.signaledValue < wait_val) {
+        std::this_thread::yield();
+    }
+    }
 }

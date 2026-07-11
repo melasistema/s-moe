@@ -670,6 +670,11 @@ int main(int argc, char* argv[]) {
     smoe_metal_register_buffer(metal, heavy_kbuf,   kvbuf_aligned);
     smoe_metal_register_buffer(metal, heavy_vbuf,   kvbuf_aligned);
     smoe_metal_register_buffer(metal, heavy_attn_out, heavy_attn_out_aligned);
+    // KV ring: one zero-copy wrap of the whole allocation so the fused
+    // attention layer resolves per-layer cache slices as offsets into a
+    // single registered buffer (16 KB-aligned via allocate_aligned_float).
+    smoe_metal_register_buffer(metal, full_kv_cache,
+        size_t(cfg.num_moe_layers + (cfg.has_dense_layer_0 ? 1 : 0)) * 2 * ATTN_CTX * kv_dim * sizeof(float));
 
     // ── Layer-major prefill activation planes ─────────────────
     // One row per chunk token. 16 KB-aligned so Metal can wrap them
@@ -967,103 +972,111 @@ int main(int argc, char* argv[]) {
             std::memcpy(heavy_normed, heavy_hidden, d_model * sizeof(float));
             smoe::rms_norm_bf16(heavy_normed, scout.get_input_norm(l), d_model);
 
+            float* k_cache = full_kv_cache + (l * 2 * ATTN_CTX + 0 * ATTN_CTX) * kv_dim;
+            float* v_cache = full_kv_cache + (l * 2 * ATTN_CTX + 1 * ATTN_CTX) * kv_dim;
+            const uint32_t slot  = ctx_pos % ATTN_CTX;
+            const uint32_t valid = (ctx_fill < ATTN_CTX) ? ctx_fill + 1 : ATTN_CTX;
+            const float scale = 1.0f / std::sqrt(static_cast<float>(cfg.head_dim));
+
             if (metal) {
-                const uint16_t* weights[3] = { scout.get_q_proj(l), scout.get_k_proj(l), scout.get_v_proj(l) };
-                const float* inputs[3] = { heavy_normed, heavy_normed, heavy_normed };
-                float* outputs[3] = { heavy_qbuf, heavy_kbuf, heavy_vbuf };
-                uint32_t rows[3] = { q_dim, kv_dim, kv_dim };
-                uint32_t cols[3] = { d_model, d_model, d_model };
-                smoe_metal_scout_matvec_batch_bf16(metal, weights, inputs, outputs, rows, cols, 3);
+                // Whole attention block in ONE command buffer / ONE CPU
+                // sync (was two matvec roundtrips with CPU norm/RoPE/
+                // attention between them — 188 syncs/token at 94 layers).
+                // o_out targets heavy_normed, same as the CPU path.
+                SmoeAttnLayerArgs attn_args {
+                    scout.get_q_proj(l), scout.get_k_proj(l),
+                    scout.get_v_proj(l), scout.get_o_proj(l),
+                    scout.get_q_norm(l), scout.get_k_norm(l),
+                    rope_cos, rope_sin,
+                    heavy_normed,
+                    heavy_qbuf, heavy_kbuf, heavy_vbuf,
+                    k_cache, v_cache,
+                    heavy_attn_out, heavy_normed,
+                    d_model, q_dim, kv_dim,
+                    cfg.head_dim, cfg.num_heads, cfg.num_kv_heads,
+                    slot, valid, ATTN_CTX, scale
+                };
+                smoe_metal_attention_layer(metal, &attn_args);
             } else {
                 smoe::matvec_bf16(heavy_qbuf, scout.get_q_proj(l), heavy_normed, q_dim, d_model);
                 smoe::matvec_bf16(heavy_kbuf, scout.get_k_proj(l), heavy_normed, kv_dim, d_model);
                 smoe::matvec_bf16(heavy_vbuf, scout.get_v_proj(l), heavy_normed, kv_dim, d_model);
-            }
 
-            // Apply per-head Q/K norm
-            const uint16_t* q_norm_w = scout.get_q_norm(l);
-            const uint16_t* k_norm_w = scout.get_k_norm(l);
-            if (q_norm_w) {
+                // Apply per-head Q/K norm
+                const uint16_t* q_norm_w = scout.get_q_norm(l);
+                const uint16_t* k_norm_w = scout.get_k_norm(l);
+                if (q_norm_w) {
+                    for (uint32_t h = 0; h < cfg.num_heads; ++h) {
+                        smoe::rms_norm_bf16(heavy_qbuf + h * cfg.head_dim, q_norm_w, cfg.head_dim);
+                    }
+                }
+                if (k_norm_w) {
+                    for (uint32_t h = 0; h < cfg.num_kv_heads; ++h) {
+                        smoe::rms_norm_bf16(heavy_kbuf + h * cfg.head_dim, k_norm_w, cfg.head_dim);
+                    }
+                }
+
+                // Apply RoPE to Q
                 for (uint32_t h = 0; h < cfg.num_heads; ++h) {
-                    smoe::rms_norm_bf16(heavy_qbuf + h * cfg.head_dim, q_norm_w, cfg.head_dim);
+                    for (uint32_t d = 0; d < rope_half; ++d) {
+                        float q0 = heavy_qbuf[h * cfg.head_dim + d];
+                        float q1 = heavy_qbuf[h * cfg.head_dim + d + rope_half];
+                        heavy_qbuf[h * cfg.head_dim + d]             = q0 * rope_cos[d] - q1 * rope_sin[d];
+                        heavy_qbuf[h * cfg.head_dim + d + rope_half] = q0 * rope_sin[d] + q1 * rope_cos[d];
+                    }
                 }
-            }
-            if (k_norm_w) {
+
+                // Apply RoPE to K
                 for (uint32_t h = 0; h < cfg.num_kv_heads; ++h) {
-                    smoe::rms_norm_bf16(heavy_kbuf + h * cfg.head_dim, k_norm_w, cfg.head_dim);
-                }
-            }
-
-            // Apply RoPE to Q
-            for (uint32_t h = 0; h < cfg.num_heads; ++h) {
-                for (uint32_t d = 0; d < rope_half; ++d) {
-                    float q0 = heavy_qbuf[h * cfg.head_dim + d];
-                    float q1 = heavy_qbuf[h * cfg.head_dim + d + rope_half];
-                    heavy_qbuf[h * cfg.head_dim + d]             = q0 * rope_cos[d] - q1 * rope_sin[d];
-                    heavy_qbuf[h * cfg.head_dim + d + rope_half] = q0 * rope_sin[d] + q1 * rope_cos[d];
-                }
-            }
-
-            // Apply RoPE to K
-            for (uint32_t h = 0; h < cfg.num_kv_heads; ++h) {
-                for (uint32_t d = 0; d < rope_half; ++d) {
-                    float k0 = heavy_kbuf[h * cfg.head_dim + d];
-                    float k1 = heavy_kbuf[h * cfg.head_dim + d + rope_half];
-                    heavy_kbuf[h * cfg.head_dim + d]             = k0 * rope_cos[d] - k1 * rope_sin[d];
-                    heavy_kbuf[h * cfg.head_dim + d + rope_half] = k0 * rope_sin[d] + k1 * rope_cos[d];
-                }
-            }
-
-            float* k_cache = full_kv_cache + (l * 2 * ATTN_CTX + 0 * ATTN_CTX) * kv_dim;
-            float* v_cache = full_kv_cache + (l * 2 * ATTN_CTX + 1 * ATTN_CTX) * kv_dim;
-            
-            const uint32_t slot = ctx_pos % ATTN_CTX;
-            std::memcpy(k_cache + slot * kv_dim, heavy_kbuf, kv_dim * sizeof(float));
-            std::memcpy(v_cache + slot * kv_dim, heavy_vbuf, kv_dim * sizeof(float));
-
-            // Multi-Head Attention CPU (with GQA support)
-            const float scale = 1.0f / std::sqrt(static_cast<float>(cfg.head_dim));
-            const uint32_t valid = (ctx_fill < ATTN_CTX) ? ctx_fill + 1 : ATTN_CTX;
-            std::memset(heavy_attn_out, 0, q_dim * sizeof(float));
-            
-            uint32_t heads_per_kv = cfg.num_heads / cfg.num_kv_heads;
-
-            for (uint32_t h = 0; h < cfg.num_heads; ++h) {
-                uint32_t kv_h = h / heads_per_kv;
-                const float* qhead = heavy_qbuf + h * cfg.head_dim;
-                for (uint32_t i = 0; i < valid; ++i) {
-                    uint32_t ki = (ctx_pos - i + ATTN_CTX) % ATTN_CTX;
-                    const float* krow = k_cache + ki * kv_dim + kv_h * cfg.head_dim;
-                    attn_scores[i] = smoe::dot_f32(qhead, krow, cfg.head_dim) * scale;
+                    for (uint32_t d = 0; d < rope_half; ++d) {
+                        float k0 = heavy_kbuf[h * cfg.head_dim + d];
+                        float k1 = heavy_kbuf[h * cfg.head_dim + d + rope_half];
+                        heavy_kbuf[h * cfg.head_dim + d]             = k0 * rope_cos[d] - k1 * rope_sin[d];
+                        heavy_kbuf[h * cfg.head_dim + d + rope_half] = k0 * rope_sin[d] + k1 * rope_cos[d];
+                    }
                 }
 
-                float max_val = attn_scores[0];
-                for (uint32_t i = 1; i < valid; ++i) {
-                    if (attn_scores[i] > max_val) max_val = attn_scores[i];
-                }
-                float sum = 0.0f;
-                for (uint32_t i = 0; i < valid; ++i) {
-                    attn_scores[i] = std::exp(attn_scores[i] - max_val);
-                    sum += attn_scores[i];
-                }
-                float inv_sum = (sum > 0.0f) ? 1.0f / sum : 0.0f;
-                for (uint32_t i = 0; i < valid; ++i) {
-                    attn_scores[i] *= inv_sum;
+                std::memcpy(k_cache + slot * kv_dim, heavy_kbuf, kv_dim * sizeof(float));
+                std::memcpy(v_cache + slot * kv_dim, heavy_vbuf, kv_dim * sizeof(float));
+
+                // Multi-Head Attention CPU (with GQA support)
+                std::memset(heavy_attn_out, 0, q_dim * sizeof(float));
+
+                uint32_t heads_per_kv = cfg.num_heads / cfg.num_kv_heads;
+
+                for (uint32_t h = 0; h < cfg.num_heads; ++h) {
+                    uint32_t kv_h = h / heads_per_kv;
+                    const float* qhead = heavy_qbuf + h * cfg.head_dim;
+                    for (uint32_t i = 0; i < valid; ++i) {
+                        uint32_t ki = (ctx_pos - i + ATTN_CTX) % ATTN_CTX;
+                        const float* krow = k_cache + ki * kv_dim + kv_h * cfg.head_dim;
+                        attn_scores[i] = smoe::dot_f32(qhead, krow, cfg.head_dim) * scale;
+                    }
+
+                    float max_val = attn_scores[0];
+                    for (uint32_t i = 1; i < valid; ++i) {
+                        if (attn_scores[i] > max_val) max_val = attn_scores[i];
+                    }
+                    float sum = 0.0f;
+                    for (uint32_t i = 0; i < valid; ++i) {
+                        attn_scores[i] = std::exp(attn_scores[i] - max_val);
+                        sum += attn_scores[i];
+                    }
+                    float inv_sum = (sum > 0.0f) ? 1.0f / sum : 0.0f;
+                    for (uint32_t i = 0; i < valid; ++i) {
+                        attn_scores[i] *= inv_sum;
+                    }
+
+                    float* out_head = heavy_attn_out + h * cfg.head_dim;
+                    for (uint32_t i = 0; i < valid; ++i) {
+                        uint32_t vi = (ctx_pos - i + ATTN_CTX) % ATTN_CTX;
+                        smoe::axpy_f32(out_head, attn_scores[i],
+                                       v_cache + vi * kv_dim + kv_h * cfg.head_dim,
+                                       cfg.head_dim);
+                    }
                 }
 
-                float* out_head = heavy_attn_out + h * cfg.head_dim;
-                for (uint32_t i = 0; i < valid; ++i) {
-                    uint32_t vi = (ctx_pos - i + ATTN_CTX) % ATTN_CTX;
-                    smoe::axpy_f32(out_head, attn_scores[i],
-                                   v_cache + vi * kv_dim + kv_h * cfg.head_dim,
-                                   cfg.head_dim);
-                }
-            }
-
-            // O Proj and Residual
-            if (metal) {
-                smoe_metal_scout_matvec_bf16(metal, scout.get_o_proj(l), heavy_attn_out, heavy_normed, d_model, q_dim);
-            } else {
+                // O Proj
                 smoe::matvec_bf16(heavy_normed, scout.get_o_proj(l), heavy_attn_out, d_model, q_dim);
             }
             for (uint32_t i = 0; i < d_model; ++i) {

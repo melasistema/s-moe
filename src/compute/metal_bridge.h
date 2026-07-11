@@ -171,6 +171,40 @@ void smoe_metal_scout_matvec_bf16(SmoeMetalCtx* ctx,
                              uint32_t       rows,
                              uint32_t       cols);
 
+// ── Fused decode attention layer (single token) ───────────────
+// One command buffer, one CPU sync: QKV projections → per-head
+// QK-RMSNorm + RoPE + KV ring append → GQA attention → O projection.
+// Replaces the previous two synchronous matvec roundtrips per layer
+// (QKV, then o_proj after CPU attention) and moves the O(context)
+// attention math onto the GPU. Synchronous: o_out is valid on return.
+// NOT bit-exact with the CPU path (simd-reduced norms/softmax, GPU
+// exp) — verify token-level, not bit-level.
+typedef struct {
+    const uint16_t* w_q;        // [q_dim × d_model] bf16
+    const uint16_t* w_k;        // [kv_dim × d_model] bf16
+    const uint16_t* w_v;        // [kv_dim × d_model] bf16
+    const uint16_t* w_o;        // [d_model × q_dim] bf16
+    const uint16_t* q_norm_w;   // [head_dim] bf16, NULL → no QK norm
+    const uint16_t* k_norm_w;   // [head_dim] bf16, NULL → no QK norm
+    const float*    rope_cos;   // [head_dim/2] for this token's position
+    const float*    rope_sin;   // [head_dim/2]
+    const float*    normed_in;  // [d_model] post input-norm hidden
+    float*          qbuf;       // [q_dim] scratch (normed+roped Q on exit)
+    float*          kbuf;       // [kv_dim] scratch
+    float*          vbuf;       // [kv_dim] scratch
+    float*          k_cache;    // layer base of KV ring [attn_ctx × kv_dim]
+    float*          v_cache;    // layer base of KV ring [attn_ctx × kv_dim]
+    float*          attn_out;   // [q_dim] scratch
+    float*          o_out;      // [d_model] result
+    uint32_t d_model, q_dim, kv_dim, head_dim, num_heads, num_kv_heads;
+    uint32_t slot;              // KV ring write slot (ctx_pos % attn_ctx)
+    uint32_t valid;             // attended positions incl. current
+    uint32_t attn_ctx;          // KV ring capacity
+    float    attn_scale;        // 1/sqrt(head_dim)
+} SmoeAttnLayerArgs;
+
+void smoe_metal_attention_layer(SmoeMetalCtx* ctx, const SmoeAttnLayerArgs* args);
+
 // Perform a batch of float32 matrix-vector multiplications on the GPU to reduce sync latency.
 void smoe_metal_scout_matvec_batch(SmoeMetalCtx* ctx, const float** weights, const float** inputs, float** outputs, const uint32_t* rows, const uint32_t* cols, uint32_t count);
 void smoe_metal_scout_matvec_batch_bf16(SmoeMetalCtx* ctx,
