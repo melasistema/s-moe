@@ -154,18 +154,17 @@ inline float smoeq4_dequant(
     return (float(code) - 7.5f) * (1.0f / 7.5f) * scale;
 }
 
-// ── Fused Gate+Up+Down FFN kernel ────────────────────────────
+// ── Fused Gate+Up+Down FFN kernels (simdgroup-per-row) ───────
 //
 // Buffer bindings (must match metal_bridge.mm exactly):
-//   [0] gate_packed   — 2-bit packed gate projection weights
+//   [0] gate_packed   — packed gate projection weights
 //   [1] gate_scales   — fp16 scale factors for gate
-//   [2] up_packed     — 2-bit packed up projection weights
+//   [2] up_packed     — packed up projection weights
 //   [3] up_scales     — fp16 scale factors for up
-//   [4] down_packed   — 2-bit packed down projection weights
+//   [4] down_packed   — packed down projection weights
 //   [5] down_scales   — fp16 scale factors for down
 //   [6] input         — float32 input activation vector (cols elements)
 //   [7] hidden        — float32 scratch: intermediate after gate+up+SiLU
-//                       (rows elements; caller pre-zeros if needed)
 //   [8] output        — float32 output vector (rows elements for down)
 //   [9] params        — FusedFFNParams
 //
@@ -174,6 +173,188 @@ inline float smoeq4_dequant(
 // before any down-projection thread reads it. The bridge schedules
 // them as two back-to-back compute passes in the same command buffer.
 //
+// DISPATCH CONTRACT (changed 2026-07-12):
+//   grid            : ceil(rows / ROWS_PER_TG) threadgroups
+//   threadsPerTG    : TGROUP_SIZE (256 = 8 simdgroups × 32 lanes)
+//   threadgroup mem : cols × sizeof(float)  — the WHOLE staged input
+//                     vector (16 KB at d_model 4096 — under the 32 KB
+//                     limit up to cols 8192)
+//
+// One SIMDGROUP owns one output row; its 32 lanes read consecutive
+// uint4 chunks of the packed row — 512 coalesced bytes per step. The
+// old thread-per-row layout made the 32 lanes of a simdgroup read
+// addresses ~2 KB apart one byte at a time: measured 22.6 GB/s
+// effective vs 158 GB/s for this layout on M4 Pro
+// (scratch/kernel_bench_results.md, 7.0× per expert group).
+//
+// Dequantisation is folded into a per-chunk affine epilogue: with
+//   w = (code − Z)·(1/Z)·s        (Z = 7.5 at Q4, 1.5 at Q2)
+//   Σ w·x = s·( (Σ code·x)/Z − Σ x )
+// so the inner loop is one fma(code4, x4, acc) per 4 codes and the
+// scale is read once per 16-byte chunk instead of once per 2 codes.
+//
+// Layout assumptions (hold for every .smoe vault — dims are multiples
+// of 256, group_size 64):
+//   • cols % 32 == 0 (Q4) / % 64 == 0 (Q2) — no chunk tail handling
+//   • group_size % 32 == 0 (Q4) / % 64 == 0 (Q2) — a 16-byte chunk
+//     never straddles a scale group
+//   • packed rows are 16-byte aligned (row stride = cols/2 B at Q4,
+//     cols/4 B at Q2 — multiples of 16 when cols % 64 == 0)
+
+constant uint ROWS_PER_TG = 8;      // TGROUP_SIZE / 32 lanes
+
+// ── One quantized row · staged input vector, simdgroup-cooperative ──
+// Each lane owns the uint4 chunks c = lane, lane+32, … of the row.
+// Returns the full row dot on EVERY lane (simd_sum broadcast).
+inline float qrow_dot(device const uint8_t*    packed,
+                      device const half*       scales,
+                      threadgroup const float* x,
+                      uint row, uint cols,
+                      uint group_size, uint bits, uint lane)
+{
+    float acc = 0.0f;
+
+    if (bits == 4) {
+        // 16-byte chunk = 32 codes; row stride = cols/2 bytes.
+        device const uint4* rp =
+            (device const uint4*)(packed + (ulong)row * (cols >> 1));
+        device const half* srow = scales + (ulong)row * (cols / group_size);
+        const uint nchunks = cols >> 5;
+
+        for (uint c = lane; c < nchunks; c += 32) {
+            uint4 v = rp[c];
+            float s = float(srow[(c << 5) / group_size]);
+            threadgroup const float4* xv =
+                (threadgroup const float4*)(x + (c << 5));
+
+            float4 a  = float4(0.0f);
+            float4 xs = float4(0.0f);
+            for (uint k = 0; k < 4; ++k) {
+                uint u = v[k];                       // 8 codes
+                float4 clo = float4(float( u        & 0xFu),
+                                    float((u >>  4) & 0xFu),
+                                    float((u >>  8) & 0xFu),
+                                    float((u >> 12) & 0xFu));
+                float4 chi = float4(float((u >> 16) & 0xFu),
+                                    float((u >> 20) & 0xFu),
+                                    float((u >> 24) & 0xFu),
+                                    float((u >> 28) & 0xFu));
+                float4 xlo = xv[k * 2];
+                float4 xhi = xv[k * 2 + 1];
+                a   = fma(clo, xlo, a);
+                a   = fma(chi, xhi, a);
+                xs += xlo + xhi;
+            }
+            float A = a.x + a.y + a.z + a.w;
+            float X = xs.x + xs.y + xs.z + xs.w;
+            acc = fma(s, A * (1.0f / 7.5f) - X, acc);
+        }
+    } else {
+        // Q2: 16-byte chunk = 64 codes; row stride = cols/4 bytes.
+        device const uint4* rp =
+            (device const uint4*)(packed + (ulong)row * (cols >> 2));
+        device const half* srow = scales + (ulong)row * (cols / group_size);
+        const uint nchunks = cols >> 6;
+
+        for (uint c = lane; c < nchunks; c += 32) {
+            uint4 v = rp[c];
+            float s = float(srow[(c << 6) / group_size]);
+            threadgroup const float4* xv =
+                (threadgroup const float4*)(x + (c << 6));
+
+            float4 a  = float4(0.0f);
+            float4 xs = float4(0.0f);
+            for (uint k = 0; k < 4; ++k) {
+                uint u = v[k];                       // 16 codes
+                for (uint g = 0; g < 4; ++g) {       // 4 codes per step
+                    float4 cq = float4(float((u >> (8*g    )) & 3u),
+                                       float((u >> (8*g + 2)) & 3u),
+                                       float((u >> (8*g + 4)) & 3u),
+                                       float((u >> (8*g + 6)) & 3u));
+                    float4 xq = xv[k * 4 + g];
+                    a   = fma(cq, xq, a);
+                    xs += xq;
+                }
+            }
+            float A = a.x + a.y + a.z + a.w;
+            float X = xs.x + xs.y + xs.z + xs.w;
+            acc = fma(s, A * (1.0f / 1.5f) - X, acc);
+        }
+    }
+    return simd_sum(acc);
+}
+
+// ── Two quantized rows (gate + up) · staged input, one pass ─────
+// Both matrices share x, so Σx and the xv loads are paid once for
+// the two dots (measured ~17% over two qrow_dot passes).
+inline void qrow_dot2(device const uint8_t*    g_packed,
+                      device const half*       g_scales,
+                      device const uint8_t*    u_packed,
+                      device const half*       u_scales,
+                      threadgroup const float* x,
+                      uint row, uint cols,
+                      uint group_size, uint bits, uint lane,
+                      thread float& g_out, thread float& u_out)
+{
+    float gacc = 0.0f, uacc = 0.0f;
+
+    if (bits == 4) {
+        device const uint4* gp =
+            (device const uint4*)(g_packed + (ulong)row * (cols >> 1));
+        device const uint4* up =
+            (device const uint4*)(u_packed + (ulong)row * (cols >> 1));
+        device const half* gsrow = g_scales + (ulong)row * (cols / group_size);
+        device const half* usrow = u_scales + (ulong)row * (cols / group_size);
+        const uint nchunks = cols >> 5;
+
+        for (uint c = lane; c < nchunks; c += 32) {
+            uint4 vg = gp[c];
+            uint4 vu = up[c];
+            float sg = float(gsrow[(c << 5) / group_size]);
+            float su = float(usrow[(c << 5) / group_size]);
+            threadgroup const float4* xv =
+                (threadgroup const float4*)(x + (c << 5));
+
+            float4 ag = float4(0.0f), au = float4(0.0f), xs = float4(0.0f);
+            for (uint k = 0; k < 4; ++k) {
+                uint ug = vg[k];
+                uint uu = vu[k];
+                float4 xlo = xv[k * 2];
+                float4 xhi = xv[k * 2 + 1];
+                ag = fma(float4(float( ug        & 0xFu),
+                                float((ug >>  4) & 0xFu),
+                                float((ug >>  8) & 0xFu),
+                                float((ug >> 12) & 0xFu)), xlo, ag);
+                ag = fma(float4(float((ug >> 16) & 0xFu),
+                                float((ug >> 20) & 0xFu),
+                                float((ug >> 24) & 0xFu),
+                                float((ug >> 28) & 0xFu)), xhi, ag);
+                au = fma(float4(float( uu        & 0xFu),
+                                float((uu >>  4) & 0xFu),
+                                float((uu >>  8) & 0xFu),
+                                float((uu >> 12) & 0xFu)), xlo, au);
+                au = fma(float4(float((uu >> 16) & 0xFu),
+                                float((uu >> 20) & 0xFu),
+                                float((uu >> 24) & 0xFu),
+                                float((uu >> 28) & 0xFu)), xhi, au);
+                xs += xlo + xhi;
+            }
+            float X = xs.x + xs.y + xs.z + xs.w;
+            gacc = fma(sg, (ag.x + ag.y + ag.z + ag.w) * (1.0f / 7.5f) - X, gacc);
+            uacc = fma(su, (au.x + au.y + au.z + au.w) * (1.0f / 7.5f) - X, uacc);
+        }
+        g_out = simd_sum(gacc);
+        u_out = simd_sum(uacc);
+        return;
+    }
+
+    // Q2: reuse the single-row path twice (no Q2 vault exists yet to
+    // measure against; fuse here too if Q2 becomes a hot path).
+    g_out = qrow_dot(g_packed, g_scales, x, row, cols, group_size, bits, lane);
+    u_out = qrow_dot(u_packed, u_scales, x, row, cols, group_size, bits, lane);
+}
+
+// ── Fused gate+up+SiLU: hidden[row] = silu(gate·x) * (up·x) ─────
 kernel void smoe_gate_up(
     device const uint8_t*      gate_packed  [[buffer(0)]],
     device const half*         gate_scales  [[buffer(1)]],
@@ -182,186 +363,53 @@ kernel void smoe_gate_up(
     device const float*        input        [[buffer(6)]],
     device       float*        hidden       [[buffer(7)]],
     constant FusedFFNParams&   params       [[buffer(9)]],
-    uint                       gid          [[thread_position_in_grid]],
-    uint                       tid          [[thread_index_in_threadgroup]],
-    uint                       threads_per_tg [[threads_per_threadgroup]],
-    threadgroup float*         tg_input     [[threadgroup(0)]])
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]],
+    uint sgi  [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    threadgroup float* xshared [[threadgroup(0)]])
 {
-    // ── Phase A: cooperatively load the input vector into SRAM ──
-    // Each threadgroup covers a TGROUP_SIZE-wide tile of `input`.
-    // We iterate over input tiles until the whole vector is cached.
-    //
-    // NOTE: For cols > TGROUP_SIZE we reload tiles. Because SMOE-Q2
-    // DeepSeek experts are narrow (cols typically 2048–7168), the
-    // entire input vector may fit in a single tile on most configs.
-    uint row = gid;                           // output element index
-
-    float gate_acc = 0.0f;
-    float up_acc   = 0.0f;
-
-    uint tiles = (params.gate_cols + TGROUP_SIZE - 1) / TGROUP_SIZE;
-
-    for (uint t = 0; t < tiles; ++t) {
-        uint col_base = t * TGROUP_SIZE;
-
-        // Load this thread's element into shared memory
-        for (uint i = tid; i < TGROUP_SIZE; i += threads_per_tg) {
-            uint col = col_base + i;
-            tg_input[i] = (col < params.gate_cols) ? input[col] : 0.0f;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // Accumulate dot-products for all cols in this tile
-        uint tile_end = min(TGROUP_SIZE, params.gate_cols - col_base);
-
-        if (row < params.gate_rows) {
-
-        // Unroll x4 over the natural 4-codes-per-byte boundary
-        uint wi_base = row * params.gate_cols + col_base;
-
-        uint k = 0;
-        if (params.bits == 4) {
-            for (; k + 1 < tile_end; k += 2) {
-                uint wi = wi_base + k;
-                uint pidx = wi >> 1;
-                uint8_t gbyte = gate_packed[pidx];
-                uint8_t ubyte = up_packed[pidx];
-
-                float gs = float(gate_scales[wi / params.group_size]);
-                float us = float(up_scales[wi  / params.group_size]);
-
-                for (uint b = 0; b < 2; ++b) {
-                    float gcode = float((gbyte >> (b * 4)) & 0xFu);
-                    float ucode = float((ubyte >> (b * 4)) & 0xFu);
-                    float gw    = (gcode - 7.5f) * (1.0f / 7.5f) * gs;
-                    float uw    = (ucode - 7.5f) * (1.0f / 7.5f) * us;
-                    float x_k   = tg_input[k + b];
-                    gate_acc   += gw * x_k;
-                    up_acc     += uw * x_k;
-                }
-            }
-            for (; k < tile_end; ++k) {
-                uint wi = wi_base + k;
-                gate_acc += smoeq4_dequant(gate_packed, gate_scales, wi, params.group_size) * tg_input[k];
-                up_acc   += smoeq4_dequant(up_packed,   up_scales,   wi, params.group_size) * tg_input[k];
-            }
-        } else {
-            for (; k + 3 < tile_end; k += 4) {
-                uint wi = wi_base + k;
-                uint pidx = wi >> 2;
-                uint8_t gbyte = gate_packed[pidx];
-                uint8_t ubyte = up_packed[pidx];
-
-                float gs = float(gate_scales[wi / params.group_size]);
-                float us = float(up_scales[wi  / params.group_size]);
-
-                for (uint b = 0; b < 4; ++b) {
-                    float gcode = float((gbyte >> (b * 2)) & 0x3u);
-                    float ucode = float((ubyte >> (b * 2)) & 0x3u);
-                    float gw    = (gcode - 1.5f) * (1.0f / 1.5f) * gs;
-                    float uw    = (ucode - 1.5f) * (1.0f / 1.5f) * us;
-                    float x_k   = tg_input[k + b];
-                    gate_acc   += gw * x_k;
-                    up_acc     += uw * x_k;
-                }
-            }
-            for (; k < tile_end; ++k) {
-                uint wi = wi_base + k;
-                gate_acc += smoeq2_dequant(gate_packed, gate_scales, wi, params.group_size) * tg_input[k];
-                up_acc   += smoeq2_dequant(up_packed,   up_scales,   wi, params.group_size) * tg_input[k];
-            }
-        }
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Stage the input vector once per threadgroup (shared by 8 rows).
+    for (uint i = tid; i < params.gate_cols; i += TGROUP_SIZE) {
+        xshared[i] = input[i];
     }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // ── Phase B: fused SiLU gate ─────────────────────────────
-    if (row < params.gate_rows) {
-        hidden[row] = silu(gate_acc) * up_acc;
+    const uint row = tgid * ROWS_PER_TG + sgi;
+    if (row >= params.gate_rows) return;   // whole simdgroup exits together
+
+    float g, u;
+    qrow_dot2(gate_packed, gate_scales, up_packed, up_scales, xshared,
+              row, params.gate_cols, params.group_size, params.bits, lane, g, u);
+    if (lane == 0) {
+        hidden[row] = silu(g) * u;
     }
 }
 
-// ── Down projection: hidden[rows] → output[rows] ─────────────
-//
-// One thread computes one element of the output vector by taking
-// the dot-product of the corresponding down-projection row with
-// the hidden activation vector.
-//
+// ── Down projection: output[row] = down_row · hidden ────────────
 kernel void smoe_down(
     device const uint8_t*      down_packed  [[buffer(4)]],
     device const half*         down_scales  [[buffer(5)]],
     device const float*        hidden       [[buffer(7)]],
     device       float*        output       [[buffer(8)]],
     constant FusedFFNParams&   params       [[buffer(9)]],
-    uint                       gid          [[thread_position_in_grid]],
-    uint                       tid          [[thread_index_in_threadgroup]],
-    uint                       threads_per_tg [[threads_per_threadgroup]],
-    threadgroup float*         tg_hidden    [[threadgroup(0)]])
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]],
+    uint sgi  [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    threadgroup float* xshared [[threadgroup(0)]])
 {
-    uint row = gid;
-
-    float acc   = 0.0f;
-    uint  tiles = (params.down_cols + TGROUP_SIZE - 1) / TGROUP_SIZE;
-
-    for (uint t = 0; t < tiles; ++t) {
-        uint col_base = t * TGROUP_SIZE;
-
-        for (uint i = tid; i < TGROUP_SIZE; i += threads_per_tg) {
-            uint col = col_base + i;
-            tg_hidden[i] = (col < params.down_cols) ? hidden[col] : 0.0f;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        uint tile_end = min(TGROUP_SIZE, params.down_cols - col_base);
-        uint wi_base  = row * params.down_cols + col_base;
-
-        if (row < params.down_rows) {
-
-        uint k = 0;
-        if (params.bits == 4) {
-            for (; k + 1 < tile_end; k += 2) {
-                uint    pidx  = (wi_base + k) >> 1;
-                uint8_t dbyte = down_packed[pidx];
-                float   ds    = float(down_scales[(wi_base + k) / params.group_size]);
-
-                for (uint b = 0; b < 2; ++b) {
-                    float dcode = float((dbyte >> (b * 4)) & 0xFu);
-                    float dw    = (dcode - 7.5f) * (1.0f / 7.5f) * ds;
-                    acc        += dw * tg_hidden[k + b];
-                }
-            }
-            for (; k < tile_end; ++k) {
-                uint wi = wi_base + k;
-                acc += smoeq4_dequant(down_packed, down_scales, wi, params.group_size) * tg_hidden[k];
-            }
-        } else {
-            for (; k + 3 < tile_end; k += 4) {
-                uint    pidx  = (wi_base + k) >> 2;
-                uint8_t dbyte = down_packed[pidx];
-                float   ds    = float(down_scales[(wi_base + k) / params.group_size]);
-
-                for (uint b = 0; b < 4; ++b) {
-                    float dcode = float((dbyte >> (b * 2)) & 0x3u);
-                    float dw    = (dcode - 1.5f) * (1.0f / 1.5f) * ds;
-                    acc        += dw * tg_hidden[k + b];
-                }
-            }
-            for (; k < tile_end; ++k) {
-                uint wi = wi_base + k;
-                acc += smoeq2_dequant(down_packed, down_scales, wi, params.group_size) * tg_hidden[k];
-            }
-        }
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < params.down_cols; i += TGROUP_SIZE) {
+        xshared[i] = hidden[i];
     }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    if (row < params.down_rows) {
+    const uint row = tgid * ROWS_PER_TG + sgi;
+    if (row >= params.down_rows) return;
+
+    float acc = qrow_dot(down_packed, down_scales, xshared,
+                         row, params.down_cols, params.group_size, params.bits, lane);
+    if (lane == 0) {
         output[row] = acc;
     }
 }
@@ -1100,16 +1148,19 @@ void* smoe_metal_fused_ffn(SmoeMetalCtx*   ctx,
         // command stream. The old newBufferWithBytes here was a heap
         // allocation per dispatch, in the hot loop.
         [enc setBytes:&params length:sizeof(params) atIndex:9];
-    // Threadgroup SRAM: TGROUP_SIZE floats for the input tile
-    [enc setThreadgroupMemoryLength:256 * 2 * sizeof(float) atIndex:0];
+    // Threadgroup SRAM: the WHOLE input vector, staged once per
+    // threadgroup (simdgroup-per-row contract; 16 KB at d_model 4096,
+    // under the 32 KB limit up to cols 8192).
+    [enc setThreadgroupMemoryLength:gate_cols * sizeof(float) atIndex:0];
 
     {
-        // One thread per output row: ceil(rows/256) threadgroups. The old
-        // MTLSizeMake(gate_rows,…) grid launched one threadgroup PER ROW —
-        // a 256× overdispatch the batch kernels never had.
+        // One SIMDGROUP per output row: 256 threads = 8 rows per
+        // threadgroup → ceil(rows/8) threadgroups (192 at ffn_dim 1536;
+        // the old thread-per-row grid was 6 — occupancy-starved AND
+        // uncoalesced: 22.6 vs 158 GB/s, scratch/kernel_bench_results.md).
         NSUInteger tgroup = 256;
         MTLSize tgSize    = MTLSizeMake(tgroup, 1, 1);
-        MTLSize gridGroups  = MTLSizeMake((gate_rows + tgroup - 1) / tgroup, 1, 1);
+        MTLSize gridGroups  = MTLSizeMake((gate_rows + 7) / 8, 1, 1);
         [enc dispatchThreadgroups:gridGroups threadsPerThreadgroup:tgSize];
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
     }
@@ -1129,12 +1180,12 @@ void* smoe_metal_fused_ffn(SmoeMetalCtx*   ctx,
     [enc setBuffer:buf_hd offset:hd_offset atIndex:7];
     [enc setBuffer:buf_ou offset:ou_offset atIndex:8];
     [enc setBytes:&params length:sizeof(params) atIndex:9];
-    [enc setThreadgroupMemoryLength:256 * sizeof(float) atIndex:0];
+    [enc setThreadgroupMemoryLength:down_cols * sizeof(float) atIndex:0];
 
     {
         NSUInteger tgroup = 256;
         MTLSize tgSize   = MTLSizeMake(tgroup, 1, 1);
-        MTLSize gridGroups = MTLSizeMake((down_rows + tgroup - 1) / tgroup, 1, 1);
+        MTLSize gridGroups = MTLSizeMake((down_rows + 7) / 8, 1, 1);
         [enc dispatchThreadgroups:gridGroups threadsPerThreadgroup:tgSize];
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
     }
@@ -1197,10 +1248,13 @@ void* smoe_metal_fused_ffn_group(SmoeMetalCtx*        ctx,
         id<MTLCommandBuffer>         cmd = [ctx->queue commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
 
+        // Simdgroup-per-row contract: 256 threads = 8 rows per
+        // threadgroup, grid ceil(rows/8), threadgroup memory holds the
+        // whole staged input vector (see kernel header in kMetalSource).
         const NSUInteger tgroup = 256;
         const MTLSize tgSize    = MTLSizeMake(tgroup, 1, 1);
-        const MTLSize gridGate  = MTLSizeMake((gate_rows + tgroup - 1) / tgroup, 1, 1);
-        const MTLSize gridDown  = MTLSizeMake((down_rows + tgroup - 1) / tgroup, 1, 1);
+        const MTLSize gridGate  = MTLSizeMake((gate_rows + 7) / 8, 1, 1);
+        const MTLSize gridDown  = MTLSizeMake((down_rows + 7) / 8, 1, 1);
 
         // ── Pass 1: smoe_gate_up for every expert ─────────────────
         // Shape/params/input are identical across the group — bound
@@ -1209,7 +1263,7 @@ void* smoe_metal_fused_ffn_group(SmoeMetalCtx*        ctx,
         [enc setComputePipelineState:ctx->gate_up_pso];
         [enc setBuffer:ctx->input_buf offset:0 atIndex:6];
         [enc setBytes:&params length:sizeof(params) atIndex:9];
-        [enc setThreadgroupMemoryLength:256 * 2 * sizeof(float) atIndex:0];
+        [enc setThreadgroupMemoryLength:gate_cols * sizeof(float) atIndex:0];
 
         for (uint32_t i = 0; i < n_experts; ++i) {
             NSUInteger off_gp = 0, off_gs = 0, off_up = 0, off_us = 0;
@@ -1235,7 +1289,7 @@ void* smoe_metal_fused_ffn_group(SmoeMetalCtx*        ctx,
         // ── Pass 2: smoe_down for every expert ────────────────────
         [enc setComputePipelineState:ctx->down_pso];
         [enc setBytes:&params length:sizeof(params) atIndex:9];
-        [enc setThreadgroupMemoryLength:256 * sizeof(float) atIndex:0];
+        [enc setThreadgroupMemoryLength:down_cols * sizeof(float) atIndex:0];
 
         for (uint32_t i = 0; i < n_experts; ++i) {
             NSUInteger off_dp = 0, off_ds = 0;
