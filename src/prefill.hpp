@@ -63,7 +63,7 @@ struct Buffers {
     float* vbuf;       // [CHUNK × kv_dim]
     float* attn_out;   // [CHUNK × q_dim]
     float* routed_out; // [CHUNK × d_model]  (CPU accumulator)
-    float* oproj_out;  // [d_model]          (o_proj row scratch)
+    float* oproj_out;  // [CHUNK × d_model]  (o_proj rows, batched dispatch)
     float* ffn_hidden; // [ffn_dim]          (expert / dense gate scratch)
     float* ffn_up;     // [ffn_dim]          (dense up scratch)
     float* ffn_out;    // [d_model]          (expert / dense down output)

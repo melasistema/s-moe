@@ -215,6 +215,19 @@ void smoe_metal_scout_matvec_batch_bf16(SmoeMetalCtx* ctx,
                                    const uint32_t* cols,
                                    uint32_t       count);
 
+// Same as smoe_metal_scout_matvec_batch_bf16 but WITHOUT the memory
+// barrier between dispatches: the caller guarantees every output plane
+// is distinct and no dispatch reads another's output, so the GPU is
+// free to overlap them (layer-major prefill: all B tokens' QKV in one
+// command buffer, then all B o_proj rows in another).
+void smoe_metal_scout_matvec_group_bf16(SmoeMetalCtx* ctx,
+                                   const uint16_t** weights,
+                                   const float**  inputs,
+                                   float**        outputs,
+                                   const uint32_t* rows,
+                                   const uint32_t* cols,
+                                   uint32_t       count);
+
 // Register a CPU buffer with Metal once at boot to avoid page table mapping overhead in the hot loop.
 void smoe_metal_register_buffer(SmoeMetalCtx* ctx, const void* ptr, size_t size_in_bytes);
 

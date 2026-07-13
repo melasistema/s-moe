@@ -493,6 +493,66 @@ kernel void scout_matvec_bf16(
     }
 }
 
+// ── Scout BF16 Matvec (simdgroup-per-row) ─────────────────────
+// Coalesced twin of scout_matvec_bf16, same dispatch contract as
+// the fused FFN kernels above:
+//   grid            : ceil(rows / ROWS_PER_TG) threadgroups
+//   threadsPerTG    : TGROUP_SIZE (256 = 8 simdgroups × 32 lanes)
+//   threadgroup mem : cols × sizeof(float) — the WHOLE staged input
+// One simdgroup owns one output row; its 32 lanes read consecutive
+// uint4 chunks (8 bf16 each — 512 coalesced bytes per step) instead
+// of one ushort each from addresses cols×2 bytes apart.
+// Contract (bridge-checked per dispatch; thread-per-row twin covers
+// the rest):
+//   • weight pointer 16-byte aligned and cols % 8 == 0, so every
+//     row base stays 16-byte aligned for the uint4 loads
+//   • cols × 4 ≤ maxThreadgroupMemoryLength (32 KB → cols ≤ 8192)
+kernel void scout_matvec_bf16_sg(
+    device const uint16_t* weights [[buffer(0)]],
+    device const float*    input   [[buffer(1)]],
+    device       float*    output  [[buffer(2)]],
+    constant     Dims&     dims    [[buffer(3)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]],
+    uint sgi  [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    threadgroup float* xshared [[threadgroup(0)]])
+{
+    // Stage the input vector once per threadgroup (shared by 8 rows).
+    for (uint i = tid; i < dims.cols; i += TGROUP_SIZE) {
+        xshared[i] = input[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint row = tgid * ROWS_PER_TG + sgi;
+    if (row >= dims.rows) return;   // whole simdgroup exits together
+
+    device const uint4* rp =
+        (device const uint4*)(weights + (ulong)row * dims.cols);
+    const uint nchunks = dims.cols >> 3;   // 8 bf16 per 16-byte chunk
+
+    float4 acc = float4(0.0f);
+    for (uint c = lane; c < nchunks; c += 32) {
+        uint4 v = rp[c];
+        threadgroup const float4* xv =
+            (threadgroup const float4*)(xshared + (c << 3));
+        // Two bf16 per uint: the low half needs the <<16 shift, the
+        // high half is already in sign/exponent position — mask only.
+        float4 w0 = float4(as_type<float>(v.x << 16),
+                           as_type<float>(v.x & 0xFFFF0000u),
+                           as_type<float>(v.y << 16),
+                           as_type<float>(v.y & 0xFFFF0000u));
+        float4 w1 = float4(as_type<float>(v.z << 16),
+                           as_type<float>(v.z & 0xFFFF0000u),
+                           as_type<float>(v.w << 16),
+                           as_type<float>(v.w & 0xFFFF0000u));
+        acc = fma(w0, xv[0], acc);
+        acc = fma(w1, xv[1], acc);
+    }
+    float r = simd_sum(acc.x + acc.y + acc.z + acc.w);
+    if (lane == 0) output[row] = r;
+}
+
 // ═══════════════════════════════════════════════════════════════
 // Decode attention (single token) — one command buffer per layer
 // ═══════════════════════════════════════════════════════════════
@@ -814,6 +874,7 @@ struct SmoeMetalCtx {
     id<MTLComputePipelineState> down_pso     = nil;
     id<MTLComputePipelineState> scout_matvec_pso = nil;
     id<MTLComputePipelineState> scout_matvec_bf16_pso = nil;
+    id<MTLComputePipelineState> scout_matvec_bf16_sg_pso = nil;
     id<MTLComputePipelineState> attn_prep_pso   = nil;
     id<MTLComputePipelineState> attn_decode_pso = nil;
     id<MTLComputePipelineState> gate_up_batch_pso = nil;
@@ -842,6 +903,7 @@ struct SmoeMetalCtx {
 
     size_t                      slot_bytes   = 0;
     uint32_t                    max_rows     = 0;    // = slot_bytes / sizeof(float)
+    size_t                      max_tg_mem   = 0;    // device threadgroup memory limit
 
     // Atomic flag: true when buf_b is safe for the I/O streamer to fill.
     std::atomic<bool>           passive_ready { true };
@@ -1017,6 +1079,14 @@ SmoeMetalCtx* smoe_metal_init(size_t slot_bytes) {
         return nullptr;
     }
     ctx->scout_matvec_bf16_pso = scout_matvec_bf16_pso;
+
+    // Coalesced twin — non-fatal if unavailable: every dispatch site
+    // falls back to the thread-per-row PSO when this one is nil.
+    ctx->scout_matvec_bf16_sg_pso = make_pso(dev, lib, "scout_matvec_bf16_sg", &err);
+    if (!ctx->scout_matvec_bf16_sg_pso) {
+        std::fprintf(stderr, "[smoe_metal] WARN: PSO 'scout_matvec_bf16_sg' unavailable — thread-per-row bf16 path only.\n");
+    }
+    ctx->max_tg_mem = [dev maxThreadgroupMemoryLength];
 
     ctx->attn_prep_pso   = make_pso(dev, lib, "attn_prep", &err);
     ctx->attn_decode_pso = make_pso(dev, lib, "attn_decode", &err);
@@ -1594,6 +1664,59 @@ void smoe_metal_register_buffer(SmoeMetalCtx* ctx, const void* ptr, size_t size_
 
 
 
+// Encode one bf16 matvec dispatch, picking the coalesced simdgroup-
+// per-row kernel whenever its contract holds — weight pointer 16-byte
+// aligned, cols % 8 == 0 (keeps every row base 16-byte aligned for the
+// uint4 loads), staged input within the device threadgroup memory
+// limit. The thread-per-row twin covers everything else (e.g. the
+// >8192-col dense/shared FFN matrices of DeepSeek-family models).
+// Returns false only if buffer wrapping failed.
+static bool encode_scout_matvec_bf16(SmoeMetalCtx* ctx,
+                                     id<MTLComputeCommandEncoder> enc,
+                                     const uint16_t* weight,
+                                     const float*    input,
+                                     float*          output,
+                                     uint32_t rows, uint32_t cols)
+{
+    size_t weight_bytes = static_cast<size_t>(rows) * cols * sizeof(uint16_t);
+    size_t input_bytes  = static_cast<size_t>(cols) * sizeof(float);
+    size_t output_bytes = static_cast<size_t>(rows) * sizeof(float);
+
+    NSUInteger off_wt=0, off_in=0, off_ou=0;
+    id<MTLBuffer> buf_wt = get_registered_buffer(ctx, weight, weight_bytes, off_wt);
+    id<MTLBuffer> buf_in = get_registered_buffer(ctx, input,  input_bytes,  off_in);
+    id<MTLBuffer> buf_ou = get_registered_buffer(ctx, output, output_bytes, off_ou);
+    if (!buf_wt || !buf_in || !buf_ou) return false;
+
+    const bool sg_ok = ctx->scout_matvec_bf16_sg_pso != nil
+        && (reinterpret_cast<uintptr_t>(weight) & 15u) == 0
+        && (cols & 7u) == 0
+        && static_cast<size_t>(cols) * sizeof(float) <= ctx->max_tg_mem;
+
+    Dims dims { rows, cols };
+    [enc setComputePipelineState:(sg_ok ? ctx->scout_matvec_bf16_sg_pso
+                                        : ctx->scout_matvec_bf16_pso)];
+    [enc setBuffer:buf_wt offset:off_wt atIndex:0];
+    [enc setBuffer:buf_in offset:off_in atIndex:1];
+    [enc setBuffer:buf_ou offset:off_ou atIndex:2];
+    [enc setBytes:&dims length:sizeof(dims) atIndex:3];
+
+    NSUInteger tgroup = 256;
+    if (sg_ok) {
+        // One SIMDGROUP per output row: 256 threads = 8 rows per
+        // threadgroup; the whole input vector staged in tgmem.
+        [enc setThreadgroupMemoryLength:static_cast<size_t>(cols) * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake((rows + 7) / 8, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tgroup, 1, 1)];
+    } else {
+        // ceil(rows/256) threadgroups, one thread per row.
+        [enc setThreadgroupMemoryLength:tgroup * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake((rows + tgroup - 1) / tgroup, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tgroup, 1, 1)];
+    }
+    return true;
+}
+
 void smoe_metal_scout_matvec_batch_bf16(SmoeMetalCtx* ctx,
                                    const uint16_t** weights,
                                    const float**  inputs,
@@ -1608,44 +1731,56 @@ void smoe_metal_scout_matvec_batch_bf16(SmoeMetalCtx* ctx,
     id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
 
-    [enc setComputePipelineState:ctx->scout_matvec_bf16_pso];
-
     for (uint32_t i = 0; i < count; ++i) {
-        size_t weight_bytes = static_cast<size_t>(rows[i]) * cols[i] * sizeof(uint16_t);
-        size_t input_bytes  = static_cast<size_t>(cols[i]) * sizeof(float);
-        size_t output_bytes = static_cast<size_t>(rows[i]) * sizeof(float);
-
-        NSUInteger off_wt=0, off_in=0, off_ou=0;
-        id<MTLBuffer> buf_wt = get_registered_buffer(ctx, weights[i], weight_bytes, off_wt);
-        id<MTLBuffer> buf_in = get_registered_buffer(ctx, inputs[i],  input_bytes,  off_in);
-        id<MTLBuffer> buf_ou = get_registered_buffer(ctx, outputs[i], output_bytes, off_ou);
-
-        if (!buf_wt || !buf_in || !buf_ou) {
+        if (!encode_scout_matvec_bf16(ctx, enc, weights[i], inputs[i], outputs[i],
+                                      rows[i], cols[i])) {
             std::fprintf(stderr, "[smoe_metal] ERROR: failed to wrap batch bf16 pointers.\n");
             return;
         }
-
-        Dims dims { rows[i], cols[i] };
-
-        [enc setBuffer:buf_wt offset:off_wt atIndex:0];
-        [enc setBuffer:buf_in offset:off_in atIndex:1];
-        [enc setBuffer:buf_ou offset:off_ou atIndex:2];
-        [enc setBytes:&dims length:sizeof(dims) atIndex:3];
-
-        NSUInteger tgroup = 256;
-        [enc setThreadgroupMemoryLength:tgroup * sizeof(float) atIndex:0];
-
-        MTLSize tgSize     = MTLSizeMake(tgroup, 1, 1);
-        // ceil(rows/256) threadgroups, one thread per row. This path runs
-        // the 151936-row LM head once per generated token — the old
-        // one-threadgroup-per-row grid was a 256× overdispatch.
-        MTLSize gridGroups = MTLSizeMake((rows[i] + tgroup - 1) / tgroup, 1, 1);
-        [enc dispatchThreadgroups:gridGroups threadsPerThreadgroup:tgSize];
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
     }
 
     [enc endEncoding];
     
+    ctx->signaled_value++;
+    uint64_t wait_val = ctx->signaled_value;
+    [cmd encodeSignalEvent:ctx->shared_event value:wait_val];
+
+    [cmd commit];
+
+    while (ctx->shared_event.signaledValue < wait_val) {
+        std::this_thread::yield();
+    }
+    }
+}
+
+void smoe_metal_scout_matvec_group_bf16(SmoeMetalCtx* ctx,
+                                   const uint16_t** weights,
+                                   const float**  inputs,
+                                   float**        outputs,
+                                   const uint32_t* rows,
+                                   const uint32_t* cols,
+                                   uint32_t       count)
+{
+    if (!ctx || count == 0) return;
+
+    @autoreleasepool {
+    id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+
+    // No inter-dispatch barriers: outputs are pairwise distinct and no
+    // dispatch reads another's output (caller contract), so the GPU may
+    // execute all of them concurrently.
+    for (uint32_t i = 0; i < count; ++i) {
+        if (!encode_scout_matvec_bf16(ctx, enc, weights[i], inputs[i], outputs[i],
+                                      rows[i], cols[i])) {
+            std::fprintf(stderr, "[smoe_metal] ERROR: failed to wrap group bf16 pointers.\n");
+            return;
+        }
+    }
+
+    [enc endEncoding];
+
     ctx->signaled_value++;
     uint64_t wait_val = ctx->signaled_value;
     [cmd encodeSignalEvent:ctx->shared_event value:wait_val];
@@ -1693,37 +1828,21 @@ void smoe_metal_attention_layer(SmoeMetalCtx* ctx, const SmoeAttnLayerArgs* a)
     id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
 
-    const size_t in_bytes  = size_t(a->d_model) * sizeof(float);
     const size_t cache_bytes = size_t(a->attn_ctx) * a->kv_dim * sizeof(float);
 
     // ── Pass 1: Q/K/V projections (independent — one barrier after) ──
-    [enc setComputePipelineState:ctx->scout_matvec_bf16_pso];
     {
         const uint16_t* w[3]   = { a->w_q,  a->w_k,  a->w_v  };
         float*          o[3]   = { a->qbuf, a->kbuf, a->vbuf };
         const uint32_t  rows[3]= { a->q_dim, a->kv_dim, a->kv_dim };
 
-        NSUInteger off_in = 0;
-        id<MTLBuffer> buf_in = get_registered_buffer(ctx, a->normed_in, in_bytes, off_in);
         for (int i = 0; i < 3; ++i) {
-            size_t w_bytes = size_t(rows[i]) * a->d_model * sizeof(uint16_t);
-            NSUInteger off_wt = 0, off_ou = 0;
-            id<MTLBuffer> buf_wt = get_registered_buffer(ctx, w[i], w_bytes, off_wt);
-            id<MTLBuffer> buf_ou = get_registered_buffer(ctx, o[i], size_t(rows[i]) * sizeof(float), off_ou);
-            if (!buf_wt || !buf_in || !buf_ou) {
+            if (!encode_scout_matvec_bf16(ctx, enc, w[i], a->normed_in, o[i],
+                                          rows[i], a->d_model)) {
                 std::fprintf(stderr, "[smoe_metal] ERROR: attention QKV wrap failed.\n");
                 [enc endEncoding];
                 return;
             }
-            Dims dims { rows[i], a->d_model };
-            [enc setBuffer:buf_wt offset:off_wt atIndex:0];
-            [enc setBuffer:buf_in offset:off_in atIndex:1];
-            [enc setBuffer:buf_ou offset:off_ou atIndex:2];
-            [enc setBytes:&dims length:sizeof(dims) atIndex:3];
-            NSUInteger tgroup = 256;
-            [enc setThreadgroupMemoryLength:tgroup * sizeof(float) atIndex:0];
-            [enc dispatchThreadgroups:MTLSizeMake((rows[i] + tgroup - 1) / tgroup, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(tgroup, 1, 1)];
         }
     }
     [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
@@ -1803,27 +1922,11 @@ void smoe_metal_attention_layer(SmoeMetalCtx* ctx, const SmoeAttnLayerArgs* a)
     [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
     // ── Pass 4: O projection ──
-    {
-        size_t w_bytes = size_t(a->d_model) * a->q_dim * sizeof(uint16_t);
-        NSUInteger off_wt = 0, off_in = 0, off_ou = 0;
-        id<MTLBuffer> buf_wt = get_registered_buffer(ctx, a->w_o, w_bytes, off_wt);
-        id<MTLBuffer> buf_in = get_registered_buffer(ctx, a->attn_out, size_t(a->q_dim) * sizeof(float), off_in);
-        id<MTLBuffer> buf_ou = get_registered_buffer(ctx, a->o_out, size_t(a->d_model) * sizeof(float), off_ou);
-        if (!buf_wt || !buf_in || !buf_ou) {
-            std::fprintf(stderr, "[smoe_metal] ERROR: attention o_proj wrap failed.\n");
-            [enc endEncoding];
-            return;
-        }
-        Dims dims { a->d_model, a->q_dim };
-        [enc setComputePipelineState:ctx->scout_matvec_bf16_pso];
-        [enc setBuffer:buf_wt offset:off_wt atIndex:0];
-        [enc setBuffer:buf_in offset:off_in atIndex:1];
-        [enc setBuffer:buf_ou offset:off_ou atIndex:2];
-        [enc setBytes:&dims length:sizeof(dims) atIndex:3];
-        NSUInteger tgroup = 256;
-        [enc setThreadgroupMemoryLength:tgroup * sizeof(float) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake((a->d_model + tgroup - 1) / tgroup, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(tgroup, 1, 1)];
+    if (!encode_scout_matvec_bf16(ctx, enc, a->w_o, a->attn_out, a->o_out,
+                                  a->d_model, a->q_dim)) {
+        std::fprintf(stderr, "[smoe_metal] ERROR: attention o_proj wrap failed.\n");
+        [enc endEncoding];
+        return;
     }
 
     [enc endEncoding];

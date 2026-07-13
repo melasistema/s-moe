@@ -441,6 +441,66 @@ kernel void scout_matvec_bf16(
     }
 }
 
+// ── Scout BF16 Matvec (simdgroup-per-row) ─────────────────────
+// Coalesced twin of scout_matvec_bf16, same dispatch contract as
+// the fused FFN kernels above:
+//   grid            : ceil(rows / ROWS_PER_TG) threadgroups
+//   threadsPerTG    : TGROUP_SIZE (256 = 8 simdgroups × 32 lanes)
+//   threadgroup mem : cols × sizeof(float) — the WHOLE staged input
+// One simdgroup owns one output row; its 32 lanes read consecutive
+// uint4 chunks (8 bf16 each — 512 coalesced bytes per step) instead
+// of one ushort each from addresses cols×2 bytes apart.
+// Contract (bridge-checked per dispatch; thread-per-row twin covers
+// the rest):
+//   • weight pointer 16-byte aligned and cols % 8 == 0, so every
+//     row base stays 16-byte aligned for the uint4 loads
+//   • cols × 4 ≤ maxThreadgroupMemoryLength (32 KB → cols ≤ 8192)
+kernel void scout_matvec_bf16_sg(
+    device const uint16_t* weights [[buffer(0)]],
+    device const float*    input   [[buffer(1)]],
+    device       float*    output  [[buffer(2)]],
+    constant     Dims&     dims    [[buffer(3)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]],
+    uint sgi  [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    threadgroup float* xshared [[threadgroup(0)]])
+{
+    // Stage the input vector once per threadgroup (shared by 8 rows).
+    for (uint i = tid; i < dims.cols; i += TGROUP_SIZE) {
+        xshared[i] = input[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint row = tgid * ROWS_PER_TG + sgi;
+    if (row >= dims.rows) return;   // whole simdgroup exits together
+
+    device const uint4* rp =
+        (device const uint4*)(weights + (ulong)row * dims.cols);
+    const uint nchunks = dims.cols >> 3;   // 8 bf16 per 16-byte chunk
+
+    float4 acc = float4(0.0f);
+    for (uint c = lane; c < nchunks; c += 32) {
+        uint4 v = rp[c];
+        threadgroup const float4* xv =
+            (threadgroup const float4*)(xshared + (c << 3));
+        // Two bf16 per uint: the low half needs the <<16 shift, the
+        // high half is already in sign/exponent position — mask only.
+        float4 w0 = float4(as_type<float>(v.x << 16),
+                           as_type<float>(v.x & 0xFFFF0000u),
+                           as_type<float>(v.y << 16),
+                           as_type<float>(v.y & 0xFFFF0000u));
+        float4 w1 = float4(as_type<float>(v.z << 16),
+                           as_type<float>(v.z & 0xFFFF0000u),
+                           as_type<float>(v.w << 16),
+                           as_type<float>(v.w & 0xFFFF0000u));
+        acc = fma(w0, xv[0], acc);
+        acc = fma(w1, xv[1], acc);
+    }
+    float r = simd_sum(acc.x + acc.y + acc.z + acc.w);
+    if (lane == 0) output[row] = r;
+}
+
 // ═══════════════════════════════════════════════════════════════
 // Decode attention (single token) — one command buffer per layer
 // ═══════════════════════════════════════════════════════════════

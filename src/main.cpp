@@ -697,7 +697,7 @@ int main(int argc, char* argv[]) {
         pf.vbuf        = plane(size_t(CHUNK) * kv_dim, true);
         pf.attn_out    = plane(size_t(CHUNK) * q_dim,  true);
         pf.routed_out  = plane(size_t(CHUNK) * d_model, false);
-        pf.oproj_out   = plane(d_model, true);
+        pf.oproj_out   = plane(size_t(CHUNK) * d_model, true);  // one o_proj row per token (batched dispatch)
         pf.ffn_hidden  = plane(ffn_dim, true);
         pf.ffn_up      = plane(ffn_dim, true);
         pf.ffn_out     = plane(d_model, true);

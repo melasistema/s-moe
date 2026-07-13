@@ -4,13 +4,16 @@
 // See prefill.hpp for the design rationale. Structure per chunk:
 //
 //   embed all B tokens → for each layer L:
-//     ① RMS-norm + QKV + QK-norm + RoPE for all B tokens
-//     ② append K/V to the ring (heavy + scout mirrors)
+//     ① RMS-norm (CPU), then ALL B tokens' Q/K/V in one command buffer
+//     ② QK-norm + RoPE + K/V ring append per token (CPU)
 //     ③ causal attention per token (window = its own history only)
-//     ④ o_proj + residual, FFN norm
-//     ⑤ router gate for all B tokens → per-expert token lists (dedupe)
-//     ⑥ prefetch the whole union, then claim each expert ONCE and
-//        run the fused FFN for every token routed to it
+//     ④ ALL B o_proj rows in one command buffer, then residual +
+//        FFN norm per token (CPU)
+//     ⑤ router gate per token → per-expert token lists (dedupe);
+//        every FRESH expert fires at the streamer immediately, so the
+//        NVMe works while later tokens are still routing
+//     ⑥ claim each union expert ONCE and run the fused FFN for every
+//        token routed to it
 // ═══════════════════════════════════════════════════════════════
 
 #include "prefill.hpp"
@@ -41,7 +44,10 @@ uint32_t     g_union_size;
 
 void union_reset() { g_union_size = 0; }
 
-void union_add(uint32_t expert, uint32_t tok_row, float weight) {
+// Returns true the first time this expert enters the layer's union —
+// the caller fires the streamer on that edge, so I/O for the layer
+// starts while later tokens are still routing.
+bool union_add(uint32_t expert, uint32_t tok_row, float weight) {
     ExpertTokens& et = g_elist[expert];
     bool fresh = true;
     for (uint32_t u = 0; u < g_union_size; ++u) {
@@ -56,7 +62,18 @@ void union_add(uint32_t expert, uint32_t tok_row, float weight) {
         et.w[et.count]   = weight;
         et.count++;
     }
+    return fresh;
 }
+
+// Batched dense-dispatch pointer tables (QKV: 3 entries per token;
+// o_proj: 1). Static: single-threaded caller, zero allocation in the
+// hot path (CLAUDE.md).
+inline constexpr uint32_t MAX_DISPATCH = 3 * CHUNK;
+const uint16_t* g_disp_w[MAX_DISPATCH];
+const float*    g_disp_in[MAX_DISPATCH];
+float*          g_disp_out[MAX_DISPATCH];
+uint32_t        g_disp_rows[MAX_DISPATCH];
+uint32_t        g_disp_cols[MAX_DISPATCH];
 
 } // namespace
 
@@ -108,29 +125,47 @@ void run_layer_major(const Params& P,
             float* k_cache = P.full_kv_cache + (static_cast<size_t>(l) * 2 * ATTN_CTX + 0 * ATTN_CTX) * kv_dim;
             float* v_cache = P.full_kv_cache + (static_cast<size_t>(l) * 2 * ATTN_CTX + 1 * ATTN_CTX) * kv_dim;
 
-            // ── ① Input norm + QKV + QK-norm + RoPE, ② K/V append ──
+            // ── ① Input norm (CPU), then ALL B tokens' Q/K/V in one
+            //     command buffer. The per-token synchronous matvec
+            //     round-trips (2×B×layers command buffers, each
+            //     re-reading the full weight matrices at thread-per-row
+            //     bandwidth) were the prefill's dominant non-I/O cost.
             for (uint32_t i = 0; i < B; ++i) {
-                float* h   = b.hidden + static_cast<size_t>(i) * d_model;
-                float* nr  = b.normed + static_cast<size_t>(i) * d_model;
+                float* h  = b.hidden + static_cast<size_t>(i) * d_model;
+                float* nr = b.normed + static_cast<size_t>(i) * d_model;
+                std::memcpy(nr, h, d_model * sizeof(float));
+                smoe::rms_norm_bf16(nr, scout.get_input_norm(l), d_model);
+            }
+            if (P.metal) {
+                uint32_t n = 0;
+                for (uint32_t i = 0; i < B; ++i) {
+                    const float* nr = b.normed + static_cast<size_t>(i) * d_model;
+                    const uint16_t* w[3] = { scout.get_q_proj(l), scout.get_k_proj(l), scout.get_v_proj(l) };
+                    float* o[3] = { b.qbuf + static_cast<size_t>(i) * q_dim,
+                                    b.kbuf + static_cast<size_t>(i) * kv_dim,
+                                    b.vbuf + static_cast<size_t>(i) * kv_dim };
+                    const uint32_t r[3] = { q_dim, kv_dim, kv_dim };
+                    for (uint32_t j = 0; j < 3; ++j) {
+                        g_disp_w[n] = w[j];  g_disp_in[n] = nr;  g_disp_out[n] = o[j];
+                        g_disp_rows[n] = r[j];  g_disp_cols[n] = d_model;  ++n;
+                    }
+                }
+                smoe_metal_scout_matvec_group_bf16(P.metal, g_disp_w, g_disp_in,
+                                                   g_disp_out, g_disp_rows, g_disp_cols, n);
+            } else {
+                for (uint32_t i = 0; i < B; ++i) {
+                    const float* nr = b.normed + static_cast<size_t>(i) * d_model;
+                    smoe::matvec_bf16(b.qbuf + static_cast<size_t>(i) * q_dim,  scout.get_q_proj(l), nr, q_dim, d_model);
+                    smoe::matvec_bf16(b.kbuf + static_cast<size_t>(i) * kv_dim, scout.get_k_proj(l), nr, kv_dim, d_model);
+                    smoe::matvec_bf16(b.vbuf + static_cast<size_t>(i) * kv_dim, scout.get_v_proj(l), nr, kv_dim, d_model);
+                }
+            }
+
+            // ── ② QK-norm + RoPE + K/V append per token (CPU) ──
+            for (uint32_t i = 0; i < B; ++i) {
                 float* qi  = b.qbuf + static_cast<size_t>(i) * q_dim;
                 float* ki  = b.kbuf + static_cast<size_t>(i) * kv_dim;
                 float* vi  = b.vbuf + static_cast<size_t>(i) * kv_dim;
-
-                std::memcpy(nr, h, d_model * sizeof(float));
-                smoe::rms_norm_bf16(nr, scout.get_input_norm(l), d_model);
-
-                if (P.metal) {
-                    const uint16_t* weights[3] = { scout.get_q_proj(l), scout.get_k_proj(l), scout.get_v_proj(l) };
-                    const float* inputs[3] = { nr, nr, nr };
-                    float* outputs[3] = { qi, ki, vi };
-                    uint32_t rows[3] = { q_dim, kv_dim, kv_dim };
-                    uint32_t cols[3] = { d_model, d_model, d_model };
-                    smoe_metal_scout_matvec_batch_bf16(P.metal, weights, inputs, outputs, rows, cols, 3);
-                } else {
-                    smoe::matvec_bf16(qi, scout.get_q_proj(l), nr, q_dim, d_model);
-                    smoe::matvec_bf16(ki, scout.get_k_proj(l), nr, kv_dim, d_model);
-                    smoe::matvec_bf16(vi, scout.get_v_proj(l), nr, kv_dim, d_model);
-                }
 
                 const uint16_t* q_norm_w = scout.get_q_norm(l);
                 const uint16_t* k_norm_w = scout.get_k_norm(l);
@@ -169,12 +204,10 @@ void run_layer_major(const Params& P,
                 std::memcpy(v_cache + static_cast<size_t>(slot) * kv_dim, vi, kv_dim * sizeof(float));
             }
 
-            // ── ③ Causal attention + ④ o_proj/residual/FFN-norm ──
+            // ── ③ Causal attention per token (CPU) ──
             // All chunk K/V rows are already in the ring; causality holds
             // because token i's window is capped at its own history.
             for (uint32_t i = 0; i < B; ++i) {
-                float* h  = b.hidden + static_cast<size_t>(i) * d_model;
-                float* nr = b.normed + static_cast<size_t>(i) * d_model;
                 float* qi = b.qbuf + static_cast<size_t>(i) * q_dim;
                 float* ao = b.attn_out + static_cast<size_t>(i) * q_dim;
 
@@ -209,13 +242,33 @@ void run_layer_major(const Params& P,
                     }
                 }
 
-                if (P.metal) {
-                    smoe_metal_scout_matvec_bf16(P.metal, scout.get_o_proj(l), ao, b.oproj_out, d_model, q_dim);
-                } else {
-                    smoe::matvec_bf16(b.oproj_out, scout.get_o_proj(l), ao, d_model, q_dim);
-                }
-                for (uint32_t d = 0; d < d_model; ++d) h[d] += b.oproj_out[d];
+            }
 
+            // ── ④ ALL B o_proj rows in one command buffer, then
+            //     residual + FFN norm per token (CPU).
+            if (P.metal) {
+                for (uint32_t i = 0; i < B; ++i) {
+                    g_disp_w[i]   = scout.get_o_proj(l);
+                    g_disp_in[i]  = b.attn_out  + static_cast<size_t>(i) * q_dim;
+                    g_disp_out[i] = b.oproj_out + static_cast<size_t>(i) * d_model;
+                    g_disp_rows[i] = d_model;
+                    g_disp_cols[i] = q_dim;
+                }
+                smoe_metal_scout_matvec_group_bf16(P.metal, g_disp_w, g_disp_in,
+                                                   g_disp_out, g_disp_rows, g_disp_cols, B);
+            } else {
+                for (uint32_t i = 0; i < B; ++i) {
+                    smoe::matvec_bf16(b.oproj_out + static_cast<size_t>(i) * d_model,
+                                      scout.get_o_proj(l),
+                                      b.attn_out + static_cast<size_t>(i) * q_dim,
+                                      d_model, q_dim);
+                }
+            }
+            for (uint32_t i = 0; i < B; ++i) {
+                float* h  = b.hidden + static_cast<size_t>(i) * d_model;
+                float* nr = b.normed + static_cast<size_t>(i) * d_model;
+                const float* po = b.oproj_out + static_cast<size_t>(i) * d_model;
+                for (uint32_t d = 0; d < d_model; ++d) h[d] += po[d];
                 std::memcpy(nr, h, d_model * sizeof(float));
                 smoe::rms_norm_bf16(nr, scout.get_post_norm(l), d_model);
             }
@@ -250,7 +303,13 @@ void run_layer_major(const Params& P,
                 continue;
             }
 
-            // Routed experts: exact gate per token, then dedupe.
+            // Routed experts: exact gate per token, then dedupe. Each
+            // expert is FIRED at the streamer the moment it first enters
+            // the union — the NVMe starts on this layer's blobs while
+            // later tokens are still routing, instead of idling until
+            // the whole chunk has routed. These are demand reads pulled
+            // earlier, never extra reads (contrast the measured-slower
+            // replay hints documented in main.cpp).
             const uint32_t li = l - P.moe_start_layer;
             union_reset();
             std::memset(b.routed_out, 0, static_cast<size_t>(B) * d_model * sizeof(float));
@@ -263,14 +322,11 @@ void run_layer_major(const Params& P,
                 uint32_t cnt = scout.compute_top_k(b.gate_scores, n_experts, TOPK,
                                                    topk_ids, topk_w, cfg.norm_topk_prob);
                 for (uint32_t e = 0; e < cnt; ++e) {
-                    if (topk_ids[e] < MAX_EXPERTS) union_add(topk_ids[e], i, topk_w[e]);
+                    if (topk_ids[e] < MAX_EXPERTS &&
+                        union_add(topk_ids[e], i, topk_w[e])) {
+                        (void)streamer.prefetch(l, topk_ids[e]);
+                    }
                 }
-            }
-
-            // Fire the whole union: the streamer workers stream ahead
-            // while we consume claim-by-claim below.
-            for (uint32_t u = 0; u < g_union_size; ++u) {
-                (void)streamer.prefetch(l, g_union_ids[u]);
             }
 
             // Claim each expert once; apply it to every routed token.
