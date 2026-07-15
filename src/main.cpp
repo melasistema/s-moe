@@ -577,7 +577,12 @@ int main(int argc, char* argv[]) {
     std::mt19937 rng(1337); // Fixed seed for deterministic debug, can be randomized later
     // Top-K candidate buffer for the sampler — allocated once here so the
     // token loop stays heap-free.
-    smoe::SamplerScratch sampler_scratch(top_k, cfg.vocab_size);
+    // Sized to the serve-protocol ceiling (k=<N> per-request override), not
+    // the launch --top-k, so overrides never reallocate mid-loop (Golden
+    // Rule: no dynamic memory in the token loop). k requests above the cap
+    // are clamped at parse time.
+    constexpr uint32_t TOP_K_PROTOCOL_CAP = 1024;
+    smoe::SamplerScratch sampler_scratch(std::max(top_k, TOP_K_PROTOCOL_CAP), cfg.vocab_size);
     TelemetryState ts;
 
     // Instrumentation marks: instr_bucket() charges the wall time since
@@ -728,14 +733,24 @@ int main(int argc, char* argv[]) {
     // ═══ REQUEST LOOP ═══════════════════════════════════════════
     // One-shot mode runs exactly one request from the CLI arguments.
     // Server mode reads one request per stdin line:
-    //   GEN <max_tokens> <id0>,<id1>,...   full conversation token stream
-    //   RESET                              drop all cached state
-    // and replies with raw token IDs on stdout, terminated by <<DONE>>.
+    //   GEN <max_tokens> [ovr ...] <id0>,<id1>,...   full conversation stream
+    //   RESET                                        drop all cached state
+    // [ovr ...] are optional per-request sampling overrides, space-separated
+    // key=value fields: t=<temperature> p=<top_p> k=<top_k> r=<rep_penalty>.
+    // The first field without '=' starts the token csv, so pre-override
+    // clients (chat.py) are parsed unchanged. Unknown keys are ignored.
+    // The engine replies with raw token IDs on stdout, terminated by <<DONE>>.
     // The KV cache, ring cache, and scout state persist across requests;
     // only the suffix beyond the longest common prefix with the stored
     // stream is prefetched and prefilled.
     while (true) {
         uint32_t req_max_tokens = max_tokens;
+        // Per-request sampling: launch values are the defaults, serve-mode
+        // overrides apply to this request only.
+        float    req_temperature = temperature;
+        float    req_top_p       = top_p;
+        uint32_t req_top_k       = top_k;
+        float    req_rep_penalty = rep_penalty;
         prompt_len = 0;
 
         if (!serve) {
@@ -789,6 +804,38 @@ int main(int argc, char* argv[]) {
                     req_max_tokens = static_cast<uint32_t>(std::atoi(req_line.c_str() + p));
                     if (req_max_tokens == 0 || req_max_tokens > 8192) parse_ok = false;
                     p = sp + 1;
+                    // Optional sampling overrides: consume key=value fields
+                    // until the first field with no '=' (the token csv).
+                    while (parse_ok && p < req_line.size()) {
+                        size_t fend = req_line.find(' ', p);
+                        if (fend == std::string::npos) fend = req_line.size();
+                        size_t eq = req_line.find('=', p);
+                        if (eq == std::string::npos || eq >= fend) break;   // csv begins
+                        const char* val = req_line.c_str() + eq + 1;
+                        if (eq == p + 1) {
+                            switch (req_line[p]) {
+                                case 't':   // temperature (<1e-4 → greedy)
+                                    req_temperature = std::max(0.0f, std::strtof(val, nullptr));
+                                    break;
+                                case 'p':   // top_p, clamped to a sane range
+                                    req_top_p = std::min(std::max(std::strtof(val, nullptr), 0.01f), 1.0f);
+                                    break;
+                                case 'k': { // top_k, capped by the scratch pre-allocation
+                                    long kv = std::strtol(val, nullptr, 10);
+                                    const long cap = static_cast<long>(sampler_scratch.topk.size());
+                                    req_top_k = static_cast<uint32_t>(std::min(std::max(kv, 1L), cap));
+                                    break;
+                                }
+                                case 'r': { // repetition penalty (must be > 0)
+                                    float rv = std::strtof(val, nullptr);
+                                    if (rv > 0.0f) req_rep_penalty = rv;
+                                    break;
+                                }
+                                default: break;   // unknown key: ignore (forward compat)
+                            }
+                        }
+                        p = (fend < req_line.size()) ? fend + 1 : fend;
+                    }
                     while (parse_ok && p < req_line.size()) {
                         if (full_len >= STREAM_CAP) { parse_ok = false; break; }
                         char* endp = nullptr;
@@ -839,8 +886,9 @@ int main(int argc, char* argv[]) {
                 stream_tokens[stream_len++] = prompt_tokens[i];
             }
             if (g_debug) {
-                std::fprintf(stderr, "[serve] stream=%u lcp=%u suffix=%u gen=%u\n",
-                             full_len, lcp, suffix, req_max_tokens);
+                std::fprintf(stderr, "[serve] stream=%u lcp=%u suffix=%u gen=%u t=%.2f p=%.2f k=%u r=%.2f\n",
+                             full_len, lcp, suffix, req_max_tokens,
+                             req_temperature, req_top_p, req_top_k, req_rep_penalty);
             }
         }
 
@@ -859,6 +907,10 @@ int main(int argc, char* argv[]) {
         ts.prev_bytes = 0;
 
         next_heavy_token = 0;
+
+        // Finish reason for serve clients: EOS sampled ("stop") vs the
+        // req_max_tokens cap exhausted ("length").
+        bool hit_eos = false;
 
         uint32_t total_steps = prompt_len + req_max_tokens;
         if (prompt_len > 0) total_steps -= 1;
@@ -1395,10 +1447,10 @@ int main(int argc, char* argv[]) {
             // Sample Token
             smoe::SamplerConfig sampler_cfg {
                 .vocab_size = cfg.vocab_size,
-                .temperature = temperature,
-                .top_p = top_p,
-                .top_k = top_k,
-                .rep_penalty = rep_penalty
+                .temperature = req_temperature,
+                .top_p = req_top_p,
+                .top_k = req_top_k,
+                .rep_penalty = req_rep_penalty
             };
             uint32_t best_tok = smoe::sample_token(scores, sampler_cfg, stream_tokens, stream_len, rng, sampler_scratch);
 
@@ -1427,6 +1479,7 @@ int main(int argc, char* argv[]) {
         if (is_generating) {
             if (std::find(eos_ids.begin(), eos_ids.end(), heavy_cur_token) != eos_ids.end()) {
                 if (g_debug) std::fprintf(stderr, "\n[EOS reached]\n");
+                hit_eos = true;
                 break;
             }
             if (g_raw_ids) {
@@ -1500,9 +1553,13 @@ int main(int argc, char* argv[]) {
         prewarm_epoch.fetch_add(1, std::memory_order_relaxed);
 
         if (serve) {
-            // Terminate the token stream for this request. chat.py reads
-            // token IDs until it sees the <<DONE>> sentinel line.
-            std::printf("\n<<DONE>>\n");
+            // Terminate the token stream for this request. Clients read
+            // token IDs until the <<DONE>> sentinel. The fin=<reason>
+            // key=value token rides ahead of it (mirroring the GEN
+            // override syntax): "stop" = EOS sampled, "length" = the
+            // max_tokens cap ran out. Backward compatible — clients that
+            // predate it (chat.py) drop non-numeric tokens unread.
+            std::printf("\nfin=%s <<DONE>>\n", hit_eos ? "stop" : "length");
             std::fflush(stdout);
         }
     } // ═══ end REQUEST LOOP ═══

@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<!--
+  webchat.html — a dependency-free manual test console for serve_openai.py.
+
+  Served at GET / by the OpenAI-compatible server, so it shares the server's
+  origin: fetch() to /v1/chat/completions needs no CORS. It is a *test*
+  client, deliberately thin — one file, vanilla JS, no build step — mirroring
+  the ethos of chat.py and serve_openai.py. Any real OpenAI client (Open
+  WebUI, LibreChat, the openai SDK) works identically against /v1.
+
+  It resends the full message history every turn, exactly as OpenAI-style
+  clients do — that is what lets the engine LCP-prefix-match and reuse its KV
+  cache for a warm follow-up TTFT.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>S-MoE · webchat</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --border: #30363d;
+    --fg: #e6edf3; --muted: #8b949e; --accent: #58a6ff;
+    --user: #1f6feb22; --assist: #161b22; --warn: #d29922;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--fg); display: flex; flex-direction: column;
+    font: 15px/1.55 -apple-system, "SF Pro Text", Segoe UI, Roboto, sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px; padding: 10px 16px;
+    border-bottom: 1px solid var(--border); background: var(--panel);
+  }
+  header .title { font-weight: 600; letter-spacing: .2px; }
+  header .title small { color: var(--muted); font-weight: 400; margin-left: 6px; }
+  header .dot { width: 9px; height: 9px; border-radius: 50%; background: #3fb950; }
+  header .dot.down { background: #f85149; }
+  header .spacer { flex: 1; }
+  header label { color: var(--muted); font-size: 12px; display: inline-flex; align-items: center; gap: 4px; }
+  header input {
+    width: 58px; background: var(--bg); color: var(--fg);
+    border: 1px solid var(--border); border-radius: 6px; padding: 3px 6px; font: inherit; font-size: 12px;
+  }
+  header button.ghost {
+    background: transparent; color: var(--muted); border: 1px solid var(--border);
+    border-radius: 6px; padding: 4px 10px; cursor: pointer; font: inherit; font-size: 12px;
+  }
+  header button.ghost:hover { color: var(--fg); border-color: var(--muted); }
+  #log { flex: 1; overflow-y: auto; padding: 20px 16px; }
+  .wrap { max-width: 760px; margin: 0 auto; }
+  .msg { padding: 12px 14px; border-radius: 10px; margin: 10px 0; border: 1px solid var(--border); white-space: pre-wrap; word-wrap: break-word; }
+  .msg.user { background: var(--user); }
+  .msg.assistant { background: var(--assist); }
+  .msg .role { font-size: 11px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); margin-bottom: 6px; }
+  .msg .fin { font-size: 11px; color: var(--muted); margin-top: 8px; }
+  .msg .fin.length { color: var(--warn); }
+  .cursor::after { content: "▍"; color: var(--accent); animation: blink 1s steps(2) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+  footer { border-top: 1px solid var(--border); background: var(--panel); padding: 12px 16px; }
+  .composer { max-width: 760px; margin: 0 auto; display: flex; gap: 10px; align-items: flex-end; }
+  textarea {
+    flex: 1; resize: none; background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+    border-radius: 10px; padding: 10px 12px; font: inherit; max-height: 160px; min-height: 44px;
+  }
+  textarea:focus { outline: none; border-color: var(--accent); }
+  button.send {
+    background: var(--accent); color: #0d1117; border: none; border-radius: 10px;
+    padding: 0 18px; height: 44px; font: inherit; font-weight: 600; cursor: pointer;
+  }
+  button.send:disabled { opacity: .5; cursor: default; }
+  .hint { text-align: center; color: var(--muted); font-size: 11px; margin-top: 8px; }
+</style>
+</head>
+<body>
+  <header>
+    <span class="dot" id="dot" title="engine status"></span>
+    <span class="title">S-MoE <small id="model">webchat</small></span>
+    <span class="spacer"></span>
+    <label>temp <input id="temp" type="number" step="0.1" min="0" value="0.6"></label>
+    <label>max <input id="max" type="number" step="16" min="1" value="512"></label>
+    <button class="ghost" id="reset">Reset</button>
+  </header>
+
+  <div id="log"><div class="wrap" id="wrap"></div></div>
+
+  <footer>
+    <div class="composer">
+      <textarea id="input" placeholder="Ask something…  (Enter to send · Shift+Enter for newline)" rows="1"></textarea>
+      <button class="send" id="send">Send</button>
+    </div>
+    <div class="hint">One serialized context · full history resent each turn for warm KV reuse · ~1 word/sec, NVMe-bound</div>
+  </footer>
+
+<script>
+const messages = [];                    // the running OpenAI-style history
+const wrap = document.getElementById("wrap");
+const input = document.getElementById("input");
+const sendBtn = document.getElementById("send");
+let busy = false;
+
+// This page must be SERVED by serve_openai.py, not opened from disk: its
+// fetches are relative, so on file:// they resolve to file:///v1/... and the
+// browser blocks them. Fail loud and clear instead of silently.
+if (location.protocol === "file:") {
+  document.getElementById("dot").classList.add("down");
+  wrap.innerHTML =
+    '<div class="msg assistant"><div class="role">webchat</div><div class="body">'
+    + "This console is open from a file:// URL, so it can’t reach the engine "
+    + "(the browser blocks file:///v1/... requests).\n\nRun the server and open it "
+    + "through that origin instead:\n\n    .venv/bin/python serve_openai.py --port 8000\n\n"
+    + "then visit  http://127.0.0.1:8000/  in your browser."
+    + "</div></div>";
+  input.disabled = true; sendBtn.disabled = true;
+  throw new Error("webchat.html must be served over http://, not opened from file://");
+}
+
+// ── model id + liveness ────────────────────────────────────────────
+fetch("/v1/models").then(r => r.json()).then(d => {
+  const id = d?.data?.[0]?.id; if (id) document.getElementById("model").textContent = id;
+}).catch(() => {});
+async function poll() {
+  try { const h = await (await fetch("/health")).json();
+        document.getElementById("dot").classList.toggle("down", h.engine !== "up"); }
+  catch { document.getElementById("dot").classList.add("down"); }
+}
+poll(); setInterval(poll, 5000);
+
+// ── rendering ──────────────────────────────────────────────────────
+function addMsg(role, text) {
+  const el = document.createElement("div");
+  el.className = "msg " + role;
+  el.innerHTML = `<div class="role">${role}</div><div class="body"></div>`;
+  el.querySelector(".body").textContent = text;
+  wrap.appendChild(el);
+  document.getElementById("log").scrollTop = 1e9;
+  return el;
+}
+function setFin(el, reason) {
+  const f = document.createElement("div");
+  f.className = "fin" + (reason === "length" ? " length" : "");
+  f.textContent = reason === "length"
+    ? "◦ finish_reason: length — hit max_tokens (send again to continue)"
+    : "◦ finish_reason: stop";
+  el.appendChild(f);
+}
+
+// ── send / stream ──────────────────────────────────────────────────
+async function send() {
+  const text = input.value.trim();
+  if (!text || busy) return;
+  busy = true; sendBtn.disabled = true; input.value = ""; input.style.height = "auto";
+
+  messages.push({ role: "user", content: text });
+  addMsg("user", text);
+
+  const el = addMsg("assistant", "");
+  const body = el.querySelector(".body");
+  body.classList.add("cursor");
+  let acc = "";
+
+  try {
+    const resp = await fetch("/v1/chat/completions", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: document.getElementById("model").textContent,
+        messages, stream: true,
+        temperature: parseFloat(document.getElementById("temp").value),
+        max_tokens: parseInt(document.getElementById("max").value, 10),
+      }),
+    });
+
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder();
+    let sse = "", finish = "stop";
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      sse += dec.decode(value, { stream: true });
+      const lines = sse.split("\n"); sse = lines.pop();       // keep partial line
+      for (const line of lines) {
+        if (!line.startsWith("data:")) continue;
+        const data = line.slice(5).trim();
+        if (data === "[DONE]") continue;
+        let obj; try { obj = JSON.parse(data); } catch { continue; }
+        const choice = obj.choices?.[0] || {};
+        if (choice.delta?.content) { acc += choice.delta.content; body.textContent = acc;
+                                     document.getElementById("log").scrollTop = 1e9; }
+        if (choice.finish_reason) finish = choice.finish_reason;
+      }
+    }
+    body.classList.remove("cursor");
+    messages.push({ role: "assistant", content: acc });
+    setFin(el, finish);
+  } catch (e) {
+    body.classList.remove("cursor");
+    body.textContent = acc + `\n[error: ${e}]`;
+    messages.pop();   // drop the failed user turn so it can't poison context
+  } finally {
+    busy = false; sendBtn.disabled = false; input.focus();
+  }
+}
+
+// ── input UX ───────────────────────────────────────────────────────
+input.addEventListener("keydown", e => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+});
+input.addEventListener("input", () => {
+  input.style.height = "auto"; input.style.height = Math.min(input.scrollHeight, 160) + "px";
+});
+sendBtn.addEventListener("click", send);
+document.getElementById("reset").addEventListener("click", () => {
+  messages.length = 0; wrap.innerHTML = ""; input.focus();
+});
+input.focus();
+</script>
+</body>
+</html>
