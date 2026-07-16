@@ -288,6 +288,8 @@ def _sysmem(pid=None):
 class Handler(BaseHTTPRequestHandler):
     engine = None          # set in main()
     model_id = "s-moe"
+    lineage = ""           # the tokenizer checkpoint the vault was shattered from — the real identity
+    quant = ""             # quantization ("Q4"/"Q2"), read from the vault filename stem
     default_max = 256
     max_cap = 4096
 
@@ -354,7 +356,12 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path in ("/v1/models", "/models"):
             self._json(200, {"object": "list", "data": [
                 {"id": self.model_id, "object": "model",
-                 "created": 0, "owned_by": "s-moe"}]})
+                 "created": 0, "owned_by": "s-moe",
+                 # Non-standard fields (OpenAI clients ignore extras): the true
+                 # lineage — the tokenizer checkpoint the vault was shattered
+                 # from — plus its quantization, so the console can name WHO
+                 # you're actually talking to, not just the API label.
+                 "lineage": self.lineage, "quant": self.quant}]})
         else:
             self._json(404, {"error": {"message": "not found", "type": "invalid_request_error"}})
 
@@ -468,6 +475,12 @@ def main():
 
     Handler.engine = engine
     Handler.model_id = args.model_id
+    # The true identity shown in the console: lineage from the tokenizer
+    # checkpoint (authoritative — the vault was shattered from it), quant from
+    # the vault filename stem (…-q4.smoe / …-q2.smoe — the tokenizer name lacks it).
+    Handler.lineage = args.tokenizer
+    _qm = re.search(r"q(\d+)", os.path.basename(args.vault).lower())
+    Handler.quant = f"Q{_qm.group(1)}" if _qm else ""
     Handler.default_max = args.max_tokens
 
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)

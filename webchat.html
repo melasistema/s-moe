@@ -18,99 +18,114 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>S-MoE · webchat</title>
 <style>
-  :root {
-    --bg: #0d1117; --panel: #161b22; --border: #30363d;
-    --fg: #e6edf3; --muted: #8b949e; --accent: #58a6ff;
-    --user: #1f6feb22; --assist: #161b22; --warn: #d29922;
-  }
-  * { box-sizing: border-box; }
-  html, body { height: 100%; margin: 0; }
-  body {
-    background: var(--bg); color: var(--fg); display: flex; flex-direction: column;
-    font: 15px/1.55 -apple-system, "SF Pro Text", Segoe UI, Roboto, sans-serif;
-  }
-  header {
-    display: flex; align-items: center; gap: 12px; padding: 10px 16px;
-    border-bottom: 1px solid var(--border); background: var(--panel);
-  }
-  header .title { font-weight: 600; letter-spacing: .2px; }
-  header .title small { color: var(--muted); font-weight: 400; margin-left: 6px; }
-  header .dot { width: 9px; height: 9px; border-radius: 50%; background: #3fb950; }
-  header .dot.down { background: #f85149; }
-  header .spacer { flex: 1; }
-  header label { color: var(--muted); font-size: 12px; display: inline-flex; align-items: center; gap: 4px; }
-  header input {
-    width: 58px; background: var(--bg); color: var(--fg);
-    border: 1px solid var(--border); border-radius: 6px; padding: 3px 6px; font: inherit; font-size: 12px;
-  }
-  header button.ghost {
-    background: transparent; color: var(--muted); border: 1px solid var(--border);
-    border-radius: 6px; padding: 4px 10px; cursor: pointer; font: inherit; font-size: 12px;
-  }
-  header button.ghost:hover { color: var(--fg); border-color: var(--muted); }
-  /* Context-budget meter: how much of the engine's fixed KV window this
-     conversation is holding. It fills, turns amber near the wall, red once
-     the ring starts sliding (see CTX_WINDOW in the script). */
-  header .ctx { display: inline-flex; align-items: center; gap: 7px; color: var(--muted); font-size: 12px; }
-  header .ctx-bar { width: 62px; height: 6px; border-radius: 3px; background: var(--border); overflow: hidden; }
-  header .ctx-bar i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .3s ease, background .3s ease; }
-  header .ctx.warn .ctx-bar i { background: var(--warn); }
-  header .ctx.warn .ctx-num { color: var(--warn); }
-  header .ctx.full .ctx-bar i { background: #f85149; }
-  header .ctx.full .ctx-num { color: #f85149; }
-  header .ctx-num { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-variant-numeric: tabular-nums; }
-  /* System-RAM meter: installed / used / free headroom for the engine. Colour
-     follows macOS memory PRESSURE, not raw %, since a 48 GB box running a 235B
-     stream sits legitimately high (see pollRam in the script). */
-  header .ram { display: inline-flex; align-items: center; gap: 7px; color: var(--muted); font-size: 12px; }
-  header .ram-bar { width: 62px; height: 6px; border-radius: 3px; background: var(--border); overflow: hidden; }
-  header .ram-bar i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .3s ease, background .3s ease; }
-  header .ram.warn .ram-bar i { background: var(--warn); }
-  header .ram.warn .ram-num { color: var(--warn); }
-  header .ram.crit .ram-bar i { background: #f85149; }
-  header .ram.crit .ram-num { color: #f85149; }
-  header .ram-num, header .ram-free { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-variant-numeric: tabular-nums; }
-  header .ram-free { color: var(--muted); }
-  /* Thin rule that groups the header into system meter | context meter | inputs. */
-  header .vsep { width: 1px; height: 20px; background: var(--border); }
-  #log { flex: 1; overflow-y: auto; padding: 20px 16px; }
-  .wrap { max-width: 760px; margin: 0 auto; }
-  .msg { padding: 12px 14px; border-radius: 10px; margin: 10px 0; border: 1px solid var(--border); white-space: pre-wrap; word-wrap: break-word; }
-  .msg.user { background: var(--user); }
-  .msg.assistant { background: var(--assist); }
-  .msg .role { font-size: 11px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); margin-bottom: 6px; }
-  .msg .fin { font-size: 11px; color: var(--muted); margin-top: 8px; }
-  .msg .fin.length { color: var(--warn); }
-  .msg .stats {
-    font-size: 11px; color: var(--muted); margin-top: 8px;
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-variant-numeric: tabular-nums;
-  }
-  .msg .stats .hot { color: var(--accent); }
-  /* Inline system notices — the soft warning at the context wall. */
-  .notice { max-width: 760px; margin: 12px auto; text-align: center; font-size: 12px; color: var(--warn); line-height: 1.5; }
-  .notice.full { color: #f85149; }
-  .cursor::after { content: "▍"; color: var(--accent); animation: blink 1s steps(2) infinite; }
-  @keyframes blink { 50% { opacity: 0; } }
-  footer { border-top: 1px solid var(--border); background: var(--panel); padding: 12px 16px; }
-  .composer { max-width: 760px; margin: 0 auto; display: flex; gap: 10px; align-items: flex-end; }
-  textarea {
-    flex: 1; resize: none; background: var(--bg); color: var(--fg); border: 1px solid var(--border);
-    border-radius: 10px; padding: 10px 12px; font: inherit; max-height: 160px; min-height: 44px;
-  }
-  textarea:focus { outline: none; border-color: var(--accent); }
-  button.send {
-    background: var(--accent); color: #0d1117; border: none; border-radius: 10px;
-    padding: 0 18px; height: 44px; font: inherit; font-weight: 600; cursor: pointer;
-  }
-  button.send:disabled { opacity: .5; cursor: default; }
-  .hint { text-align: center; color: var(--muted); font-size: 11px; margin-top: 8px; }
-</style>
+    :root {
+      /* Harmonized Deep Eggplant Base */
+      --bg: #0b0914;
+      --panel: #141122;
+      --border: #2d2544;
+      --fg: #f5f0ff;
+      --muted: #8f87a3;
+
+      /* Integrated Purple Palette */
+      --accent: #c8abfa;       /* Color 01: Soft Lavender */
+      --brand-mid: #a879e6;    /* Color 02: Focus & Hover */
+      --brand-solid: #8e5cd9;  /* Color 03: Primary Button */
+
+      /* Semantic / Chat Specific */
+      --user: rgba(142, 92, 217, 0.12); /* Color 03 with soft opacity */
+      --assist: #141122;                /* Matches panel background */
+      --warn: #e3a018;                  /* Warm gold (complementary to purple) */
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; }
+    body {
+      background: var(--bg); color: var(--fg); display: flex; flex-direction: column;
+      font: 15px/1.55 -apple-system, "SF Pro Text", Segoe UI, Roboto, sans-serif;
+    }
+    header {
+      display: flex; align-items: center; gap: 12px; padding: 10px 16px;
+      border-bottom: 1px solid var(--border); background: var(--panel);
+    }
+    header .title { font-weight: 600; letter-spacing: .2px; }
+    header .title small { color: var(--muted); font-weight: 400; margin-left: 6px; }
+    header .dot { width: 9px; height: 9px; border-radius: 50%; background: #3fb950; }
+    header .dot.down { background: #f85149; }
+    header .spacer { flex: 1; }
+    header label { color: var(--muted); font-size: 12px; display: inline-flex; align-items: center; gap: 4px; }
+    header input {
+      width: 58px; background: var(--bg); color: var(--fg);
+      border: 1px solid var(--border); border-radius: 6px; padding: 3px 6px; font: inherit; font-size: 12px;
+      transition: border-color 0.15s ease;
+    }
+    header input:focus { outline: none; border-color: var(--brand-mid); }
+    header button.ghost {
+      background: transparent; color: var(--muted); border: 1px solid var(--border);
+      border-radius: 6px; padding: 4px 10px; cursor: pointer; font: inherit; font-size: 12px;
+      transition: color 0.15s ease, border-color 0.15s ease;
+    }
+    header button.ghost:hover { color: var(--fg); border-color: var(--brand-mid); }
+    /* Context-budget meter */
+    header .ctx { display: inline-flex; align-items: center; gap: 7px; color: var(--muted); font-size: 12px; }
+    header .ctx-bar { width: 62px; height: 6px; border-radius: 3px; background: var(--border); overflow: hidden; }
+    header .ctx-bar i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .3s ease, background .3s ease; }
+    header .ctx.warn .ctx-bar i { background: var(--warn); }
+    header .ctx.warn .ctx-num { color: var(--warn); }
+    header .ctx.full .ctx-bar i { background: #f85149; }
+    header .ctx.full .ctx-num { color: #f85149; }
+    header .ctx-num { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-variant-numeric: tabular-nums; }
+    /* System-RAM meter */
+    header .ram { display: inline-flex; align-items: center; gap: 7px; color: var(--muted); font-size: 12px; }
+    header .ram-bar { width: 62px; height: 6px; border-radius: 3px; background: var(--border); overflow: hidden; }
+    header .ram-bar i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .3s ease, background .3s ease; }
+    header .ram.warn .ram-bar i { background: var(--warn); }
+    header .ram.warn .ram-num { color: var(--warn); }
+    header .ram.crit .ram-bar i { background: #f85149; }
+    header .ram.crit .ram-num { color: #f85149; }
+    header .ram-num, header .ram-free { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-variant-numeric: tabular-nums; }
+    header .ram-free { color: var(--muted); }
+    /* Thin rule that groups the header */
+    header .vsep { width: 1px; height: 20px; background: var(--border); }
+    #log { flex: 1; overflow-y: auto; padding: 20px 16px; }
+    .wrap { max-width: 760px; margin: 0 auto; }
+    .msg { padding: 12px 14px; border-radius: 10px; margin: 10px 0; border: 1px solid var(--border); white-space: pre-wrap; word-wrap: break-word; }
+    .msg.user { background: var(--user); border-color: rgba(142, 92, 217, 0.25); }
+    .msg.assistant { background: var(--assist); }
+    .msg .role { font-size: 11px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); margin-bottom: 6px; }
+    .msg .fin { font-size: 11px; color: var(--muted); margin-top: 8px; }
+    .msg .fin.length { color: var(--warn); }
+    .msg .stats {
+      font-size: 11px; color: var(--muted); margin-top: 8px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-variant-numeric: tabular-nums;
+    }
+    .msg .stats .hot { color: var(--accent); }
+    /* Inline system notices */
+    .notice { max-width: 760px; margin: 12px auto; text-align: center; font-size: 12px; color: var(--warn); line-height: 1.5; }
+    .notice.full { color: #f85149; }
+    .cursor::after { content: "▍"; color: var(--accent); animation: blink 1s steps(2) infinite; }
+    @keyframes blink { 50% { opacity: 0; } }
+    footer { border-top: 1px solid var(--border); background: var(--panel); padding: 12px 16px; }
+    .composer { max-width: 760px; margin: 0 auto; display: flex; gap: 10px; align-items: flex-end; }
+    textarea {
+      flex: 1; resize: none; background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+      border-radius: 10px; padding: 10px 12px; font: inherit; max-height: 160px; min-height: 44px;
+      transition: border-color 0.15s ease;
+    }
+    textarea:focus { outline: none; border-color: var(--brand-mid); }
+    button.send {
+      background: var(--brand-solid); color: #ffffff; border: none; border-radius: 10px;
+      padding: 0 18px; height: 44px; font: inherit; font-weight: 600; cursor: pointer;
+      transition: background 0.15s ease, opacity 0.15s ease;
+    }
+    button.send:hover:not(:disabled) { background: var(--brand-mid); }
+    button.send:disabled { opacity: .4; cursor: default; }
+    .hint { text-align: center; color: var(--muted); font-size: 11px; margin-top: 8px; }
+  </style>
 </head>
 <body>
   <header>
     <span class="dot" id="dot" title="engine status"></span>
-    <span class="title">S-MoE</span>
+    <span class="title">S-MoE<small id="model" title="the model this engine is serving">…</small></span>
     <span class="spacer"></span>
     <span class="ram" id="ram" title="Mac physical memory — used / installed, and free headroom for S-MoE" hidden>
       <span class="ram-bar"><i id="ramfill"></i></span>
@@ -161,10 +176,25 @@ if (location.protocol === "file:") {
   throw new Error("webchat.html must be served over http://, not opened from file://");
 }
 
-// ── model id + liveness ────────────────────────────────────────────
+// ── model id + identity + liveness ─────────────────────────────────
+// /v1/models carries the API id (what we send back in requests) plus two
+// non-standard fields, `lineage` (the tokenizer checkpoint the vault was
+// shattered from) and `quant` — the honest answer to "who am I talking to?".
+// We show the lineage's short name + quant in the title; the full checkpoint
+// path lives in the tooltip. Falls back to the bare id on older servers.
+let modelId = "s-moe";                       // the value POSTed as `model`
+const modelTag = document.getElementById("model");
 fetch("/v1/models").then(r => r.json()).then(d => {
-  const id = d?.data?.[0]?.id; if (id) document.getElementById("model").textContent = id;
-}).catch(() => {});
+  const m = d?.data?.[0]; if (!m) return;
+  if (m.id) modelId = m.id;
+  if (m.lineage) {
+    const shortName = m.lineage.split("/").pop();      // "Qwen/Qwen3-…" → "Qwen3-…"
+    modelTag.textContent = shortName + (m.quant ? " · " + m.quant : "");
+    modelTag.title = m.lineage + (m.quant ? " · " + m.quant + " (shattered vault)" : "");
+  } else {
+    modelTag.textContent = m.id || "s-moe";            // pre-lineage server
+  }
+}).catch(() => { modelTag.textContent = ""; });
 async function poll() {
   try { const h = await (await fetch("/health")).json();
         document.getElementById("dot").classList.toggle("down", h.engine !== "up"); }
@@ -330,7 +360,7 @@ async function send() {
     const resp = await fetch("/v1/chat/completions", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        model: document.getElementById("model").textContent,
+        model: modelId,
         messages, stream: true,
         temperature: parseFloat(document.getElementById("temp").value),
         max_tokens: parseInt(document.getElementById("max").value, 10),
