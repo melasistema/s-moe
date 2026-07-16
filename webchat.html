@@ -48,6 +48,17 @@
     border-radius: 6px; padding: 4px 10px; cursor: pointer; font: inherit; font-size: 12px;
   }
   header button.ghost:hover { color: var(--fg); border-color: var(--muted); }
+  /* Context-budget meter: how much of the engine's fixed KV window this
+     conversation is holding. It fills, turns amber near the wall, red once
+     the ring starts sliding (see CTX_WINDOW in the script). */
+  header .ctx { display: inline-flex; align-items: center; gap: 7px; color: var(--muted); font-size: 12px; }
+  header .ctx-bar { width: 62px; height: 6px; border-radius: 3px; background: var(--border); overflow: hidden; }
+  header .ctx-bar i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .3s ease, background .3s ease; }
+  header .ctx.warn .ctx-bar i { background: var(--warn); }
+  header .ctx.warn .ctx-num { color: var(--warn); }
+  header .ctx.full .ctx-bar i { background: #f85149; }
+  header .ctx.full .ctx-num { color: #f85149; }
+  header .ctx-num { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-variant-numeric: tabular-nums; }
   #log { flex: 1; overflow-y: auto; padding: 20px 16px; }
   .wrap { max-width: 760px; margin: 0 auto; }
   .msg { padding: 12px 14px; border-radius: 10px; margin: 10px 0; border: 1px solid var(--border); white-space: pre-wrap; word-wrap: break-word; }
@@ -62,6 +73,9 @@
     font-variant-numeric: tabular-nums;
   }
   .msg .stats .hot { color: var(--accent); }
+  /* Inline system notices — the soft warning at the context wall. */
+  .notice { max-width: 760px; margin: 12px auto; text-align: center; font-size: 12px; color: var(--warn); line-height: 1.5; }
+  .notice.full { color: #f85149; }
   .cursor::after { content: "▍"; color: var(--accent); animation: blink 1s steps(2) infinite; }
   @keyframes blink { 50% { opacity: 0; } }
   footer { border-top: 1px solid var(--border); background: var(--panel); padding: 12px 16px; }
@@ -84,6 +98,10 @@
     <span class="dot" id="dot" title="engine status"></span>
     <span class="title">S-MoE <small id="model">webchat</small></span>
     <span class="spacer"></span>
+    <span class="ctx" id="ctx" title="conversation tokens held in the engine's KV window (prompt + replies, cumulative)">
+      <span class="ctx-bar"><i id="ctxfill"></i></span>
+      <span class="ctx-num" id="ctxnum">0 / 4,096</span>
+    </span>
     <label>temp <input id="temp" type="number" step="0.1" min="0" value="0.6"></label>
     <label>max <input id="max" type="number" step="16" min="1" value="512"></label>
     <button class="ghost" id="reset">Reset</button>
@@ -132,6 +150,56 @@ async function poll() {
   catch { document.getElementById("dot").classList.add("down"); }
 }
 poll(); setInterval(poll, 5000);
+
+// ── context-budget meter ───────────────────────────────────────────
+// The engine holds ONE fixed KV window (ATTN_CTX in src/main.cpp — a 4096-slot
+// ring). The whole conversation lives in it: chat-template overhead + every
+// user turn + every reply, cumulatively. Past the wall the ring silently
+// slides, dropping the OLDEST tokens — the model forgets the start with no
+// error. This meter makes that budget visible, and warns once at the wall.
+// Keep CTX_WINDOW in sync with ATTN_CTX if that constant ever changes.
+const CTX_WINDOW = 4096;
+const CTX_WARN = 0.85;                       // fraction that trips the amber warning
+const ctxEl = document.getElementById("ctx");
+const ctxFill = document.getElementById("ctxfill");
+const ctxNum = document.getElementById("ctxnum");
+let ctxWarned = "";                          // "" | "warn" | "full" — highest notice shown
+
+const ctxState = used =>
+  used >= CTX_WINDOW ? "full" : used >= CTX_WINDOW * CTX_WARN ? "warn" : "ok";
+
+function renderCtx(used) {
+  // The current turn's prompt_tokens is the full resent history, so it IS the
+  // authoritative running total — no cross-turn accumulation needed.
+  ctxFill.style.width = (Math.min(used / CTX_WINDOW, 1) * 100).toFixed(1) + "%";
+  ctxNum.textContent = used.toLocaleString() + " / " + CTX_WINDOW.toLocaleString();
+  const st = ctxState(used);
+  ctxEl.classList.toggle("warn", st === "warn");
+  ctxEl.classList.toggle("full", st === "full");
+}
+
+function noteCtx(used) {
+  // Fire once per escalation (ok→warn→full), never per turn — a long
+  // conversation is told exactly once that it's nearing, then past, the wall.
+  const st = ctxState(used);
+  if (st === "ok" || st === ctxWarned || (st === "warn" && ctxWarned === "full")) return;
+  ctxWarned = st;
+  if (st === "warn")
+    addNotice("◦ context is " + Math.round(used / CTX_WINDOW * 100) + "% of the "
+      + CTX_WINDOW.toLocaleString() + "-token window — a few more turns and the model "
+      + "starts forgetting the beginning of this conversation. Reset to clear it.", "");
+  else
+    addNotice("● context window full — the engine is now sliding: the earliest turns "
+      + "are dropping out of the model's memory. Reset for a clean slate.", "full");
+}
+
+function addNotice(text, kind) {
+  const n = document.createElement("div");
+  n.className = "notice" + (kind ? " " + kind : "");
+  n.textContent = text;
+  wrap.appendChild(n);
+  document.getElementById("log").scrollTop = 1e9;
+}
 
 // ── rendering ──────────────────────────────────────────────────────
 function addMsg(role, text) {
@@ -184,6 +252,8 @@ async function send() {
     // Exact prompt size (full templated history, not just the typed text) —
     // the number the TTFT benchmarks are quoted against (e.g. 45-tok prompt).
     const p = usage && usage.prompt_tokens != null ? `${usage.prompt_tokens} tok prompt` : null;
+    // Live context occupancy = this turn's prompt + tokens generated so far.
+    if (usage && usage.prompt_tokens != null) renderCtx(usage.prompt_tokens + ntok);
     if (!tFirst) {
       stats.innerHTML = (p ? `prefilling ${p}` : "waiting for first token")
         + ` · <span class="hot">${secs(now - t0)}</span>`
@@ -224,7 +294,12 @@ async function send() {
         let obj; try { obj = JSON.parse(data); } catch { continue; }
         // usage arrives twice: prompt_tokens alone on an early chunk (right
         // after tokenization, before prefill), full counts on the final one.
-        if (obj.usage) usage = Object.assign(usage || {}, obj.usage);
+        if (obj.usage) {
+          usage = Object.assign(usage || {}, obj.usage);
+          // The prompt is the whole conversation resent — check the wall now,
+          // before this reply even adds to it (catches an already-full prompt).
+          if (usage.prompt_tokens != null) { renderCtx(usage.prompt_tokens + ntok); noteCtx(usage.prompt_tokens); }
+        }
         const choice = obj.choices?.[0] || {};
         if (choice.delta?.content) { if (!tFirst) tFirst = performance.now();
                                      ntok++;
@@ -246,6 +321,12 @@ async function send() {
         + `ttft ${secs(tFirst - t0)} · ${toks} tok` + (r ? ` · ${r} tok/s` : "")
         + ` · ${secs(tEnd - t0)} total`
       : `no tokens · ${secs(tEnd - t0)} total`;
+
+    // Freeze the meter on the exact turn total (prompt + real completion
+    // count), and fire the wall warning once if this turn crossed it.
+    const finalUsed = (usage?.prompt_tokens ?? 0) + (usage?.completion_tokens ?? ntok);
+    renderCtx(finalUsed);
+    noteCtx(finalUsed);
 
     messages.push({ role: "assistant", content: acc });
     setFin(el, finish);
@@ -270,6 +351,7 @@ input.addEventListener("input", () => {
 sendBtn.addEventListener("click", send);
 document.getElementById("reset").addEventListener("click", () => {
   messages.length = 0; wrap.innerHTML = ""; input.focus();
+  ctxWarned = ""; renderCtx(0);   // fresh conversation → empty context window
 });
 input.focus();
 </script>
