@@ -9,6 +9,7 @@ LibreChat, editor plugins, the `openai` SDK, curl) can talk to S-MoE.
 Endpoints:
     GET  /                     → webchat.html, a built-in same-origin test UI
     GET  /health               → {"status":"ok", "engine":"up|down"}
+    GET  /sysmem               → macOS physical-memory snapshot for the console
     GET  /v1/models            → the single served model
     POST /v1/chat/completions  → streaming (SSE) or non-streaming completion
 
@@ -36,6 +37,7 @@ No new dependencies: Python stdlib + transformers (already used by chat.py).
 import argparse
 import json
 import os
+import re
 import subprocess
 import threading
 import time
@@ -227,6 +229,62 @@ def _sampling_from(body):
     return out
 
 
+_MEMSIZE = None    # hw.memsize never changes at runtime — fetch it once.
+
+
+def _memsize():
+    global _MEMSIZE
+    if _MEMSIZE is None:
+        _MEMSIZE = int(subprocess.check_output(["sysctl", "-n", "hw.memsize"]))
+    return _MEMSIZE
+
+
+def _sysmem(pid=None):
+    """macOS physical-memory snapshot for the dev console, all in bytes:
+
+        total       installed RAM (hw.memsize)
+        used        Activity-Monitor sense: app (anon−purgeable) + wired + compressed
+        available   total − used, the headroom S-MoE's expert-streaming ring can grow into
+        wired,
+        compressed  the two non-reclaimable components of `used`
+        pressure    macOS VM pressure level ("normal"|"warning"|"critical"|None)
+        rss         the engine process's resident set, when a pid is given
+
+    Best-effort and macOS-specific: any failure returns None so the client
+    simply hides the meter (e.g. on Linux)."""
+    try:
+        total = _memsize()
+        vm = subprocess.check_output(["vm_stat"]).decode()
+    except Exception:
+        return None
+    m = re.search(r"page size of (\d+) bytes", vm)
+    ps = int(m.group(1)) if m else 4096
+
+    def pages(label):
+        mm = re.search(re.escape(label) + r":\s+(\d+)", vm)
+        return int(mm.group(1)) if mm else 0
+
+    wired = pages("Pages wired down") * ps
+    compressed = pages("Pages occupied by compressor") * ps
+    app = max(pages("Anonymous pages") - pages("Pages purgeable"), 0) * ps
+    used = min(app + wired + compressed, total)
+    out = {"total": total, "used": used, "available": total - used,
+           "wired": wired, "compressed": compressed}
+    try:
+        lvl = int(subprocess.check_output(
+            ["sysctl", "-n", "kern.memorystatus_vm_pressure_level"]))
+        out["pressure"] = {1: "normal", 2: "warning", 4: "critical"}.get(lvl)
+    except Exception:
+        out["pressure"] = None
+    if pid:
+        try:  # ps reports RSS in KiB
+            out["rss"] = int(subprocess.check_output(
+                ["ps", "-o", "rss=", "-p", str(pid)]).strip()) * 1024
+        except Exception:
+            out["rss"] = None
+    return out
+
+
 class Handler(BaseHTTPRequestHandler):
     engine = None          # set in main()
     model_id = "s-moe"
@@ -287,6 +345,12 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/health":
             self._json(200, {"status": "ok",
                              "engine": "up" if self.engine.alive() else "down"})
+        elif self.path == "/sysmem":
+            # System RAM for the console's memory meter. Pass the engine's live
+            # pid (when up) so the snapshot can include S-MoE's own resident set.
+            proc = getattr(self.engine, "proc", None)
+            pid = proc.pid if proc and self.engine.alive() else None
+            self._json(200, _sysmem(pid) or {"error": "unavailable"})
         elif self.path in ("/v1/models", "/models"):
             self._json(200, {"object": "list", "data": [
                 {"id": self.model_id, "object": "model",

@@ -59,6 +59,20 @@
   header .ctx.full .ctx-bar i { background: #f85149; }
   header .ctx.full .ctx-num { color: #f85149; }
   header .ctx-num { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-variant-numeric: tabular-nums; }
+  /* System-RAM meter: installed / used / free headroom for the engine. Colour
+     follows macOS memory PRESSURE, not raw %, since a 48 GB box running a 235B
+     stream sits legitimately high (see pollRam in the script). */
+  header .ram { display: inline-flex; align-items: center; gap: 7px; color: var(--muted); font-size: 12px; }
+  header .ram-bar { width: 62px; height: 6px; border-radius: 3px; background: var(--border); overflow: hidden; }
+  header .ram-bar i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .3s ease, background .3s ease; }
+  header .ram.warn .ram-bar i { background: var(--warn); }
+  header .ram.warn .ram-num { color: var(--warn); }
+  header .ram.crit .ram-bar i { background: #f85149; }
+  header .ram.crit .ram-num { color: #f85149; }
+  header .ram-num, header .ram-free { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-variant-numeric: tabular-nums; }
+  header .ram-free { color: var(--muted); }
+  /* Thin rule that groups the header into system meter | context meter | inputs. */
+  header .vsep { width: 1px; height: 20px; background: var(--border); }
   #log { flex: 1; overflow-y: auto; padding: 20px 16px; }
   .wrap { max-width: 760px; margin: 0 auto; }
   .msg { padding: 12px 14px; border-radius: 10px; margin: 10px 0; border: 1px solid var(--border); white-space: pre-wrap; word-wrap: break-word; }
@@ -98,10 +112,17 @@
     <span class="dot" id="dot" title="engine status"></span>
     <span class="title">S-MoE <small id="model">webchat</small></span>
     <span class="spacer"></span>
+    <span class="ram" id="ram" title="Mac physical memory — used / installed, and free headroom for S-MoE" hidden>
+      <span class="ram-bar"><i id="ramfill"></i></span>
+      <span class="ram-num" id="ramnum">— / —</span>
+      <span class="ram-free" id="ramfree"></span>
+    </span>
+    <span class="vsep" id="ramsep" hidden></span>
     <span class="ctx" id="ctx" title="conversation tokens held in the engine's KV window (prompt + replies, cumulative)">
       <span class="ctx-bar"><i id="ctxfill"></i></span>
       <span class="ctx-num" id="ctxnum">0 / 4,096</span>
     </span>
+    <span class="vsep"></span>
     <label>temp <input id="temp" type="number" step="0.1" min="0" value="0.6"></label>
     <label>max <input id="max" type="number" step="16" min="1" value="512"></label>
     <button class="ghost" id="reset">Reset</button>
@@ -150,6 +171,46 @@ async function poll() {
   catch { document.getElementById("dot").classList.add("down"); }
 }
 poll(); setInterval(poll, 5000);
+
+// ── system RAM meter ───────────────────────────────────────────────
+// The browser can't read host memory, so serve_openai.py exposes it at
+// GET /sysmem (macOS vm_stat + hw.memsize). We surface installed total, used,
+// and free headroom — the space S-MoE's expert-streaming ring can grow into.
+// Colour follows macOS memory PRESSURE (the honest "fullness" signal — a 48 GB
+// box streaming a 235B model legitimately runs high), falling back to raw %
+// only when the pressure level is unavailable. Stays hidden off macOS.
+const ramEl = document.getElementById("ram");
+const ramFill = document.getElementById("ramfill");
+const ramNum = document.getElementById("ramnum");
+const ramFree = document.getElementById("ramfree");
+const GB = 1 << 30;
+const gb = b => (b / GB).toFixed(1);
+
+async function pollRam() {
+  let d; try { d = await (await fetch("/sysmem")).json(); } catch { return; }
+  if (!d || !d.total) return;                 // non-macOS / unavailable → stay hidden
+  ramEl.hidden = false;
+  document.getElementById("ramsep").hidden = false;   // reveal its divider too
+  ramFill.style.width = (Math.min(d.used / d.total, 1) * 100).toFixed(1) + "%";
+  ramNum.textContent = gb(d.used) + " / " + gb(d.total) + " GB";
+  ramFree.textContent = "· " + gb(d.available) + " free";
+  const frac = d.used / d.total;
+  const st = d.pressure === "critical" ? "crit"
+           : d.pressure === "warning" ? "warn"
+           : d.pressure ? "ok"                 // explicit "normal" — trust it over %
+           : frac >= 0.96 ? "crit"             // no pressure signal → conservative %
+           : frac >= 0.90 ? "warn" : "ok";
+  ramEl.classList.toggle("warn", st === "warn");
+  ramEl.classList.toggle("crit", st === "crit");
+  // Tooltip carries the full breakdown, including S-MoE's own resident set.
+  const parts = ["used " + gb(d.used) + " GB", "free " + gb(d.available) + " GB"];
+  if (d.rss) parts.push("S-MoE RSS " + gb(d.rss) + " GB");
+  if (d.wired) parts.push("wired " + gb(d.wired));
+  if (d.compressed) parts.push("compressed " + gb(d.compressed));
+  if (d.pressure) parts.push("pressure " + d.pressure);
+  ramEl.title = "Mac memory — " + parts.join(" · ");
+}
+pollRam(); setInterval(pollRam, 2000);
 
 // ── context-budget meter ───────────────────────────────────────────
 // The engine holds ONE fixed KV window (ATTN_CTX in src/main.cpp — a 4096-slot
