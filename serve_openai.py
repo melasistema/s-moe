@@ -99,7 +99,7 @@ class Engine:
                 out.append(f"{tag}={v:.6g}" if isinstance(v, float) else f"{tag}={v}")
         return (" " + " ".join(out)) if out else ""
 
-    def generate(self, messages, max_tokens, on_delta, sampling=None):
+    def generate(self, messages, max_tokens, on_delta, sampling=None, on_prompt=None):
         """Serialized generation. Applies the chat template, sends one GEN
         request (with per-request sampling overrides when given), and streams
         decoded text deltas to on_delta(str). Returns (full_text,
@@ -117,6 +117,8 @@ class Engine:
 
             token_ids = self.tok.apply_chat_template(messages, add_generation_prompt=True)
             prompt_n = len(token_ids)
+            if on_prompt:
+                on_prompt(prompt_n)
             csv = ",".join(map(str, token_ids))
             overrides = self._override_fields(sampling)
             request = f"GEN {max_tokens}{overrides} {csv}\n"
@@ -329,8 +331,24 @@ class Handler(BaseHTTPRequestHandler):
             def on_delta(text):
                 self._sse(chunk({"content": text}))
 
-            _, _, _, finish = self.engine.generate(messages, max_tokens, on_delta, sampling)
-            self._sse(chunk({}, finish=finish))
+            def on_prompt(n):
+                # The prompt's exact token count exists the moment the chat
+                # template is tokenized — before prefill even starts. Surface
+                # it right away (empty delta + partial usage) so clients can
+                # relate the prefill wait to the prompt size in real time.
+                early = chunk({})
+                early["usage"] = {"prompt_tokens": n}
+                self._sse(early)
+
+            _, p_n, c_n, finish = self.engine.generate(
+                messages, max_tokens, on_delta, sampling, on_prompt=on_prompt)
+            # Exact token counts ride on the final chunk (the include_usage
+            # convention): clients computing tok/s shouldn't have to infer
+            # them from delta counts, which under-count UTF-8 hold-backs.
+            final = chunk({}, finish=finish)
+            final["usage"] = {"prompt_tokens": p_n, "completion_tokens": c_n,
+                              "total_tokens": p_n + c_n}
+            self._sse(final)
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):

@@ -56,6 +56,12 @@
   .msg .role { font-size: 11px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); margin-bottom: 6px; }
   .msg .fin { font-size: 11px; color: var(--muted); margin-top: 8px; }
   .msg .fin.length { color: var(--warn); }
+  .msg .stats {
+    font-size: 11px; color: var(--muted); margin-top: 8px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-variant-numeric: tabular-nums;
+  }
+  .msg .stats .hot { color: var(--accent); }
   .cursor::after { content: "▍"; color: var(--accent); animation: blink 1s steps(2) infinite; }
   @keyframes blink { 50% { opacity: 0; } }
   footer { border-top: 1px solid var(--border); background: var(--panel); padding: 12px 16px; }
@@ -160,6 +166,35 @@ async function send() {
   body.classList.add("cursor");
   let acc = "";
 
+  // ── live turn monitor: wall-clock wait, TTFT, decode tok/s ─────────
+  // TTFT here is the full client-side wait (queue + prefill + first token),
+  // which is what a developer actually experiences at this console.
+  const stats = document.createElement("div");
+  stats.className = "stats";
+  stats.textContent = "…";
+  el.appendChild(stats);
+  const t0 = performance.now();
+  let tFirst = 0, ntok = 0, usage = null;
+  const secs = ms => (ms / 1000).toFixed(1) + "s";
+  // Decode rate = intervals between tokens (the first token ends prefill,
+  // it doesn't count as decode work) — matches the engine's own tok/s.
+  const rate = (n, ms) => n > 1 && ms > 0 ? ((n - 1) / (ms / 1000)).toFixed(2) : null;
+  const tick = setInterval(() => {
+    const now = performance.now();
+    // Exact prompt size (full templated history, not just the typed text) —
+    // the number the TTFT benchmarks are quoted against (e.g. 45-tok prompt).
+    const p = usage && usage.prompt_tokens != null ? `${usage.prompt_tokens} tok prompt` : null;
+    if (!tFirst) {
+      stats.innerHTML = (p ? `prefilling ${p}` : "waiting for first token")
+        + ` · <span class="hot">${secs(now - t0)}</span>`
+        + (messages.length <= 1 ? " · cold start" : " · warm turn");
+    } else {
+      const r = rate(ntok, now - tFirst);
+      stats.textContent = (p ? p + " · " : "") + `ttft ${secs(tFirst - t0)} · ${ntok} tok`
+        + (r ? ` · ${r} tok/s` : "");
+    }
+  }, 100);
+
   try {
     const resp = await fetch("/v1/chat/completions", {
       method: "POST", headers: { "Content-Type": "application/json" },
@@ -187,21 +222,40 @@ async function send() {
         // spinning after the completion is over.
         if (data === "[DONE]") { ended = true; break; }
         let obj; try { obj = JSON.parse(data); } catch { continue; }
+        // usage arrives twice: prompt_tokens alone on an early chunk (right
+        // after tokenization, before prefill), full counts on the final one.
+        if (obj.usage) usage = Object.assign(usage || {}, obj.usage);
         const choice = obj.choices?.[0] || {};
-        if (choice.delta?.content) { acc += choice.delta.content; body.textContent = acc;
+        if (choice.delta?.content) { if (!tFirst) tFirst = performance.now();
+                                     ntok++;
+                                     acc += choice.delta.content; body.textContent = acc;
                                      document.getElementById("log").scrollTop = 1e9; }
         if (choice.finish_reason) finish = choice.finish_reason;
       }
     }
     if (ended) { try { reader.cancel(); } catch {} }          // release the socket
     body.classList.remove("cursor");
+
+    // Freeze the monitor with exact numbers: the final chunk's usage counts
+    // real tokens (client-side delta counting misses UTF-8 hold-back merges).
+    const tEnd = performance.now();
+    const toks = usage?.completion_tokens ?? ntok;
+    const r = rate(toks, tEnd - tFirst);
+    stats.textContent = tFirst
+      ? (usage && usage.prompt_tokens != null ? `${usage.prompt_tokens} tok prompt · ` : "")
+        + `ttft ${secs(tFirst - t0)} · ${toks} tok` + (r ? ` · ${r} tok/s` : "")
+        + ` · ${secs(tEnd - t0)} total`
+      : `no tokens · ${secs(tEnd - t0)} total`;
+
     messages.push({ role: "assistant", content: acc });
     setFin(el, finish);
   } catch (e) {
     body.classList.remove("cursor");
+    stats.textContent = `failed after ${secs(performance.now() - t0)}`;
     body.textContent = acc + `\n[error: ${e}]`;
     messages.pop();   // drop the failed user turn so it can't poison context
   } finally {
+    clearInterval(tick);
     busy = false; sendBtn.disabled = false; input.focus();
   }
 }
