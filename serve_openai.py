@@ -247,7 +247,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
+        # The SSE body has no Content-Length and no chunked framing, so the
+        # ONLY way the client learns the stream ended is the connection
+        # closing. "keep-alive" here would leave readers blocked forever
+        # after [DONE].
+        self.send_header("Connection", "close")
+        self.close_connection = True
         self.end_headers()
 
     def _sse(self, obj):
