@@ -58,6 +58,12 @@
       transition: border-color 0.15s ease;
     }
     header input:focus { outline: none; border-color: var(--brand-mid); }
+    header select.model {
+      background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+      border-radius: 6px; padding: 3px 6px; font: inherit; font-size: 12px;
+      max-width: 260px; cursor: pointer; transition: border-color 0.15s ease;
+    }
+    header select.model:hover, header select.model:focus { outline: none; border-color: var(--brand-mid); }
     header button.ghost {
       background: transparent; color: var(--muted); border: 1px solid var(--border);
       border-radius: 6px; padding: 4px 10px; cursor: pointer; font: inherit; font-size: 12px;
@@ -125,7 +131,8 @@
 <body>
   <header>
     <span class="dot" id="dot" title="engine status"></span>
-    <span class="title">S-MoE<small id="model" title="the model this engine is serving">…</small></span>
+    <span class="title">S-MoE</span>
+    <select class="model" id="model" title="the vault this engine is serving — pick another to switch"></select>
     <span class="spacer"></span>
     <span class="ram" id="ram" title="Mac physical memory — used / installed, and free headroom for S-MoE" hidden>
       <span class="ram-bar"><i id="ramfill"></i></span>
@@ -150,7 +157,7 @@
       <textarea id="input" placeholder="Ask something…  (Enter to send · Shift+Enter for newline)" rows="1"></textarea>
       <button class="send" id="send">Send</button>
     </div>
-    <div class="hint">One serialized context · full history resent each turn for warm KV reuse · ~1 word/sec, NVMe-bound</div>
+    <div class="hint">One serialized context · full history resent each turn for warm KV reuse · speed scales with the loaded vault (NVMe-bound on the big ones)</div>
   </footer>
 
 <script>
@@ -176,25 +183,46 @@ if (location.protocol === "file:") {
   throw new Error("webchat.html must be served over http://, not opened from file://");
 }
 
-// ── model id + identity + liveness ─────────────────────────────────
-// /v1/models carries the API id (what we send back in requests) plus two
-// non-standard fields, `lineage` (the tokenizer checkpoint the vault was
-// shattered from) and `quant` — the honest answer to "who am I talking to?".
-// We show the lineage's short name + quant in the title; the full checkpoint
-// path lives in the tooltip. Falls back to the bare id on older servers.
+// ── model catalogue + switching + liveness ─────────────────────────
+// /v1/models lists every vault the server discovered (id = vault stem) with
+// non-standard fields: `active` (the one currently loaded), `quant` and
+// `model_type` (read from the vault's own header/arch block), and `lineage`
+// (the tokenizer checkpoint). The dropdown POSTs the selected id as `model`;
+// naming a non-active vault makes the server restart the engine on it —
+// the switch happens on the NEXT message, and its first prefill is a cold
+// boot of the other vault.
 let modelId = "s-moe";                       // the value POSTed as `model`
-const modelTag = document.getElementById("model");
-fetch("/v1/models").then(r => r.json()).then(d => {
-  const m = d?.data?.[0]; if (!m) return;
-  if (m.id) modelId = m.id;
-  if (m.lineage) {
-    const shortName = m.lineage.split("/").pop();      // "Qwen/Qwen3-…" → "Qwen3-…"
-    modelTag.textContent = shortName + (m.quant ? " · " + m.quant : "");
-    modelTag.title = m.lineage + (m.quant ? " · " + m.quant + " (shattered vault)" : "");
-  } else {
-    modelTag.textContent = m.id || "s-moe";            // pre-lineage server
+const modelSel = document.getElementById("model");
+
+async function loadModels() {
+  let cards;
+  try { cards = (await (await fetch("/v1/models")).json())?.data; } catch { return; }
+  if (!cards || !cards.length) return;
+  modelSel.innerHTML = "";
+  for (const m of cards) {
+    const o = document.createElement("option");
+    o.value = m.id;
+    o.textContent = m.id + (m.quant ? " · " + m.quant : "");
+    o.title = [m.lineage, m.model_type].filter(Boolean).join(" · ");
+    modelSel.appendChild(o);
   }
-}).catch(() => { modelTag.textContent = ""; });
+  // Follow the server's active model unless the user already picked another
+  // (their choice takes effect on the next send — don't fight it).
+  const active = cards.find(m => m.active) || cards[0];
+  const chosen = cards.some(m => m.id === modelId) ? modelId : active.id;
+  modelId = chosen;
+  modelSel.value = chosen;
+  modelSel.disabled = cards.length < 2;
+}
+loadModels();
+
+modelSel.addEventListener("change", () => {
+  if (modelSel.value === modelId) return;
+  modelId = modelSel.value;
+  addNotice("◦ model set to " + modelId + " — the next message shuts down the "
+    + "current engine and boots this vault, so its first reply pays a cold "
+    + "start. The conversation so far is re-prefilled into the new model.", "");
+});
 async function poll() {
   try { const h = await (await fetch("/health")).json();
         document.getElementById("dot").classList.toggle("down", h.engine !== "up"); }
@@ -429,6 +457,7 @@ async function send() {
   } finally {
     clearInterval(tick);
     busy = false; sendBtn.disabled = false; input.focus();
+    loadModels();   // a switch may have landed server-side — resync the active mark
   }
 }
 
