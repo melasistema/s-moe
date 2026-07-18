@@ -83,6 +83,23 @@ class Engine:
     def alive(self):
         return self.proc is not None and self.proc.poll() is None
 
+    def _drain(self):
+        """The engine is mid-response but its reader gave up (typically the
+        client hung up mid-SSE and the socket write raised out of on_delta).
+        The engine knows nothing of this and keeps streaming; without a drain
+        the NEXT request would read this response's leftover tokens as its
+        own. Consume until the request terminator so the pipe is back at a
+        request boundary. May take as long as the abandoned generation runs —
+        the engine is busy anyway, so queued requests would be waiting on it
+        regardless."""
+        try:
+            while self.alive():
+                line = self.proc.stdout.readline()
+                if not line or "<<DONE>>" in line or "<<ERR" in line:
+                    break
+        except Exception:
+            pass
+
     @staticmethod
     def _override_fields(sampling):
         """Map OpenAI-style sampling params onto GEN protocol key=value
@@ -135,6 +152,7 @@ class Engine:
             emitted = ""      # text already handed to on_delta
             buf = ""
             finish = "stop"   # engines without the fin= trailer → "stop"
+            at_boundary = False  # pipe consumed up to a <<DONE>>/<<ERR>> line
 
             def flush_final():
                 nonlocal emitted
@@ -144,50 +162,62 @@ class Engine:
                     emitted = text
                 return emitted
 
-            while True:
-                ch = self.proc.stdout.read(1)
-                if not ch:
-                    raise RuntimeError("engine_exit")
-                if not ch.isspace():
-                    buf += ch
-                    continue
-                if not buf:
-                    continue
-                if buf.startswith("fin="):
-                    finish = "length" if buf[4:] == "length" else "stop"
-                    buf = ""
-                    continue
-                if buf.startswith("<<"):
-                    if buf == "<<DONE>>":
-                        full = flush_final()
-                        return full, prompt_n, len(resp_tokens), finish
-                    # "<<ERR reason>>" splits on its internal space — pull the
-                    # rest of the line so the pipe is clean for the next request.
-                    err = (buf + " " + self.proc.stdout.readline().strip()).rstrip()
-                    if "bad_request" in err and overrides and not resp_tokens:
-                        # Engine binary predates the sampling extension: fall
-                        # back to the plain protocol and retry this request.
-                        print("[serve] WARNING: engine rejected sampling overrides "
-                              "(old GEN protocol) — retrying without them. Rebuild "
-                              "with `make all` for per-request sampling.", flush=True)
-                        overrides = ""
-                        buf = ""
-                        self.proc.stdin.write(f"GEN {max_tokens} {csv}\n")
-                        self.proc.stdin.flush()
+            try:
+                while True:
+                    ch = self.proc.stdout.read(1)
+                    if not ch:
+                        at_boundary = True  # engine gone — nothing left to drain
+                        raise RuntimeError("engine_exit")
+                    if not ch.isspace():
+                        buf += ch
                         continue
-                    raise RuntimeError(err)
-                clean = buf.replace("[", "").replace("]", "").strip()
-                buf = ""
-                if not clean.isdigit():
-                    continue
-                resp_tokens.append(int(clean))
-                text = self.tok.decode(resp_tokens, skip_special_tokens=True)
-                # Hold back while the tail is an incomplete UTF-8 sequence.
-                if text.endswith("�"):
-                    continue
-                if len(text) > len(emitted):
-                    on_delta(text[len(emitted):])
-                    emitted = text
+                    if not buf:
+                        continue
+                    if buf.startswith("fin="):
+                        finish = "length" if buf[4:] == "length" else "stop"
+                        buf = ""
+                        continue
+                    if buf.startswith("<<"):
+                        if buf == "<<DONE>>":
+                            at_boundary = True
+                            full = flush_final()
+                            return full, prompt_n, len(resp_tokens), finish
+                        # "<<ERR reason>>" splits on its internal space — pull the
+                        # rest of the line so the pipe is clean for the next request.
+                        err = (buf + " " + self.proc.stdout.readline().strip()).rstrip()
+                        at_boundary = True
+                        if "bad_request" in err and overrides and not resp_tokens:
+                            # Engine binary predates the sampling extension: fall
+                            # back to the plain protocol and retry this request.
+                            print("[serve] WARNING: engine rejected sampling overrides "
+                                  "(old GEN protocol) — retrying without them. Rebuild "
+                                  "with `make all` for per-request sampling.", flush=True)
+                            overrides = ""
+                            buf = ""
+                            at_boundary = False  # the retried GEN is in flight again
+                            self.proc.stdin.write(f"GEN {max_tokens} {csv}\n")
+                            self.proc.stdin.flush()
+                            continue
+                        raise RuntimeError(err)
+                    clean = buf.replace("[", "").replace("]", "").strip()
+                    buf = ""
+                    if not clean.isdigit():
+                        continue
+                    resp_tokens.append(int(clean))
+                    text = self.tok.decode(resp_tokens, skip_special_tokens=True)
+                    # Hold back while the tail is an incomplete UTF-8 sequence.
+                    if text.endswith("�"):
+                        continue
+                    if len(text) > len(emitted):
+                        on_delta(text[len(emitted):])
+                        emitted = text
+            finally:
+                # Any exit before the terminator (an on_delta socket write
+                # raising on client disconnect, a decode error) leaves the
+                # engine mid-stream; drain before the lock is released so the
+                # next request can't read this response's tokens.
+                if not at_boundary:
+                    self._drain()
 
 
 def _messages_from(body):
