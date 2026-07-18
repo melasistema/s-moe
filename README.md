@@ -1,6 +1,6 @@
 # S-MoE: Seismic Mixture of Experts Engine
 
-> **Rock, Paper, Silicon.** A rebellious attempt to shatter the "Monolithic Delusion" of Silicon Valley gatekeepers. S-MoE enables high-fidelity frontier LLM inference completely within the democratic boundaries of a standard 32/48 GB Apple Silicon MacBook — the 235B frontier's dense backbone alone weighs ~16 GB, the price of admission just to turn it on. On 16 GB machines, the same architecture rules over smaller fine-grained MoE models.
+> **Rock, Paper, Silicon.** A rebellious attempt to shatter the "Monolithic Delusion" of Silicon Valley gatekeepers. S-MoE enables high-fidelity frontier LLM inference completely within the democratic boundaries of a standard 32/48 GB Apple Silicon MacBook — the 235B frontier's dense backbone alone weighs ~16 GB, the price of admission just to turn it on. On 16 GB machines, the same architecture rules over smaller fine-grained MoE models. And it is **model-agnostic**: any fine-grained MoE, one shatter command, one self-describing vault — switchable at runtime.
 
 <div align="center">
 
@@ -38,6 +38,22 @@ The mountain rests cold on the SSD; only the handful of experts each word actual
 
 ---
 
+## One Engine, Any Fine-Grained MoE
+
+The 235B is the proof of force, not the whole story. S-MoE is **model-agnostic infrastructure**: point the shatter script at any compatible fine-grained MoE checkpoint and it produces a *self-describing* vault — the model's own mathematics (RoPE theta, routing top-k, attention geometry, lineage) travel inside the `.smoe` file's arch block, so the engine reads what it is given instead of assuming what it was built for. No recompilation, no per-model configuration.
+
+Every vault in `vault/` becomes a servable model, and they trade places live:
+
+| | Qwen3-235B-A22B | Qwen3-30B-A3B |
+|---|---|---|
+| **Role** | The frontier — maximum intelligence | The daily driver — speed |
+| **Vault (Q4)** | ~112 GB, streamed from SSD | ~14 GB, fits almost entirely in the RAM ring |
+| **Decode** | 1.43 tok/s | **~13 tok/s** |
+
+Same engine, same binary, same laptop. The smaller the model, the more of it lives in memory — and the streaming cost that bounds the frontier simply vanishes. The full model matrix and hardware projections live in the [official documentation](https://docs.s-moe.com/).
+
+---
+
 ## The Monolithic Delusion
 
 Silicon Valley has a bucket problem. 
@@ -64,15 +80,16 @@ S-MoE splits monolithic models into a similar acoustic sensor array:
 
 ## It Speaks OpenAI
 
-S-MoE isn't a walled garden. Beyond the native console, it exposes an **OpenAI-compatible HTTP server** — anything that already talks to OpenAI talks to your laptop's 235B, unmodified:
+S-MoE isn't a walled garden. Beyond the native console, it exposes an **OpenAI-compatible HTTP server** — anything that already talks to OpenAI talks to your laptop's vault fleet, unmodified:
 
 ```bash
 .venv/bin/python serve_openai.py --port 8000
 ```
 
 - `POST /v1/chat/completions` — streaming (SSE) and non-streaming, with per-request `temperature`, `top_p`, `top_k`, and an honest `finish_reason`.
-- `GET /v1/models`, `GET /health` — the plumbing supervisors expect.
-- `GET /` — a **built-in, dependency-free web chat console**. Open `http://127.0.0.1:8000/` and start typing.
+- `GET /v1/models` — every vault discovered on disk, identity read from the vault's own bytes. Naming another one in the standard `model` field **switches the engine** — so Open WebUI's model picker switches vaults with zero S-MoE-specific code.
+- `GET /health` — the plumbing supervisors expect.
+- `GET /` — a **built-in, dependency-free web chat console** with live turn timings, context and RAM meters, and a model dropdown. Open `http://127.0.0.1:8000/` and start typing.
 
 Point Open WebUI, LibreChat, an editor plugin, or the `openai` SDK at `http://127.0.0.1:8000/v1` and it cannot tell S-MoE from OpenAI. One file of Python stdlib, zero new dependencies — the engine gains an ecosystem without gaining weight.
 
@@ -86,21 +103,23 @@ Point Open WebUI, LibreChat, an editor plugin, or the `openai` SDK at `http://12
 ---
 
 ## Architectural Layout Overview
-* `scripts/shatter_moe.py`: Offline pre-processing utility that slices monolithic model weights into aligned, discrete expert components.
+* `scripts/shatter_moe.py`: Offline pre-processing utility that slices monolithic model weights into aligned, discrete expert components — and stamps each vault with a self-describing arch block read straight from the model's own `config.json`.
 * `src/io/streamer.cpp`: High-speed asynchronous storage pipeline that handles multi-threaded, unbuffered file reads — its ring buffer doubles as a true LRU expert cache.
 * `src/prefill.cpp`: Layer-major batched prefill — prompt chunks traverse the model layer by layer, each layer's deduplicated expert union read from the vault exactly once.
 * `src/compute/metal_bridge.mm`: The operational execution nexus, swapping active memory pointers directly into the Apple GPU ring, with token-batch fused FFN kernels for prefill.
 * `chat.py`: The thin Python console — tokenization and display only. It speaks to one persistent engine process per session over a line protocol.
-* `serve_openai.py`: The OpenAI-compatible HTTP front-end. Owns HTTP, tokenization, and the chat template; drives the same persistent engine over the same line protocol. Zero new dependencies.
+* `serve_openai.py`: The OpenAI-compatible HTTP front-end. Owns HTTP, tokenization, the chat template, and the vault fleet — discovery, `/v1/models`, and live model switching; drives the same persistent engine over the same line protocol. Zero new dependencies.
 * `webchat.html`: A single self-contained, dependency-free browser chat console, served same-origin at `GET /` for hands-on testing.
 
 ---
 
 ## Current Status
-S-MoE runs a fully operational **Qwen3-235B** pipeline on a purely Data-Oriented C++ architecture. Since the latency campaign began it has moved the needle on every axis that matters: cold **time-to-first-token 92.7 s → ~29 s (~3×)** and **decode 0.48 → 1.43 tok/s (~3×)**, every step verified bit-exact or coherence-checked against the reference path. It is no longer just *running* the frontier — it is running it three times faster, on both ends.
+S-MoE runs a fully operational, **model-agnostic** MoE pipeline on a purely Data-Oriented C++ architecture — a verified two-model fleet today (Qwen3-235B and Qwen3-30B-A3B), switchable at runtime. Since the latency campaign began it has moved the needle on every axis that matters: on the 235B frontier, cold **time-to-first-token 92.7 s → ~29 s (~3×)** and **decode 0.48 → 1.43 tok/s (~3×)**, every step verified bit-exact or coherence-checked against the reference path. It is no longer just *running* the frontier — it is running it three times faster, on both ends, and it is no longer *only* running the frontier.
 
 Where the wins came from:
 
+- **Self-Describing Vaults:** The `.smoe` format carries the model's own architecture — RoPE theta, routing top-k, head geometry, normalization flags, lineage — inside an arch block written at shatter time from the checkpoint's `config.json`. The engine's per-model hardcodes are gone; older vaults upgrade in place.
+- **The Model Fleet:** The server discovers every vault on disk, lists them all on `/v1/models`, and swaps the engine when a request names another one — from the web console's dropdown or any OpenAI client's model picker. One shatter command turns a downloaded MoE checkpoint into a member of the fleet.
 - **Layer-Major Batched Prefill:** Prompt chunks traverse the model layer by layer with exact router-gate evaluation; each layer's deduplicated expert union is read from NVMe once per chunk instead of once per token. Cold time-to-first-token on a 45-token prompt: **92.7s → 32.4s**, bit-identical output.
 - **Persistent Serve Mode:** One engine process per *session*, not per turn. The KV-cache, expert ring, and Scout state survive across turns; each message prefills only its new suffix (longest-common-prefix contract). Follow-up turns answer in **~14s flat** — no longer growing with conversation length.
 - **The Ring is a Cache:** Released expert slots are retained with valid data and re-claimed as LRU cache hits; eviction respects live GPU references. The old regime evicted the entire ring every prompt token.
