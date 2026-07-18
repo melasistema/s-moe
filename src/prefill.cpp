@@ -31,7 +31,9 @@ namespace {
 // to this expert and with what gate weight. Static: single-threaded
 // caller, zero allocation in the hot path (CLAUDE.md).
 inline constexpr uint32_t MAX_EXPERTS = 512;
-inline constexpr uint32_t TOPK = 8;
+// Routing width comes from cfg.moe_top_k (vault arch block, 8 for Qwen3);
+// buffers are sized for the engine-wide ceiling.
+inline constexpr uint32_t TOPK_MAX = smoe::scout::MAX_ACTIVE;
 
 struct ExpertTokens {
     uint8_t tok[CHUNK];
@@ -314,12 +316,12 @@ void run_layer_major(const Params& P,
             union_reset();
             std::memset(b.routed_out, 0, static_cast<size_t>(B) * d_model * sizeof(float));
 
-            static uint32_t topk_ids[TOPK];
-            static float    topk_w[TOPK];
+            static uint32_t topk_ids[TOPK_MAX];
+            static float    topk_w[TOPK_MAX];
             for (uint32_t i = 0; i < B; ++i) {
                 const float* nr = b.normed + static_cast<size_t>(i) * d_model;
                 smoe::matvec_bf16(b.gate_scores, scout.get_gate(li), nr, n_experts, d_model);
-                uint32_t cnt = scout.compute_top_k(b.gate_scores, n_experts, TOPK,
+                uint32_t cnt = scout.compute_top_k(b.gate_scores, n_experts, cfg.moe_top_k,
                                                    topk_ids, topk_w, cfg.norm_topk_prob);
                 for (uint32_t e = 0; e < cnt; ++e) {
                     if (topk_ids[e] < MAX_EXPERTS &&

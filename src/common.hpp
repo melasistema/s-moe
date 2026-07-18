@@ -29,7 +29,8 @@
 namespace smoe {
 
 // ── Format constants ──────────────────────────────────────────
-inline constexpr uint32_t SMOE_VERSION        = 1;
+inline constexpr uint32_t SMOE_VERSION        = 2;        // current writer version
+inline constexpr uint32_t SMOE_VERSION_MIN    = 1;        // oldest readable vault
 inline constexpr size_t   PAGE_SIZE           = 16'384;   // 16 KB Apple Silicon page
 inline constexpr uint32_t Q2_GROUP_SIZE       = 64;       // weights per quantisation group
 inline constexpr uint32_t TENSORS_PER_EXPERT  = 3;        // gate_proj, up_proj, down_proj
@@ -66,11 +67,59 @@ struct SmoeHeader {
     uint32_t d_model;                // [48]  hidden dimension
     uint32_t vocab_size;             // [52]  number of tokens
     uint32_t ffn_dim;                // [56]  dense/shared FFN intermediate dimension
-    uint32_t reserved_ext;           // [60]  padding to 64 bytes
+    uint32_t reserved_ext;           // [60]  v1: zero. v2: byte offset of SmoeArchBlock
 };                                   // [64]
 
 static_assert(sizeof(SmoeHeader) == 64,
     "SmoeHeader layout is broken — must be exactly 64 bytes.");
+
+// ─────────────────────────────────────────────────────────────
+// ARCH BLOCK — 128 bytes, format v2
+// The model's architecture constants, serialized from the source
+// checkpoint's config.json at shatter time. Lives in the zero-pad
+// gap between the descriptor table and data_offset (so a v1 vault
+// can be upgraded in place without moving any expert blob);
+// located via SmoeHeader::reserved_ext. reserved_ext == 0 means
+// no block (v1 vault → engine falls back to legacy inference).
+// ─────────────────────────────────────────────────────────────
+
+inline constexpr std::array<uint8_t, 4> SMOE_ARCH_MAGIC = { 'S', 'A', 'R', 'C' };
+inline constexpr uint32_t SMOE_ARCH_VERSION = 1;
+
+// SmoeArchBlock::activation values (engine implements SiLU only)
+inline constexpr uint32_t SMOE_ACT_SILU = 0;
+
+// SmoeArchBlock::flags bits
+inline constexpr uint32_t SMOE_ARCH_NORM_TOPK      = 1u << 0;
+inline constexpr uint32_t SMOE_ARCH_QK_NORM        = 1u << 1;
+inline constexpr uint32_t SMOE_ARCH_DENSE_LAYER_0  = 1u << 2;
+
+struct SmoeArchBlock {
+    uint8_t  magic[4];               // [0]   SMOE_ARCH_MAGIC "SARC"
+    uint32_t block_version;          // [4]   SMOE_ARCH_VERSION
+    uint32_t block_size;             // [8]   sizeof(SmoeArchBlock) = 128
+    uint32_t flags;                  // [12]  SMOE_ARCH_* bits
+    float    rope_theta;             // [16]  RoPE base frequency
+    uint32_t num_heads;              // [20]  GQA query heads
+    uint32_t num_kv_heads;           // [24]  GQA key/value heads
+    uint32_t head_dim;               // [28]  attention head dimension
+    uint32_t moe_top_k;              // [32]  routed experts per token
+    uint32_t moe_ffn_dim;            // [36]  expert intermediate dimension
+    uint32_t dense_ffn_dim;          // [40]  dense-trunk FFN intermediate dimension
+    uint32_t shared_expert_ffn_dim;  // [44]  0 = no shared expert
+    uint32_t activation;             // [48]  SMOE_ACT_* (engine rejects != SILU)
+    uint32_t num_hidden_layers;      // [52]  total transformer layers incl. dense
+    float    rms_norm_eps;           // [56]  RMSNorm epsilon
+    char     model_type[24];         // [60]  NUL-padded HF model_type ("qwen3_moe")
+    uint8_t  reserved[44];           // [84]  zero
+};                                   // [128]
+
+static_assert(sizeof(SmoeArchBlock) == 128,
+    "SmoeArchBlock layout is broken — must be exactly 128 bytes.");
+
+[[nodiscard]] inline bool arch_magic_valid(const uint8_t* raw) noexcept {
+    return std::memcmp(raw, SMOE_ARCH_MAGIC.data(), 4) == 0;
+}
 
 struct SmoeModelConfig {
     uint32_t d_model;
@@ -87,6 +136,7 @@ struct SmoeModelConfig {
     uint32_t head_dim {128};           // Attention head dimension
     float    rope_theta {10000.0f};    // RoPE base frequency (10000=DeepSeek, 1000000=Qwen3)
     bool     norm_topk_prob {false};   // Re-normalize routing weights over selected top-k
+    uint32_t moe_top_k {8};            // Routed experts per token (≤ scout MAX_ACTIVE)
     // Derived configurations
     uint32_t gate_rows() const { return max_experts_per_layer; }
 };

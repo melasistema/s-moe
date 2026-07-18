@@ -45,7 +45,11 @@ inline constexpr uint32_t MAX_MOE_LAYERS = 128;
 class Scout {
 public:
     // Load Scout weights from a .safetensors file (mmap, resident).
-    Scout(const char* scout_safetensors_path, SmoeMetalCtx* metal_ctx, const SmoeHeader* vault_hdr = nullptr);
+    // `arch` = the vault's v2 arch block, or nullptr for a v1 vault
+    // (legacy path: config inferred from tensor shapes + Qwen3 defaults).
+    Scout(const char* scout_safetensors_path, SmoeMetalCtx* metal_ctx,
+          const SmoeHeader* vault_hdr = nullptr,
+          const SmoeArchBlock* arch = nullptr);
     ~Scout();
 
     // Get the dynamically parsed model configuration

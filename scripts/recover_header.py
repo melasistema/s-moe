@@ -7,7 +7,7 @@ from shatter_moe import (
     build_tensor_index, detect_moe_topology, extract_model_dimensions,
     load_expert_tensors, build_expert_blob, _align_up, PAGE_SIZE,
     HEADER_FMT, EXPERT_ENTRY_FMT, TENSOR_DESC_FMT, TENSORS_PER_EXPERT,
-    SMOE_MAGIC, SMOE_VERSION, Q2_GROUP_SIZE, ExpertMeta
+    SMOE_MAGIC, SMOE_VERSION, SMOE_VERSION_MIN, Q2_GROUP_SIZE, ExpertMeta
 )
 
 def main():
@@ -82,10 +82,24 @@ def main():
             # Recompute data_offset just in case, though it shouldn't change unless total_experts drops drastically
             # But the file was created with the ORIGINAL data_offset, so we MUST keep the original data_offset!
         
+        # Preserve the on-disk version + arch-block offset when they look
+        # sane (a v2 vault's SARC block lives in the pad gap and survives
+        # recovery untouched). Garbage header → fall back to plain v1;
+        # upgrade_vault_v2.py can re-stamp the block afterwards.
+        f_out.seek(0)
+        old = HEADER_FMT.unpack(f_out.read(HEADER_FMT.size))
+        old_version, old_reserved_ext = old[1], old[12]
+        if old[0] == SMOE_MAGIC and SMOE_VERSION_MIN <= old_version <= SMOE_VERSION:
+            version, reserved_ext = old_version, old_reserved_ext
+        else:
+            version, reserved_ext = SMOE_VERSION_MIN, 0
+            print("Existing header unreadable — writing v1 with no arch block "
+                  "(run upgrade_vault_v2.py to restore v2).")
+
         f_out.seek(0)
         f_out.write(HEADER_FMT.pack(
             SMOE_MAGIC,
-            SMOE_VERSION,
+            version,
             topology["num_moe_layers"],
             topology["max_experts"],
             len(experts_meta),
@@ -96,7 +110,7 @@ def main():
             dims.get("d_model", 0),
             dims.get("vocab_size", 0),
             dims.get("ffn_dim", 0),
-            0  # reserved_ext
+            reserved_ext
         ))
 
         for meta in experts_meta:

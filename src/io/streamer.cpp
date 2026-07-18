@@ -195,7 +195,7 @@ static void parse_vault(int fd,
     if (!smoe::magic_valid(hdr.magic))
         throw std::runtime_error("smoe: invalid magic bytes — not a .smoe vault");
 
-    if (hdr.version != smoe::SMOE_VERSION)
+    if (hdr.version < smoe::SMOE_VERSION_MIN || hdr.version > smoe::SMOE_VERSION)
         throw std::runtime_error(
             "smoe: unsupported format version " + std::to_string(hdr.version));
 

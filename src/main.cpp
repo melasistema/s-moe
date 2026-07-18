@@ -144,7 +144,12 @@ static void print_telemetry(
 
 // ── Vault pre-flight ──────────────────────────────────────────
 
-static bool read_vault_header(const char* vault_path, smoe::SmoeHeader& hdr) {
+// Reads the 64-byte header, and — on a v2 vault — the SmoeArchBlock it points
+// to. `arch_valid` reports whether `arch` holds a validated block; a v1 vault
+// returns true with arch_valid=false (legacy config-inference path).
+static bool read_vault_header(const char* vault_path, smoe::SmoeHeader& hdr,
+                              smoe::SmoeArchBlock& arch, bool& arch_valid) {
+    arch_valid = false;
     int fd = ::open(vault_path, O_RDONLY);
     if (fd < 0) {
         std::fprintf(stderr, "\n  ✗  Cannot open vault: %s\n", vault_path);
@@ -152,22 +157,62 @@ static bool read_vault_header(const char* vault_path, smoe::SmoeHeader& hdr) {
     }
 
     ssize_t n = ::read(fd, &hdr, sizeof(smoe::SmoeHeader));
-    ::close(fd);
 
     if (n != ssize_t(sizeof(smoe::SmoeHeader))) {
+        ::close(fd);
         std::fprintf(stderr, "\n  ✗  Vault too small (not a valid .smoe file).\n");
         return false;
     }
     if (!smoe::magic_valid(hdr.magic)) {
+        ::close(fd);
         std::fprintf(stderr, "\n  ✗  Invalid magic bytes — not a .smoe vault.\n");
         return false;
     }
-    if (hdr.version != smoe::SMOE_VERSION) {
+    if (hdr.version < smoe::SMOE_VERSION_MIN || hdr.version > smoe::SMOE_VERSION) {
+        ::close(fd);
         std::fprintf(stderr,
-            "\n  ✗  Vault version mismatch: got %u, expected %u.\n",
-            hdr.version, smoe::SMOE_VERSION);
+            "\n  ✗  Vault version mismatch: got %u, supported %u–%u.\n",
+            hdr.version, smoe::SMOE_VERSION_MIN, smoe::SMOE_VERSION);
         return false;
     }
+
+    if (hdr.version >= 2) {
+        // v2 requires a valid arch block; a missing/corrupt one is a hard
+        // error rather than a silent fall-back to guessed constants.
+        if (hdr.reserved_ext == 0 ||
+            hdr.reserved_ext + sizeof(smoe::SmoeArchBlock) > hdr.data_offset) {
+            ::close(fd);
+            std::fprintf(stderr, "\n  ✗  v2 vault has no valid arch-block offset.\n");
+            return false;
+        }
+        ssize_t an = ::pread(fd, &arch, sizeof(arch), hdr.reserved_ext);
+        ::close(fd);
+        if (an != ssize_t(sizeof(arch)) || !smoe::arch_magic_valid(arch.magic) ||
+            arch.block_size != sizeof(smoe::SmoeArchBlock) ||
+            arch.block_version != smoe::SMOE_ARCH_VERSION) {
+            std::fprintf(stderr, "\n  ✗  Corrupt arch block in v2 vault.\n");
+            return false;
+        }
+        if (arch.activation != smoe::SMOE_ACT_SILU) {
+            std::fprintf(stderr,
+                "\n  ✗  Vault requires activation id %u; engine implements SiLU only.\n",
+                arch.activation);
+            return false;
+        }
+        if (arch.moe_top_k == 0 || arch.moe_top_k > smoe::scout::MAX_ACTIVE ||
+            arch.head_dim == 0 || arch.head_dim > 256 ||
+            arch.num_heads == 0 || arch.num_kv_heads == 0 ||
+            arch.num_heads % arch.num_kv_heads != 0) {
+            std::fprintf(stderr, "\n  ✗  Arch block values out of engine limits "
+                "(top_k=%u heads=%u/%u head_dim=%u).\n",
+                arch.moe_top_k, arch.num_heads, arch.num_kv_heads, arch.head_dim);
+            return false;
+        }
+        arch_valid = true;
+        return true;
+    }
+
+    ::close(fd);
     return true;
 }
 
@@ -323,7 +368,9 @@ int main(int argc, char* argv[]) {
 
     // ── Vault header read ────────────────────────────────────────────────────────────────────────
     smoe::SmoeHeader vault_hdr {};
-    if (!read_vault_header(vault_path, vault_hdr)) return 1;
+    smoe::SmoeArchBlock vault_arch {};
+    bool vault_arch_valid = false;
+    if (!read_vault_header(vault_path, vault_hdr, vault_arch, vault_arch_valid)) return 1;
 
     if (g_debug) {
         std::fprintf(stderr,
@@ -486,7 +533,8 @@ int main(int argc, char* argv[]) {
     smoe_metal_register_buffer(metal, streamer.pool_data(), streamer.pool_size());
 
     // ── Phase 4: Scout init ───────────────────────────────────
-    smoe::scout::Scout scout(scout_path, metal, &vault_hdr);  // scout_path may be nullptr (heuristic only)
+    smoe::scout::Scout scout(scout_path, metal, &vault_hdr,
+                             vault_arch_valid ? &vault_arch : nullptr);  // scout_path may be nullptr (heuristic only)
     const auto& cfg = scout.config();
     const uint32_t num_layers = cfg.num_moe_layers + (cfg.has_dense_layer_0 ? 1 : 0);
 
@@ -1168,10 +1216,11 @@ int main(int argc, char* argv[]) {
                 }
             } else {
                 // Exact routing, ALL steps: the real router gate evaluated
-                // on the heavy hidden state. One ranked top-(8+spec)
-                // selection: ranks 0–7 are the true routing for THIS token
-                // (weights renormalised over the 8 per norm_topk_prob —
-                // identical to a direct top-8 selection); ranks beyond 8
+                // on the heavy hidden state. One ranked top-(k+spec)
+                // selection, k = cfg.moe_top_k from the vault arch block
+                // (8 for Qwen3): ranks 0..k-1 are the true routing for THIS
+                // token (weights renormalised over the k per norm_topk_prob —
+                // identical to a direct top-k selection); ranks beyond k
                 // are the speculative prefetch bet for the NEXT token at
                 // this layer (measured coverage of the next token's top-8:
                 // 46.4% retention alone → 63.7% at +8 → 71.9% at +16).
@@ -1182,10 +1231,13 @@ int main(int argc, char* argv[]) {
                                   scout.get_gate(l - moe_start_layer),
                                   heavy_normed,
                                   cfg.max_experts_per_layer, d_model);
+                // Rank buffers are 32 wide (top_k 16 max + spec 24 max ⇒ clamp).
+                uint32_t want = cfg.moe_top_k + spec_width;
+                if (want > 32) want = 32;
                 const uint32_t nsel = scout.compute_top_k(
-                    exact_gate_scores, cfg.max_experts_per_layer, 8 + spec_width,
+                    exact_gate_scores, cfg.max_experts_per_layer, want,
                     exact_rank_ids, exact_rank_w, false);
-                const uint32_t n8 = (nsel < 8) ? nsel : 8;
+                const uint32_t n8 = (nsel < cfg.moe_top_k) ? nsel : cfg.moe_top_k;
                 exact_pred.layer_id = l;
                 exact_pred.count = n8;
                 float w_sum = 0.0f;

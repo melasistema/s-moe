@@ -52,6 +52,7 @@ Direct I/O streaming on Apple Silicon NVMe hardware.
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import re
 import struct
@@ -108,7 +109,8 @@ except ImportError:
 # ═════════════════════════════════════════════════════════════════
 
 SMOE_MAGIC          = b"SMOE\xDE\xEA\x00\x01"  # 8 bytes: SMOE + DeepSeek tag + format v1
-SMOE_VERSION        = 1
+SMOE_VERSION        = 2
+SMOE_VERSION_MIN    = 1                         # readers accept [MIN, VERSION]
 PAGE_SIZE           = 16_384                    # 16 KB — Apple Silicon hardware page boundary
 Q2_GROUP_SIZE       = 64                        # weights per quantisation group
 TENSORS_PER_EXPERT  = 3                         # gate_proj, up_proj, down_proj
@@ -138,6 +140,25 @@ assert EXPERT_ENTRY_FMT.size == 48, f"ExpertEntry size error: {EXPERT_ENTRY_FMT.
 #   packed_offset(Q) + packed_size(Q) + scales_offset(Q) + scales_size(Q)
 TENSOR_DESC_FMT = struct.Struct("<BBxxIIQQQQ")
 assert TENSOR_DESC_FMT.size == 44, f"TensorDesc size error: {TENSOR_DESC_FMT.size}"
+
+# ARCH BLOCK — 128 bytes (format v2; mirrored by SmoeArchBlock in common.hpp)
+# Located via SmoeHeader.reserved_ext (byte offset; 0 = absent). Sits in the
+# alignment gap between the descriptor tables and data_offset, 64-byte aligned.
+#   magic(4s) + block_version(I) + block_size(I) + flags(I) +
+#   rope_theta(f) + num_heads(I) + num_kv_heads(I) + head_dim(I) +
+#   moe_top_k(I) + moe_ffn_dim(I) + dense_ffn_dim(I) + shared_expert_ffn_dim(I) +
+#   activation(I) + num_hidden_layers(I) + rms_norm_eps(f) +
+#   model_type(24s NUL-padded) + reserved(44x)
+ARCH_MAGIC   = b"SARC"
+ARCH_VERSION = 1
+ARCH_FMT     = struct.Struct("<4sIIIfIIIIIIIIIf24s44x")
+assert ARCH_FMT.size == 128, f"ArchBlock size error: {ARCH_FMT.size}"
+
+ACT_SILU = 0                       # SiLU/SwiGLU — the only activation the kernels implement
+
+ARCH_FLAG_NORM_TOPK     = 1 << 0   # renormalise selected top-k weights to sum 1
+ARCH_FLAG_QK_NORM       = 1 << 1   # per-head Q/K RMS norm before RoPE (Qwen3)
+ARCH_FLAG_DENSE_LAYER_0 = 1 << 2   # layer 0 is a dense MLP (DeepSeek)
 
 
 # ═════════════════════════════════════════════════════════════════
@@ -452,6 +473,125 @@ def extract_model_dimensions(tensor_index: dict[str, Path]) -> dict:
             
     return dim
 
+def read_hf_arch_config(model_dir: Path, tensor_index: dict[str, Path]) -> dict:
+    """
+    Read the checkpoint's HF config.json and map it to the arch-block fields.
+
+    Per-family key mappings for qwen3_moe and the deepseek family; anything
+    else falls back to the generic HF key names with a warning. has_qk_norm
+    and has_dense_layer_0 come from tensor presence, not config — the shapes
+    on disk are authoritative. `model_dir` may also be a direct path to a
+    config.json (upgrade tool: no shards available; caller must then fix up
+    the tensor-presence flags itself).
+    """
+    config_path = model_dir if model_dir.is_file() else model_dir / "config.json"
+    if not config_path.is_file():
+        raise FileNotFoundError(
+            f"{config_path} not found — the arch block needs the checkpoint's "
+            f"config.json (re-download with it included)."
+        )
+    with open(config_path) as f:
+        raw = json.load(f)
+
+    model_type = str(raw.get("model_type", "unknown"))
+    known = ("qwen3_moe", "deepseek", "deepseek_v2", "deepseek_v3", "qwen2_moe")
+    if model_type not in known:
+        console.print(
+            f"  [yellow]⚠ model_type '{model_type}' has no dedicated mapping — "
+            f"using generic HF keys[/yellow]"
+        )
+
+    hidden_act = str(raw.get("hidden_act", "silu"))
+    if hidden_act != "silu":
+        raise ValueError(
+            f"hidden_act '{hidden_act}' — the engine kernels implement SiLU/SwiGLU only."
+        )
+
+    num_heads = int(raw["num_attention_heads"])
+    head_dim  = int(raw.get("head_dim") or raw["hidden_size"] // num_heads)
+
+    arch = {
+        "model_type":            model_type,
+        "rope_theta":            float(raw.get("rope_theta", 10_000.0)),
+        "num_heads":             num_heads,
+        "num_kv_heads":          int(raw.get("num_key_value_heads") or num_heads),
+        "head_dim":              head_dim,
+        "moe_top_k":             int(raw.get("num_experts_per_tok") or raw.get("moe_top_k", 8)),
+        "moe_ffn_dim":           int(raw.get("moe_intermediate_size") or raw.get("intermediate_size", 0)),
+        "dense_ffn_dim":         int(raw.get("intermediate_size", 0)),
+        "shared_expert_ffn_dim": 0,
+        "activation":            ACT_SILU,
+        "num_hidden_layers":     int(raw.get("num_hidden_layers", 0)),
+        "rms_norm_eps":          float(raw.get("rms_norm_eps", 1e-6)),
+        "norm_topk_prob":        bool(raw.get("norm_topk_prob", False)),
+        # Tensor presence is authoritative for these two:
+        "has_qk_norm":           "model.layers.0.self_attn.q_norm.weight" in tensor_index,
+        "has_dense_layer_0":     "model.layers.0.mlp.gate_proj.weight" in tensor_index,
+    }
+
+    # DeepSeek family: shared experts + leading dense layers
+    n_shared = int(raw.get("n_shared_experts") or 0)
+    if n_shared and arch["moe_ffn_dim"]:
+        arch["shared_expert_ffn_dim"] = n_shared * arch["moe_ffn_dim"]
+
+    return arch
+
+
+def build_arch_block(arch: dict) -> bytes:
+    """Serialise the arch dict into the 128-byte SARC block."""
+    flags = 0
+    if arch["norm_topk_prob"]:      flags |= ARCH_FLAG_NORM_TOPK
+    if arch["has_qk_norm"]:         flags |= ARCH_FLAG_QK_NORM
+    if arch["has_dense_layer_0"]:   flags |= ARCH_FLAG_DENSE_LAYER_0
+
+    return ARCH_FMT.pack(
+        ARCH_MAGIC,
+        ARCH_VERSION,
+        ARCH_FMT.size,
+        flags,
+        arch["rope_theta"],
+        arch["num_heads"],
+        arch["num_kv_heads"],
+        arch["head_dim"],
+        arch["moe_top_k"],
+        arch["moe_ffn_dim"],
+        arch["dense_ffn_dim"],
+        arch["shared_expert_ffn_dim"],
+        arch["activation"],
+        arch["num_hidden_layers"],
+        arch["rms_norm_eps"],
+        arch["model_type"].encode("utf-8")[:24],
+    )
+
+
+def unpack_arch_block(blob: bytes) -> dict:
+    """Decode a 128-byte SARC block back into a dict (validator / tools)."""
+    (magic, block_version, block_size, flags, rope_theta, num_heads,
+     num_kv_heads, head_dim, moe_top_k, moe_ffn_dim, dense_ffn_dim,
+     shared_ffn, activation, num_hidden_layers, rms_norm_eps,
+     model_type) = ARCH_FMT.unpack(blob)
+    assert magic == ARCH_MAGIC,          f"Arch magic mismatch: {magic!r}"
+    assert block_size == ARCH_FMT.size,  f"Arch block_size mismatch: {block_size}"
+    return {
+        "block_version":         block_version,
+        "model_type":            model_type.rstrip(b"\x00").decode("utf-8"),
+        "rope_theta":            rope_theta,
+        "num_heads":             num_heads,
+        "num_kv_heads":          num_kv_heads,
+        "head_dim":              head_dim,
+        "moe_top_k":             moe_top_k,
+        "moe_ffn_dim":           moe_ffn_dim,
+        "dense_ffn_dim":         dense_ffn_dim,
+        "shared_expert_ffn_dim": shared_ffn,
+        "activation":            activation,
+        "num_hidden_layers":     num_hidden_layers,
+        "rms_norm_eps":          rms_norm_eps,
+        "norm_topk_prob":        bool(flags & ARCH_FLAG_NORM_TOPK),
+        "has_qk_norm":           bool(flags & ARCH_FLAG_QK_NORM),
+        "has_dense_layer_0":     bool(flags & ARCH_FLAG_DENSE_LAYER_0),
+    }
+
+
 def classify_scout_keys(tensor_index: dict[str, Path]) -> list[str]:
     """
     Return all tensor keys that belong to the Surface Scout —
@@ -577,17 +717,40 @@ def validate_vault(smoe_path: Path, sample_count: int = 3) -> None:
     """
     with open(smoe_path, "rb") as f:
         # Header
-        hdr = HEADER_FMT.unpack(f.read(HEADER_FMT.size))
-        magic, version, n_layers, max_exp, total_exp, tbl_off, data_off, grp_sz, _ = hdr
+        (magic, version, n_layers, max_exp, total_exp, tbl_off, data_off,
+         grp_sz, bits, d_model, vocab_size, ffn_dim, reserved_ext) = \
+            HEADER_FMT.unpack(f.read(HEADER_FMT.size))
 
-        assert magic   == SMOE_MAGIC,    f"Magic mismatch: {magic!r}"
-        assert version == SMOE_VERSION,  f"Version mismatch: {version}"
+        assert magic == SMOE_MAGIC, f"Magic mismatch: {magic!r}"
+        assert SMOE_VERSION_MIN <= version <= SMOE_VERSION, \
+            f"Unsupported version: {version}"
 
         console.print(
             f"  [cyan]✓[/cyan] Header valid — v{version}  "
             f"{n_layers} MoE layers  {max_exp} experts/layer  "
             f"{total_exp} total  group_size={grp_sz}  data@{data_off:#x}"
         )
+
+        # Arch block (v2)
+        if version >= 2:
+            assert reserved_ext != 0, "v2 vault but reserved_ext (arch offset) is 0"
+            assert reserved_ext + ARCH_FMT.size <= data_off, \
+                f"Arch block at {reserved_ext:#x} overruns data_offset {data_off:#x}"
+            f.seek(reserved_ext)
+            arch = unpack_arch_block(f.read(ARCH_FMT.size))
+            console.print(
+                f"  [cyan]✓[/cyan] Arch block @ {reserved_ext:#x} — "
+                f"{arch['model_type']}  theta={arch['rope_theta']:.0f}  "
+                f"top_k={arch['moe_top_k']}  "
+                f"heads={arch['num_heads']}/{arch['num_kv_heads']}×{arch['head_dim']}  "
+                f"norm_topk={arch['norm_topk_prob']}  qk_norm={arch['has_qk_norm']}  "
+                f"dense_l0={arch['has_dense_layer_0']}  "
+                f"shared_ffn={arch['shared_expert_ffn_dim']}"
+            )
+        elif reserved_ext != 0:
+            console.print(
+                f"  [yellow]⚠ v1 vault with nonzero reserved_ext={reserved_ext:#x}[/yellow]"
+            )
 
         # Expert table samples
         f.seek(tbl_off)
@@ -731,6 +894,20 @@ def main() -> None:
         sys.exit(1)
     _print_topology(topology)
 
+    # ── Arch block source: the checkpoint's config.json ───────────
+    try:
+        arch = read_hf_arch_config(model_dir, tensor_index)
+    except (FileNotFoundError, ValueError, KeyError) as e:
+        console.print(f"[red]ERROR: {e}[/red]")
+        sys.exit(1)
+    console.print(
+        f"  Arch    : [bold]{arch['model_type']}[/bold]"
+        f"  theta={arch['rope_theta']:.0f}"
+        f"  top_k={arch['moe_top_k']}"
+        f"  heads={arch['num_heads']}/{arch['num_kv_heads']}×{arch['head_dim']}"
+        f"  norm_topk={arch['norm_topk_prob']}"
+    )
+
     # ── Dry run early exit ────────────────────────────────────────
     if args.dry_run:
         # Estimate output sizes without loading any weights
@@ -772,12 +949,16 @@ def main() -> None:
         + total_work * EXPERT_ENTRY_FMT.size
         + total_work * TENSORS_PER_EXPERT * TENSOR_DESC_FMT.size
     )
-    data_offset = _align_up(meta_bytes, PAGE_SIZE)
+    # Arch block lives 64-byte aligned after the descriptor tables,
+    # inside the page-alignment gap before the first expert blob.
+    arch_offset = _align_up(meta_bytes, 64)
+    data_offset = _align_up(arch_offset + ARCH_FMT.size, PAGE_SIZE)
 
     console.print(
         f"  Layout  : header={HEADER_FMT.size}B"
         f" + table={total_work * EXPERT_ENTRY_FMT.size}B"
         f" + meta={total_work * TENSORS_PER_EXPERT * TENSOR_DESC_FMT.size}B"
+        f" + arch@{arch_offset:#x}"
         f"  →  data@{data_offset:#x}"
     )
 
@@ -880,7 +1061,7 @@ def main() -> None:
             dims["d_model"],
             dims["vocab_size"],
             dims["ffn_dim"],
-            0,                  # reserved_ext
+            arch_offset,        # reserved_ext: v2 arch-block offset
         ))
 
         for meta in experts_meta:
@@ -907,9 +1088,13 @@ def main() -> None:
                     desc.scales_size,
                 ))
         
-        # Zero-pad until data_offset
+        # Zero-pad to the arch block slot, write it, then pad to data_offset
+        gap = arch_offset - f_out.tell()
+        assert gap >= 0, "Metadata overflow!"
+        f_out.write(b"\x00" * gap)
+        f_out.write(build_arch_block(arch))
         pad = data_offset - f_out.tell()
-        assert pad >= 0, "Metadata overflow!"
+        assert pad >= 0, "Arch block overflow!"
         f_out.write(b"\x00" * pad)
 
         t_write = time.perf_counter() - t_write_start

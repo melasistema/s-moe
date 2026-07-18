@@ -303,13 +303,15 @@ struct Scout::Impl {
     float* lm_head_scores { nullptr };
 
     // ── Constructor: load safetensors ─────────────────────────
-    Impl(const char* path, SmoeMetalCtx* metal_ctx, const SmoeHeader* vault_hdr);
+    Impl(const char* path, SmoeMetalCtx* metal_ctx, const SmoeHeader* vault_hdr,
+         const SmoeArchBlock* arch);
     ~Impl();
 };
 
 // ── Impl constructor ──────────────────────────────────────────
 
-Scout::Impl::Impl(const char* path, SmoeMetalCtx* metal_ctx, const SmoeHeader* vault_hdr) {
+Scout::Impl::Impl(const char* path, SmoeMetalCtx* metal_ctx, const SmoeHeader* vault_hdr,
+                  const SmoeArchBlock* arch) {
     this->metal_ctx = metal_ctx;
 
     if (vault_hdr) {
@@ -458,30 +460,71 @@ Scout::Impl::Impl(const char* path, SmoeMetalCtx* metal_ctx, const SmoeHeader* v
         cfg.has_qk_norm = qn.valid;
     }
 
-    // Detect rope_theta: Qwen3 uses 1000000.0, DeepSeek uses 10000.0
-    // Heuristic: if model has QK-norm it's Qwen3-family
-    cfg.rope_theta = 1000000.0f;
-
-    // norm_topk_prob: Qwen3 re-normalizes selected expert weights to sum=1
-    cfg.norm_topk_prob = true;
-
-    // shared_expert_ffn_dim: Qwen3-235B has NO shared expert (confirmed from header scan)
-    cfg.shared_expert_ffn_dim = 0; // Will be overridden if tensors found during load
-
-
-    // Infer GQA shapes from self_attn projections
+    // Attention projections — needed by both paths (v2 cross-check, v1 inference)
     TensorMeta q_meta = parse_tensor_meta(json_start, json_end, "model.layers.0.self_attn.q_proj.weight");
     TensorMeta k_meta = parse_tensor_meta(json_start, json_end, "model.layers.0.self_attn.k_proj.weight");
-    if (q_meta.valid && k_meta.valid) {
-        // Assuming head_dim = 128 (standard for most models including DeepSeek/Qwen)
-        cfg.head_dim = 128;
-        cfg.num_heads = q_meta.shape[0] / cfg.head_dim;
-        cfg.num_kv_heads = k_meta.shape[0] / cfg.head_dim;
+
+    if (arch) {
+        // v2 vault: math constants come from the arch block, serialized
+        // from the checkpoint's config.json at shatter/upgrade time.
+        cfg.rope_theta            = arch->rope_theta;
+        cfg.norm_topk_prob        = (arch->flags & SMOE_ARCH_NORM_TOPK) != 0;
+        cfg.moe_top_k             = arch->moe_top_k;
+        cfg.num_heads             = arch->num_heads;
+        cfg.num_kv_heads          = arch->num_kv_heads;
+        cfg.head_dim              = arch->head_dim;
+        cfg.shared_expert_ffn_dim = arch->shared_expert_ffn_dim;
+
+        // Cross-check the block against tensor evidence — shapes don't lie.
+        // Tensor presence stays authoritative for has_qk_norm / has_dense_layer_0.
+        const bool arch_qk    = (arch->flags & SMOE_ARCH_QK_NORM) != 0;
+        const bool arch_dense = (arch->flags & SMOE_ARCH_DENSE_LAYER_0) != 0;
+        if (arch_qk != cfg.has_qk_norm)
+            std::fprintf(stderr,
+                "[scout] ⚠ arch block says qk_norm=%d but tensor presence says %d — trusting tensors\n",
+                (int)arch_qk, (int)cfg.has_qk_norm);
+        if (arch_dense != cfg.has_dense_layer_0)
+            std::fprintf(stderr,
+                "[scout] ⚠ arch block says dense_layer_0=%d but tensor presence says %d — trusting tensors\n",
+                (int)arch_dense, (int)cfg.has_dense_layer_0);
+        if (q_meta.valid && q_meta.shape[0] != cfg.num_heads * cfg.head_dim)
+            std::fprintf(stderr,
+                "[scout] ⚠ q_proj rows=%u but arch block implies %u (heads=%u × head_dim=%u)\n",
+                q_meta.shape[0], cfg.num_heads * cfg.head_dim, cfg.num_heads, cfg.head_dim);
+        if (k_meta.valid && k_meta.shape[0] != cfg.num_kv_heads * cfg.head_dim)
+            std::fprintf(stderr,
+                "[scout] ⚠ k_proj rows=%u but arch block implies %u (kv_heads=%u × head_dim=%u)\n",
+                k_meta.shape[0], cfg.num_kv_heads * cfg.head_dim, cfg.num_kv_heads, cfg.head_dim);
+        // The RMS-norm epsilon is compiled into the Metal kernels as 1e-6.
+        if (arch->rms_norm_eps < 0.9e-6f || arch->rms_norm_eps > 1.1e-6f)
+            std::fprintf(stderr,
+                "[scout] ⚠ config rms_norm_eps=%g but kernels hardcode 1e-6\n",
+                (double)arch->rms_norm_eps);
+
+        char model_type[sizeof(arch->model_type) + 1] = {};
+        std::memcpy(model_type, arch->model_type, sizeof(arch->model_type));
+        std::fprintf(stderr,
+            "[scout] arch: vault v2 block (%s) — theta=%.0f · top_k=%u · norm_topk=%d · shared_ffn=%u\n",
+            model_type, (double)cfg.rope_theta, cfg.moe_top_k,
+            (int)cfg.norm_topk_prob, cfg.shared_expert_ffn_dim);
     } else {
-        // Fallback to MHA defaults (DeepSeek)
-        cfg.num_heads = 16;
-        cfg.num_kv_heads = 16;
-        cfg.head_dim = 128;
+        // v1 vault — legacy inference path: Qwen3-family defaults + shapes.
+        cfg.rope_theta = 1000000.0f;
+        cfg.norm_topk_prob = true;
+        cfg.shared_expert_ffn_dim = 0; // overridden if shared tensors found during load
+
+        if (q_meta.valid && k_meta.valid) {
+            // Assuming head_dim = 128 (standard for most models including DeepSeek/Qwen)
+            cfg.head_dim = 128;
+            cfg.num_heads = q_meta.shape[0] / cfg.head_dim;
+            cfg.num_kv_heads = k_meta.shape[0] / cfg.head_dim;
+        } else {
+            // Fallback to MHA defaults (DeepSeek)
+            cfg.num_heads = 16;
+            cfg.num_kv_heads = 16;
+            cfg.head_dim = 128;
+        }
+        std::fprintf(stderr, "[scout] arch: v1 legacy inference (Qwen3 defaults, theta=1e6)\n");
     }
 
     std::fprintf(stderr, "[scout] GQA config: heads=%u, kv_heads=%u, head_dim=%u\n", cfg.num_heads, cfg.num_kv_heads, cfg.head_dim);
@@ -578,8 +621,13 @@ Scout::Impl::Impl(const char* path, SmoeMetalCtx* metal_ctx, const SmoeHeader* v
                         ok &= load_tensor(gn, w_shared_gate[l], shared_elems);
                         ok &= load_tensor(un, w_shared_up[l],   shared_elems);
                         ok &= load_tensor(dn, w_shared_down[l], cfg.d_model * gm.shape[0]);
-                        if (l == moe_start_layer)
+                        if (l == moe_start_layer) {
+                            if (arch && cfg.shared_expert_ffn_dim != gm.shape[0])
+                                std::fprintf(stderr,
+                                    "[scout] ⚠ arch block shared_ffn=%u but tensor shape says %u — trusting tensors\n",
+                                    cfg.shared_expert_ffn_dim, gm.shape[0]);
                             cfg.shared_expert_ffn_dim = gm.shape[0];
+                        }
                         found_shared = true;
                         break;
                     }
@@ -588,6 +636,12 @@ Scout::Impl::Impl(const char* path, SmoeMetalCtx* metal_ctx, const SmoeHeader* v
                     w_shared_gate[l] = nullptr;
                     w_shared_up[l]   = nullptr;
                     w_shared_down[l] = nullptr;
+                    if (l == moe_start_layer && cfg.shared_expert_ffn_dim != 0) {
+                        std::fprintf(stderr,
+                            "[scout] ⚠ arch block shared_ffn=%u but no shared-expert tensors found — disabling\n",
+                            cfg.shared_expert_ffn_dim);
+                        cfg.shared_expert_ffn_dim = 0;
+                    }
                 }
 
                 // Qwen3-specific: Q/K per-head RMS norm weights
@@ -636,8 +690,9 @@ Scout::Impl::~Impl() {
 // §4  Scout public API
 // ═══════════════════════════════════════════════════════════════
 
-Scout::Scout(const char* scout_safetensors_path, SmoeMetalCtx* metal_ctx, const SmoeHeader* vault_hdr)
-    : impl_(new Impl(scout_safetensors_path, metal_ctx, vault_hdr))
+Scout::Scout(const char* scout_safetensors_path, SmoeMetalCtx* metal_ctx,
+             const SmoeHeader* vault_hdr, const SmoeArchBlock* arch)
+    : impl_(new Impl(scout_safetensors_path, metal_ctx, vault_hdr, arch))
 {}
 
 Scout::~Scout() {
