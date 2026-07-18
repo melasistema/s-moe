@@ -29,9 +29,9 @@ No cloud. No H100. No half-terabyte workstation. A 235-billion-parameter frontie
 | **Hardware** | Standard 48 GB Apple Silicon MacBook |
 | **Quantization** | Q4 — 4-bit, unpacked directly in GPU registers |
 | **Resident RAM** | ~16 GB dense trunk + a small streaming ring — *not* the whole model |
-| **Cold time-to-first-token** | **~29 s** (45-token prompt) — down from 92.7 s |
+| **Cold time-to-first-token** | **~26 s** (45-token prompt) — down from 92.7 s |
 | **Warm follow-up turn** | **~14 s**, flat — no longer grows with conversation length |
-| **Decode speed** | **1.43 tok/s** — up from 0.48 t/s at the start of the campaign |
+| **Decode speed** | **1.84 tok/s** — up from 0.48 t/s at the start of the campaign |
 | **Interfaces** | Native console · **OpenAI-compatible HTTP server** · built-in web chat |
 
 The mountain rests cold on the SSD; only the handful of experts each word actually needs is ever pulled into memory. See how the wall came down in [Current Status](#current-status).
@@ -48,7 +48,7 @@ Every vault in `vault/` becomes a servable model, and they trade places live:
 |---|---|---|
 | **Role** | The frontier — maximum intelligence | The daily driver — speed |
 | **Vault (Q4)** | ~112 GB, streamed from SSD | ~14 GB, fits almost entirely in the RAM ring |
-| **Decode** | 1.43 tok/s | **~13 tok/s** |
+| **Decode** | 1.84 tok/s | **~13.7 tok/s** |
 
 Same engine, same binary, same laptop. The smaller the model, the more of it lives in memory — and the streaming cost that bounds the frontier simply vanishes. The full model matrix and hardware projections live in the [official documentation](https://docs.s-moe.com/).
 
@@ -114,7 +114,7 @@ Point Open WebUI, LibreChat, an editor plugin, or the `openai` SDK at `http://12
 ---
 
 ## Current Status
-S-MoE runs a fully operational, **model-agnostic** MoE pipeline on a purely Data-Oriented C++ architecture — a verified two-model fleet today (Qwen3-235B and Qwen3-30B-A3B), switchable at runtime. Since the latency campaign began it has moved the needle on every axis that matters: on the 235B frontier, cold **time-to-first-token 92.7 s → ~29 s (~3×)** and **decode 0.48 → 1.43 tok/s (~3×)**, every step verified bit-exact or coherence-checked against the reference path. It is no longer just *running* the frontier — it is running it three times faster, on both ends, and it is no longer *only* running the frontier.
+S-MoE runs a fully operational, **model-agnostic** MoE pipeline on a purely Data-Oriented C++ architecture — a verified two-model fleet today (Qwen3-235B and Qwen3-30B-A3B), switchable at runtime. Since the latency campaign began it has moved the needle on every axis that matters: on the 235B frontier, cold **time-to-first-token 92.7 s → ~26 s (>3×)** and **decode 0.48 → 1.84 tok/s (>3.8×)**, every step verified bit-exact or coherence-checked against the reference path. It is no longer just *running* the frontier — it is running it much faster, on both ends, and it is no longer *only* running the frontier.
 
 Where the wins came from:
 
@@ -123,7 +123,7 @@ Where the wins came from:
 - **Layer-Major Batched Prefill:** Prompt chunks traverse the model layer by layer with exact router-gate evaluation; each layer's deduplicated expert union is read from NVMe once per chunk instead of once per token. Cold time-to-first-token on a 45-token prompt: **92.7s → 32.4s**, bit-identical output.
 - **Persistent Serve Mode:** One engine process per *session*, not per turn. The KV-cache, expert ring, and Scout state survive across turns; each message prefills only its new suffix (longest-common-prefix contract). Follow-up turns answer in **~14s flat** — no longer growing with conversation length.
 - **The Ring is a Cache:** Released expert slots are retained with valid data and re-claimed as LRU cache hits; eviction respects live GPU references. The old regime evicted the entire ring every prompt token.
-- **GPU-Resident Hot Path:** The whole decode attention block runs in one command buffer per layer, coalesced simdgroup-per-row Metal kernels stream both expert and dense weights at ~150+ GB/s (a 7× dequant-bandwidth jump), and prompt positions that cannot emit a token skip the LM head and sampler entirely — decode **0.48 → 1.43 t/s**.
+- **GPU-Resident Hot Path:** The whole decode attention block runs in one command buffer per layer, coalesced simdgroup-per-row Metal kernels stream both expert and dense weights at ~150+ GB/s (a 7× dequant-bandwidth jump), and prompt positions that cannot emit a token skip the LM head and sampler entirely — decode **0.48 → 1.84 t/s**.
 - **Dynamic Topology:** Safely routes 128 fine-grained MoE experts per layer with true Qwen3 routing — the real router gate is evaluated on the heavy hidden state at every layer, in prefill *and* decode — streaming exactly what is needed and nothing more.
 - **Q4 Quantisation:** 4-bit Apple Metal shaders efficiently unpack weights directly in the GPU registers, avoiding the mathematical collapse of 2-bit uniform quantization on fine-grained architectures.
 - **Zero-Allocation:** KV-caches, context windows, and all prefill activation planes are managed entirely in static/aligned memory, strictly preserving the **zero runtime heap allocation** invariant.
