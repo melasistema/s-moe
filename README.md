@@ -32,7 +32,7 @@ No cloud. No H100. No half-terabyte workstation. A 235-billion-parameter frontie
 | **Cold time-to-first-token** | **~26 s** (45-token prompt) — down from 92.7 s |
 | **Warm follow-up turn** | **~14 s**, flat — no longer grows with conversation length |
 | **Decode speed** | **1.84 tok/s** — up from 0.48 t/s at the start of the campaign |
-| **Interfaces** | Native console · **OpenAI-compatible HTTP server** · built-in web chat |
+| **Interfaces** | Native console · **Multi-protocol HTTP server** · built-in web chat |
 
 
 The mountain rests cold on the SSD; only the handful of experts each word actually needs is ever pulled into memory. See how the wall came down in [Current Status](#current-status).

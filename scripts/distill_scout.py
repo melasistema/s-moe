@@ -7,7 +7,7 @@ Author: S-MoE / ANDARTIS
 ═══════════════════════════════════════════════════════════════════
 
 Extracts all non-expert tensors (Surface Scout backbone) from a 
-HuggingFace DeepSeek-MoE model shard directory, and optionally
+HuggingFace supported MoE model shard directory, and optionally
 distills the routing gate weights using a calibration dataset.
 
 Modes:

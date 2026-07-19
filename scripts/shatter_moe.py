@@ -6,7 +6,7 @@ S-MoE Engine  │  Phase 1: Offline Weight Shaper
 Author: S-MoE / ANDARTIS — Luca Visciola
 ═══════════════════════════════════════════════════════════════════
 
-Slices a DeepSeek fine-grained MoE model from HuggingFace .safetensors
+Slices a supported fine-grained MoE model from HuggingFace .safetensors
 format into a custom page-aligned .smoe binary vault, optimised for
 Direct I/O streaming on Apple Silicon NVMe hardware.
 
@@ -14,10 +14,10 @@ Direct I/O streaming on Apple Silicon NVMe hardware.
     python shatter_moe.py <model_dir> <output_dir> [options]
 
   Examples:
-    python shatter_moe.py ./deepseek-moe-16b/ ./vault/ --validate
-    python shatter_moe.py ./deepseek-moe-16b/ ./vault/ --dry-run
-    python shatter_moe.py ./deepseek-moe-16b/ ./vault/ --max-layers 2 --max-experts 4
-    python shatter_moe.py ./deepseek-moe-16b/ ./vault/ --measure-error
+    python shatter_moe.py ./checkpoints/qwen3-235b-instruct/ ./vault/ --validate
+    python shatter_moe.py ./checkpoints/qwen3-235b-instruct/ ./vault/ --dry-run
+    python shatter_moe.py ./checkpoints/qwen3-235b-instruct/ ./vault/ --max-layers 2 --max-experts 4
+    python shatter_moe.py ./checkpoints/qwen3-235b-instruct/ ./vault/ --measure-error
 
   .smoe Binary Format (v1):
   ─────────────────────────────────────────────────────────────────
@@ -404,7 +404,7 @@ def measure_q4_error(
 
 
 # ═════════════════════════════════════════════════════════════════
-# DeepSeek MoE TOPOLOGY DETECTION
+# TOPOLOGY DETECTION
 # ═════════════════════════════════════════════════════════════════
 
 _EXPERT_RE = re.compile(
@@ -828,7 +828,7 @@ def _print_summary(
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="shatter_moe.py",
-        description="S-MoE Seismic Weight Sculptor — DeepSeek MoE → .smoe vault",
+        description="S-MoE Seismic Weight Sculptor — Supported MoE → .smoe vault",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("model_dir",       type=Path,
@@ -889,7 +889,7 @@ def main() -> None:
     if topology["num_moe_layers"] == 0:
         console.print(
             "[red]ERROR: No MoE expert layers detected. "
-            "Is this a DeepSeek fine-grained MoE model?[/red]"
+            "Is this a supported fine-grained MoE model?[/red]"
         )
         sys.exit(1)
     _print_topology(topology)
