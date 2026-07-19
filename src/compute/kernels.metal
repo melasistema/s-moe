@@ -1,7 +1,9 @@
 // ═══════════════════════════════════════════════════════════════
 // kernels.metal — S-MoE Engine · SMOE-Q2 Fused FFN Compute Shader
 // ═══════════════════════════════════════════════════════════════
-// Phase 3 — Week 3
+// Single source of truth for the GPU kernels: make embeds this file
+// verbatim as build/kernels_msl.h and the bridge JIT-compiles it at
+// boot (the binary stays self-contained, no .metallib to ship).
 //
 // Implements a GEMV-style fused kernel for one expert FFN block:
 //   1. Gate projection:  gate_out[i] = dot(gate_row_i, x)
@@ -362,45 +364,6 @@ kernel void smoe_down(
     }
 }
 
-// ── Scout Matrix-Vector Multiplication: weight[rows x cols] x input_vec[cols] → output_vec[rows] ──
-kernel void scout_matvec(
-    device const float*  weight       [[buffer(0)]],
-    device const float*  input_vec    [[buffer(1)]],
-    device       float*  output_vec   [[buffer(2)]],
-    constant     uint2&  dims         [[buffer(3)]], // x = rows, y = cols
-    uint                 row          [[thread_position_in_grid]],
-    uint                 tid          [[thread_index_in_threadgroup]],
-    uint                 threads_per_tg [[threads_per_threadgroup]],
-    threadgroup  float*  tg_input     [[threadgroup(0)]])
-{
-    uint rows = dims.x;
-    uint cols = dims.y;
-
-    // Load input_vec into threadgroup memory
-    for (uint i = tid; i < cols; i += threads_per_tg) {
-        tg_input[i] = input_vec[i];
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (row >= rows) return;
-
-    // Compute dot product
-    float acc = 0.0f;
-    device const float* row_ptr = weight + row * cols;
-    uint c = 0;
-    for (; c + 3 < cols; c += 4) {
-        acc += row_ptr[c]     * tg_input[c];
-        acc += row_ptr[c + 1] * tg_input[c + 1];
-        acc += row_ptr[c + 2] * tg_input[c + 2];
-        acc += row_ptr[c + 3] * tg_input[c + 3];
-    }
-    for (; c < cols; ++c) {
-        acc += row_ptr[c] * tg_input[c];
-    }
-    output_vec[row] = acc;
-}
-
-
 // ── Scout BF16 Matvec ─────────────────────────────────────────
 kernel void scout_matvec_bf16(
     device const uint16_t* weights [[buffer(0)]],
@@ -508,8 +471,6 @@ kernel void scout_matvec_bf16_sg(
 // the whole attention block runs GPU-resident with ONE CPU sync per
 // layer instead of two (the CPU previously did QK-norm/RoPE/attention
 // between two synchronous matvec roundtrips).
-// NOTE: like the kernels above, this source is duplicated as an
-// embedded string in metal_bridge.mm (kMetalSource) — keep in sync.
 
 struct AttnPrepParams {
     uint head_dim;      // per-head dim (Qwen3: 128)
@@ -697,8 +658,6 @@ kernel void attn_decode(
 // grid = (ceil(rows/256), batch). Row-major matrices:
 //   input  [batch × gate_cols]   hidden [batch × gate_rows]
 //   output [batch × down_rows]
-// NOTE: like the kernels above, this source is duplicated as an
-// embedded string in metal_bridge.mm (kMetalBatchSource) — keep in sync.
 
 struct FusedFFNBatchParams {
     uint gate_rows;

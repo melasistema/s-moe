@@ -1,15 +1,13 @@
 // ═══════════════════════════════════════════════════════════════
 // streamer.hpp — S-MoE Engine · High-Velocity Direct I/O Streamer
 // ═══════════════════════════════════════════════════════════════
-// Phase 2 — Week 2
-//
 // Design invariants (MUST NEVER be violated):
 //   ① F_NOCACHE on every fd — kernel page cache fully bypassed.
 //   ② All slot data buffers are posix_memalign(16 KB)-aligned.
 //   ③ Expert blobs are read via pread() — concurrent, offset-based,
 //      no seek, no lock.
 //   ④ Ring slot transitions are CAS-only: EMPTY→LOADING→READY→CONSUMED.
-//   ⑤ Zero heap allocations inside prefetch() / claim_ready() / release().
+//   ⑤ Zero heap allocations inside prefetch() / claim_specific() / release().
 //   ⑥ Worker threads never call malloc, new, or any blocking mutex.
 // ═══════════════════════════════════════════════════════════════
 
@@ -25,15 +23,17 @@ namespace smoe::io {
 // ─────────────────────────────────────────────────────────────
 // Ring slot state machine — all transitions are atomic CAS.
 //
-//   EMPTY ──► LOADING ──► READY ──► CONSUMED ──► EMPTY
-//     ▲                                              │
-//     └──────────────────────────────────────────────┘
+//   EMPTY ──► LOADING ──► READY ──► CONSUMED
+//                ▲          │          │
+//                │          └──────────┤  (retained as LRU cache;
+//                └─────────────────────┘   evicted only when prefetch
+//                                          needs the slot for a new load)
 // ─────────────────────────────────────────────────────────────
 enum class SlotState : uint32_t {
     EMPTY    = 0,   // free; available for a new prefetch request
     LOADING  = 1,   // owned by an I/O worker; pread() in progress
     READY    = 2,   // data is in UMA; GPU / Metal bridge may consume
-    CONSUMED = 3,   // GPU done; pending reclaim back to EMPTY
+    CONSUMED = 3,   // consumed at least once; data retained as a cache hit
 };
 
 // ─────────────────────────────────────────────────────────────
@@ -70,7 +70,7 @@ static_assert(sizeof(RingSlot) == 64,
 // them via Direct I/O pread() calls against the .smoe vault.
 //
 // Thread model:
-//   Caller thread   →  prefetch() / claim_ready() / release()
+//   Caller thread   →  prefetch() / claim_specific() / release()
 //   N worker threads →  pop request queue, pread(), mark READY
 //
 // All synchronisation: std::atomic only. No OS mutex, ever.
@@ -104,30 +104,17 @@ public:
     [[nodiscard]] bool prefetch(uint32_t layer_id, uint32_t expert_id,
                                 bool speculative = false) noexcept;
 
-    // Claim the next READY slot. Caller takes ownership; must call
-    // claim_ready() / release() when the Metal kernel has finished with the data.
-    // Returns nullptr if no slot is READY (non-blocking).
-    // Zero allocations.
-    [[nodiscard]] RingSlot* claim_ready() noexcept;
-
-    // Claim a specific READY slot for a given layer and expert.
-    // Caller takes ownership; must call release() when done.
-    // Returns nullptr if the specific expert is not READY (non-blocking).
+    // Claim a specific READY (or retained-CONSUMED) slot for a given
+    // layer and expert. Caller takes ownership; must call release()
+    // when done. Returns nullptr if the expert is not resident yet
+    // (non-blocking — caller spins/retries). Zero allocations.
     [[nodiscard]] RingSlot* claim_specific(uint32_t layer_id, uint32_t expert_id) noexcept;
 
-    // Debugging helpers
-    void debug_print() const;
-    uint32_t debug_slot_state(uint32_t layer_id, uint32_t expert_id) const noexcept;
-    void debug_dump_ring() const noexcept;
-
-    // Release a slot the GPU is done with.
-    // Atomically transitions CONSUMED → EMPTY.
+    // Release a slot the GPU is done with: drops the caller's ref_count.
+    // The slot stays CONSUMED with its data intact — the ring retains it
+    // as an LRU cache entry until prefetch() evicts it for a new load.
     // Zero allocations.
     void release(RingSlot* slot) noexcept;
-
-    // Reclaim/garbage collect any READY slots whose (layer, expert) is NOT active.
-    // Zero allocations.
-    void prune_slots(bool (*is_active)(uint32_t, uint32_t, void*), void* ctx) noexcept;
 
     // Gracefully stop all worker threads and join them.
     void shutdown() noexcept;
@@ -137,15 +124,10 @@ public:
     [[nodiscard]] uint64_t hit_count()    const noexcept;
     [[nodiscard]] uint64_t miss_count()   const noexcept;
     [[nodiscard]] uint32_t ring_size()    const noexcept;
-    [[nodiscard]] uint32_t ready_count()  const noexcept;
-    void print_debug_states()             const noexcept;
-    
+
     // ── Memory Pool access (for Metal registration) ──
     [[nodiscard]] const void* pool_data() const noexcept;
     [[nodiscard]] uint64_t    pool_size() const noexcept;
-    
-    [[nodiscard]] const void* get_slot_ptr(uint32_t index) const noexcept;
-    [[nodiscard]] uint64_t    get_slot_bytes() const noexcept;
 
     Streamer(const Streamer&)            = delete;
     Streamer& operator=(const Streamer&) = delete;

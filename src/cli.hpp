@@ -18,7 +18,6 @@ inline constexpr uint32_t DEFAULT_MAX_TOKENS   = 512;
 struct EngineConfig {
     const char* vault_path  = nullptr;
     const char* scout_path  = nullptr;
-    const char* prompt_text = nullptr;
     const char* tokens_in   = nullptr;
     uint32_t    max_tokens  = DEFAULT_MAX_TOKENS;
     uint32_t    ring_size   = DEFAULT_RING_SIZE;
@@ -50,27 +49,29 @@ static inline void print_usage(const char* argv0) {
         "  S-MoE Engine — Streaming Mixture-of-Experts Inference\n"
         "  ───────────────────────────────────────────────────────\n"
         "  Usage:\n"
-        "    %s --vault <path.smoe> --prompt <text> [options]\n"
+        "    %s --vault <path.smoe> --scout <path> (--tokens-in <ids> | --serve) [options]\n"
         "\n"
         "  Required:\n"
-        "    --vault   <path>    Path to the .smoe vault file\n"
-        "    --prompt  <text>    Input prompt (string)\n"
-        "\n"
-        "  Optional:\n"
-        "    --scout   <path>    Path to Scout .safetensors weights\n"
-        "                        (omit for heuristic-only mode)\n"
-        "    --tokens  <N>       Max tokens to generate (default: %u)\n"
-        "    --ring    <N>       Ring buffer slot count  (default: %u)\n"
-        "    --workers <N>       I/O worker thread count (default: %u)\n"
-        "    --slot-mb <N>       Bytes per ring slot, MB (default: %llu)\n"
-        "    --raw-ids           Print raw token IDs as integers instead of text\n"
+        "    --vault     <path>  Path to the .smoe vault file\n"
+        "    --scout     <path>  Path to the dense-backbone .safetensors weights\n"
+        "  and one input mode:\n"
+        "    --tokens-in <ids>   Comma-separated prompt token IDs (one-shot run)\n"
         "    --serve             Persistent server mode: read GEN/RESET requests\n"
         "                        on stdin, reuse KV cache across requests\n"
+        "                        (chat.py / serve_openai.py drive this mode)\n"
+        "\n"
+        "  Optional:\n"
+        "    --tokens  <N>       Max tokens to generate (default: %u)\n"
+        "    --ring    <N>       Ring buffer slot count  (default: %u = auto)\n"
+        "    --workers <N>       I/O worker thread count (default: %u)\n"
+        "    --slot-mb <N>       Bytes per ring slot, MB (default: %llu = auto)\n"
+        "    --raw-ids           Print raw token IDs as integers instead of text\n"
         "    --instrument        Print a per-request decode timing breakdown\n"
-        "                        (scout/dense/io/gpu buckets) on stderr\n"
+        "                        (dense/io/gpu buckets) on stderr\n"
         "\n"
         "  Example:\n"
-        "    %s --vault vault/deepseek.smoe --prompt \"Explain MoE routing\" --tokens 200\n"
+        "    %s --vault vault/qwen3-30b-instruct.smoe \\\n"
+        "       --scout vault/qwen3-30b-instruct.scout.safetensors --serve\n"
         "\n",
         argv0,
         DEFAULT_MAX_TOKENS,
@@ -89,7 +90,6 @@ static inline EngineConfig parse_args(int argc, char* argv[]) {
         };
         if      (arg("--vault"))     { cfg.vault_path  = argv[++i]; }
         else if (arg("--scout"))     { cfg.scout_path  = argv[++i]; }
-        else if (arg("--prompt"))    { cfg.prompt_text = argv[++i]; }
         else if (arg("--tokens-in")) { cfg.tokens_in   = argv[++i]; }
         else if (arg("--tokens"))    { cfg.max_tokens  = static_cast<uint32_t>(std::atoi(argv[++i])); }
         else if (arg("--ring"))      { cfg.ring_size   = static_cast<uint32_t>(std::atoi(argv[++i])); }
@@ -123,8 +123,8 @@ static inline EngineConfig parse_args(int argc, char* argv[]) {
         }
     }
 
-    if (!cfg.vault_path || (!cfg.prompt_text && !cfg.tokens_in && !cfg.serve)) {
-        std::fprintf(stderr, "\n  ✗  --vault and either --prompt, --tokens-in or --serve are required.\n");
+    if (!cfg.vault_path || (!cfg.tokens_in && !cfg.serve)) {
+        std::fprintf(stderr, "\n  ✗  --vault and either --tokens-in or --serve are required.\n");
         print_usage(argv[0]);
         cfg.valid = false;
         return cfg;

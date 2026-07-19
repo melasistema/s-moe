@@ -52,13 +52,16 @@
 namespace smoe::scout {
 
 static void info_printf(const char* format, ...) {
-    const char* sm_dbg = std::getenv("SMOE_DEBUG");
-    if (sm_dbg && (std::strcmp(sm_dbg, "1") == 0 || std::strcmp(sm_dbg, "true") == 0)) {
-        va_list args;
-        va_start(args, format);
-        std::vfprintf(stderr, format, args);
-        va_end(args);
-    }
+    static const bool enabled = [] {
+        const char* sm_dbg = std::getenv("SMOE_DEBUG");
+        return sm_dbg && (std::strcmp(sm_dbg, "1") == 0 ||
+                          std::strcmp(sm_dbg, "true") == 0);
+    }();
+    if (!enabled) return;
+    va_list args;
+    va_start(args, format);
+    std::vfprintf(stderr, format, args);
+    va_end(args);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -411,15 +414,10 @@ Scout::Impl::Impl(const char* path, SmoeMetalCtx* metal_ctx, const SmoeHeader* v
         "[scout] Safetensors header: %llu bytes\n",
         static_cast<unsigned long long>(header_len));
 
-    // ── Parse Safetensors Metadata to configure Scout ────────────────
-    if (vault_hdr) {
-        cfg.vocab_size = vault_hdr->vocab_size;
-        cfg.d_model = vault_hdr->d_model;
-        cfg.ffn_dim = vault_hdr->ffn_dim;
-        cfg.num_moe_layers = vault_hdr->num_moe_layers;
-        cfg.max_experts_per_layer = vault_hdr->max_experts_per_layer;
-        cfg.q2_group_size = vault_hdr->group_size;
-    } else {
+    // ── Configure geometry from tensor shapes when no vault header ───
+    // (with a vault header the geometry was already taken from it at
+    // the top of the constructor).
+    if (!vault_hdr) {
         TensorMeta embed_meta = parse_tensor_meta(json_start, json_end, "model.embed_tokens.weight");
         if (embed_meta.valid) {
             cfg.vocab_size = embed_meta.shape[0];
@@ -438,7 +436,6 @@ Scout::Impl::Impl(const char* path, SmoeMetalCtx* metal_ctx, const SmoeHeader* v
 
         cfg.num_moe_layers = 27; // Fallback to DeepSeek hardcode if not passed from Vault yet
     }
-    std::fprintf(stderr, "[scout] debug: max_experts_per_layer=%u, vault_hdr_ptr=%p\n", cfg.max_experts_per_layer, (void*)vault_hdr);
 
     TensorMeta l0_gate_meta = parse_tensor_meta(json_start, json_end, "model.layers.0.mlp.gate_proj.weight");
     if (l0_gate_meta.valid) {

@@ -1,8 +1,6 @@
 // ═══════════════════════════════════════════════════════════════
 // streamer.cpp — S-MoE Engine · High-Velocity Direct I/O Streamer
 // ═══════════════════════════════════════════════════════════════
-// Phase 2 — Week 2
-//
 // Strategy:
 //   • Open the .smoe vault once with F_NOCACHE — zero kernel cache.
 //   • Parse SmoeHeader + ExpertTable at construction → O(1) lookup map.
@@ -131,8 +129,6 @@ public:
         }
     }
 
-    size_t get_enqueue_pos() const noexcept { return enqueue_pos_.load(std::memory_order_relaxed); }
-    size_t get_dequeue_pos() const noexcept { return dequeue_pos_.load(std::memory_order_relaxed); }
 };
 
 static constexpr size_t REQUEST_QUEUE_CAPACITY = 1024;  // power of two
@@ -426,7 +422,6 @@ bool Streamer::prefetch(uint32_t layer_id, uint32_t expert_id,
             im.slots[i].expert_id == expert_id)
         {
             im.slots[i].last_used_tick.store(im.global_tick.fetch_add(1, std::memory_order_relaxed), std::memory_order_relaxed);
-            im.slots[i].last_used_tick.store(im.global_tick.fetch_add(1, std::memory_order_relaxed), std::memory_order_relaxed);
             return true;  // already queued or ready — no duplicate load
         }
     }
@@ -507,25 +502,6 @@ bool Streamer::prefetch(uint32_t layer_id, uint32_t expert_id,
     return true;
 }
 
-RingSlot* Streamer::claim_ready() noexcept {
-    Impl& im = *impl_;
-
-    // Scan the ring for the first READY slot and transition it to CONSUMED.
-    // O(ring_sz) — called once per expert execution step, fully acceptable.
-    for (uint32_t i = 0; i < im.ring_sz; ++i) {
-        SlotState expected = SlotState::READY;
-        if (im.slots[i].state.compare_exchange_strong(
-                expected, SlotState::CONSUMED,
-                std::memory_order_acquire,  // acquire: see all pread() writes
-                std::memory_order_relaxed))
-        {
-            im.slots[i].last_used_tick.store(im.global_tick.fetch_add(1, std::memory_order_relaxed), std::memory_order_relaxed);
-            return &im.slots[i];
-        }
-    }
-    return nullptr;
-}
-
 RingSlot* Streamer::claim_specific(uint32_t layer_id, uint32_t expert_id) noexcept {
     Impl& im = *impl_;
     for (uint32_t i = 0; i < im.ring_sz; ++i) {
@@ -569,62 +545,10 @@ RingSlot* Streamer::claim_specific(uint32_t layer_id, uint32_t expert_id) noexce
 }
 
 void Streamer::release(RingSlot* slot) noexcept {
-    // Atomically decrement ref_count. DO NOT release to EMPTY!
-    // The slot remains in CONSUMED/READY state so the LRU cache (prune_slots)
-    // can retain it for future hits.
+    // Drop the caller's reference only. The slot stays CONSUMED with its
+    // data intact — the ring retains it as an LRU cache entry until
+    // prefetch()'s ref-count-guarded eviction reuses the slot.
     slot->ref_count.fetch_sub(1, std::memory_order_acq_rel);
-}
-
-void Streamer::prune_slots(bool (*is_active)(uint32_t, uint32_t, void*), void* ctx) noexcept {
-    Impl& im = *impl_;
-    
-    uint32_t empty_count = 0;
-    for (uint32_t i = 0; i < im.ring_sz; ++i) {
-        if (im.slots[i].state.load(std::memory_order_relaxed) == SlotState::EMPTY) {
-            empty_count++;
-        }
-    }
-    
-    // Always prune all inactive slots — the ring needs maximum available
-    // capacity for the next token. With 94 MoE layers × 8 experts = 752
-    // slots per token, any retention of stale slots risks deadlock.
-    // The prefetch idempotency check prevents re-loading cached experts.
-    uint32_t target_empty = im.ring_sz;  // free everything inactive
-    if (empty_count >= target_empty) return;
-    
-    struct Candidate {
-        uint32_t idx;
-        uint64_t tick;
-    };
-    std::vector<Candidate> candidates;
-    candidates.reserve(im.ring_sz);
-
-    for (uint32_t i = 0; i < im.ring_sz; ++i) {
-        SlotState s = im.slots[i].state.load(std::memory_order_relaxed);
-        if (s == SlotState::READY || s == SlotState::CONSUMED) {
-            if (im.slots[i].ref_count.load(std::memory_order_relaxed) == 0) {
-                if (!is_active(im.slots[i].layer_id, im.slots[i].expert_id, ctx)) {
-                    candidates.push_back({i, im.slots[i].last_used_tick.load(std::memory_order_relaxed)});
-                }
-            }
-        }
-    }
-
-    // Sort by oldest tick first
-    std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
-        return a.tick < b.tick;
-    });
-
-    for (const auto& c : candidates) {
-        if (empty_count >= target_empty) break;
-        uint32_t i = c.idx;
-        im.slots[i].ref_count.store(0, std::memory_order_relaxed);
-        im.slots[i].data_size = 0;
-        im.slots[i].layer_id = 0xFFFFFFFF;
-        im.slots[i].expert_id = 0xFFFFFFFF;
-        im.slots[i].state.store(SlotState::EMPTY, std::memory_order_release);
-        empty_count++;
-    }
 }
 
 // ── Telemetry getters ─────────────────────────────────────────
@@ -645,72 +569,7 @@ uint32_t Streamer::ring_size() const noexcept {
     return impl_->ring_sz;
 }
 
-uint32_t Streamer::ready_count() const noexcept {
-    uint32_t count = 0;
-    for (uint32_t i = 0; i < impl_->ring_sz; ++i) {
-        if (impl_->slots[i].state.load(std::memory_order_relaxed) == SlotState::READY) {
-            count++;
-        }
-    }
-    return count;
-}
-
 const void* Streamer::pool_data() const noexcept { return impl_->data_pool; }
 uint64_t Streamer::pool_size() const noexcept { return static_cast<uint64_t>(impl_->ring_sz) * impl_->slot_cap; }
-
-const void* Streamer::get_slot_ptr(uint32_t index) const noexcept {
-    if (index >= impl_->ring_sz) return nullptr;
-    return impl_->slots[index].data;
-}
-
-uint64_t Streamer::get_slot_bytes() const noexcept {
-    return impl_->slot_cap;
-}
-
-void Streamer::print_debug_states() const noexcept {
-    uint32_t states[4] = {0};
-    for (uint32_t i = 0; i < impl_->ring_sz; ++i) {
-        SlotState s = impl_->slots[i].state.load(std::memory_order_relaxed);
-        states[static_cast<int>(s)]++;
-    }
-    size_t eq = impl_->request_queue.get_enqueue_pos();
-    size_t dq = impl_->request_queue.get_dequeue_pos();
-    std::fprintf(stderr, "[DEBUG RING] EMPTY=%u LOADING=%u READY=%u CONSUMED=%u | QUEUE eq=%zu dq=%zu\n",
-                 states[0], states[1], states[2], states[3], eq, dq);
-    
-    for (uint32_t i = 0; i < impl_->ring_sz; ++i) {
-        SlotState s = impl_->slots[i].state.load(std::memory_order_relaxed);
-        if (s != SlotState::EMPTY) {
-            std::fprintf(stderr, "  Slot[%u]: state=%u L%u E%u ref=%u\n",
-                         i, static_cast<uint32_t>(s),
-                         impl_->slots[i].layer_id,
-                         impl_->slots[i].expert_id,
-                         impl_->slots[i].ref_count.load(std::memory_order_relaxed));
-        }
-    }
-    std::fflush(stderr);
-}
-
-uint32_t Streamer::debug_slot_state(uint32_t layer_id, uint32_t expert_id) const noexcept {
-    for (uint32_t i = 0; i < impl_->ring_sz; ++i) {
-        if (impl_->slots[i].layer_id == layer_id && impl_->slots[i].expert_id == expert_id) {
-            return static_cast<uint32_t>(impl_->slots[i].state.load(std::memory_order_relaxed));
-        }
-    }
-    return 999;
-}
-
-void Streamer::debug_dump_ring() const noexcept {
-    std::fprintf(stderr, "--- RING BUFFER DUMP ---\n");
-    for (uint32_t i = 0; i < impl_->ring_sz; ++i) {
-        uint32_t st = static_cast<uint32_t>(impl_->slots[i].state.load(std::memory_order_relaxed));
-        if (st != 0) {
-            std::fprintf(stderr, "Slot %u: layer=%u expert=%u state=%u ref_count=%u\n", 
-                         i, impl_->slots[i].layer_id, impl_->slots[i].expert_id, st,
-                         impl_->slots[i].ref_count.load(std::memory_order_relaxed));
-        }
-    }
-    std::fprintf(stderr, "------------------------\n");
-}
 
 } // namespace smoe::io

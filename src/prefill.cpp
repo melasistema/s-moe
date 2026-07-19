@@ -415,7 +415,6 @@ void run_layer_major(const Params& P,
                     spin++;
                 }
             }
-            smoe_metal_swap_buffers(P.metal);
 
             // Shared expert (DeepSeek-family; Qwen3-235B has none).
             const bool has_shared = scout.get_shared_gate(l) != nullptr && b.sh_gate != nullptr;

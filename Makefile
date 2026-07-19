@@ -31,12 +31,15 @@ LDFLAGS  := -framework Metal -framework Foundation \
              -framework MetalPerformanceShaders
 
 SRCS_CXX  := $(SRC_DIR)/main.cpp \
+              $(SRC_DIR)/engine.cpp \
               $(SRC_DIR)/io/streamer.cpp \
               $(SRC_DIR)/scout/scout.cpp \
-              $(SRC_DIR)/prefill.cpp
+              $(SRC_DIR)/prefill.cpp \
+              $(SRC_DIR)/decode.cpp
 SRCS_MM   := $(SRC_DIR)/compute/metal_bridge.mm
 METAL_SRC := $(SRC_DIR)/compute/kernels.metal
 METAL_LIB := $(BUILD_DIR)/kernels.metallib
+MSL_HEADER:= $(BUILD_DIR)/kernels_msl.h
 OBJS_CXX  := $(patsubst $(SRC_DIR)/%.cpp, $(BUILD_DIR)/%.o, $(SRCS_CXX))
 OBJS_MM   := $(patsubst $(SRC_DIR)/%.mm,  $(BUILD_DIR)/%.o, $(SRCS_MM))
 TARGET    := $(BUILD_DIR)/smoe-engine
@@ -117,7 +120,18 @@ $(BUILD_DIR)/%.o: $(SRC_DIR)/%.cpp | $(BUILD_DIR)
 
 $(BUILD_DIR)/%.o: $(SRC_DIR)/%.mm | $(BUILD_DIR)
 	@mkdir -p $(dir $@)
-	$(CXX) $(MMFLAGS) -I$(SRC_DIR) -c -o $@ $<
+	$(CXX) $(MMFLAGS) -I$(SRC_DIR) -I$(BUILD_DIR) -c -o $@ $<
+
+# kernels.metal is the single source of truth for the GPU kernels: the
+# bridge JIT-compiles it at boot from this generated raw-string header.
+$(BUILD_DIR)/compute/metal_bridge.o: $(MSL_HEADER)
+
+$(MSL_HEADER): $(METAL_SRC) | $(BUILD_DIR)
+	@printf '// Auto-generated from %s by make — do not edit.\n' $(METAL_SRC) >  $@
+	@printf 'static const char* kMetalSource = R"SMOE_MSL(\n'                 >> $@
+	@cat $(METAL_SRC)                                                         >> $@
+	@printf '\n)SMOE_MSL";\n'                                                 >> $@
+	@echo "  ⚙   MSL source embedded → $@"
 
 $(METAL_LIB): $(METAL_SRC) | $(BUILD_DIR)
 	$(XCRUN) -sdk macosx metal    -c $(METAL_SRC) -o $(BUILD_DIR)/kernels.air
