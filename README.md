@@ -34,6 +34,12 @@ No cloud. No H100. No half-terabyte workstation. A 235-billion-parameter frontie
 | **Decode speed** | **1.84 tok/s** — up from 0.48 t/s at the start of the campaign |
 | **Interfaces** | Native console · **OpenAI-compatible HTTP server** · built-in web chat |
 
+
+| Qwen 235B | Qwen 30B |
+|---|---|
+| [![Qwen 235B](https://img.youtube.com/vi/lbf4aqNezus/default.jpg)](https://www.youtube.com/watch?v=lbf4aqNezus) | [![Qwen 30B](https://img.youtube.com/vi/xDjyxQ-GHcY/default.jpg)](https://www.youtube.com/watch?v=xDjyxQ-GHcY) |
+
+
 The mountain rests cold on the SSD; only the handful of experts each word actually needs is ever pulled into memory. See how the wall came down in [Current Status](#current-status).
 
 ---
@@ -78,20 +84,21 @@ S-MoE splits monolithic models into a similar acoustic sensor array:
 
 ---
 
-## It Speaks OpenAI
+## It Speaks Every Protocol That Matters
 
-S-MoE isn't a walled garden. Beyond the native console, it exposes an **OpenAI-compatible HTTP server** — anything that already talks to OpenAI talks to your laptop's vault fleet, unmodified:
+S-MoE isn't a walled garden. Beyond the native console, it exposes a **multi-protocol HTTP server** — anything that speaks OpenAI *or* Anthropic talks to your laptop's vault fleet, unmodified:
 
 ```bash
-.venv/bin/python serve_openai.py --port 8000
+.venv/bin/python serve.py --port 8000
 ```
 
-- `POST /v1/chat/completions` — streaming (SSE) and non-streaming, with per-request `temperature`, `top_p`, `top_k`, and an honest `finish_reason`.
+- `POST /v1/chat/completions` — **OpenAI** Chat Completions (streaming + non-streaming), with per-request `temperature`, `top_p`, `top_k`, and an honest `finish_reason`.
+- `POST /v1/messages` — **Anthropic** Messages API (streaming + non-streaming) — Claude Code, the Anthropic SDK, and any Anthropic-speaking client work natively.
 - `GET /v1/models` — every vault discovered on disk, identity read from the vault's own bytes. Naming another one in the standard `model` field **switches the engine** — so Open WebUI's model picker switches vaults with zero S-MoE-specific code.
 - `GET /health` — the plumbing supervisors expect.
 - `GET /` — a **built-in, dependency-free web chat console** with live turn timings, context and RAM meters, and a model dropdown. Open `http://127.0.0.1:8000/` and start typing.
 
-Point Open WebUI, LibreChat, an editor plugin, or the `openai` SDK at `http://127.0.0.1:8000/v1` and it cannot tell S-MoE from OpenAI. One file of Python stdlib, zero new dependencies — the engine gains an ecosystem without gaining weight.
+Point Open WebUI, LibreChat, an editor plugin, or the `openai` SDK at `http://127.0.0.1:8000/v1` and it cannot tell S-MoE from OpenAI. Point Claude Code at the same origin (`ANTHROPIC_BASE_URL=http://127.0.0.1:8000 claude`) and it cannot tell S-MoE from Anthropic. One file, one process, one port, both protocols, zero new dependencies.
 
 ---
 
@@ -108,7 +115,7 @@ Point Open WebUI, LibreChat, an editor plugin, or the `openai` SDK at `http://12
 * `src/prefill.cpp`: Layer-major batched prefill — prompt chunks traverse the model layer by layer, each layer's deduplicated expert union read from the vault exactly once.
 * `src/compute/metal_bridge.mm`: The operational execution nexus, swapping active memory pointers directly into the Apple GPU ring, with token-batch fused FFN kernels for prefill.
 * `chat.py`: The thin Python console — tokenization and display only. It speaks to one persistent engine process per session over a line protocol.
-* `serve_openai.py`: The OpenAI-compatible HTTP front-end. Owns HTTP, tokenization, the chat template, and the vault fleet — discovery, `/v1/models`, and live model switching; drives the same persistent engine over the same line protocol. Zero new dependencies.
+* `serve.py`: The multi-protocol HTTP front-end. Owns HTTP, tokenization, the chat template, and the vault fleet — discovery, `/v1/models`, and live model switching; drives the same persistent engine over the same line protocol. Speaks both OpenAI (`/v1/chat/completions`) and Anthropic (`/v1/messages`) natively. Zero new dependencies.
 * `webchat.html`: A single self-contained, dependency-free browser chat console, served same-origin at `GET /` for hands-on testing.
 
 ---

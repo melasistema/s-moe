@@ -1,17 +1,30 @@
 #!/usr/bin/env python3
 """
-serve_openai.py — OpenAI-compatible HTTP front-end for the S-MoE engine.
+serve.py — Multi-protocol HTTP front-end for the S-MoE engine.
 
-Wraps the persistent `--serve` engine (GEN/<<DONE>> stdin protocol) in the
-OpenAI Chat Completions API, so any OpenAI-compatible client (Open WebUI,
-LibreChat, editor plugins, the `openai` SDK, curl) can talk to S-MoE.
+Wraps the persistent `--serve` engine (GEN/<<DONE>> stdin protocol) in two
+industry-standard APIs, so any client — OpenAI or Anthropic — can talk to
+S-MoE without modification.
 
 Endpoints:
     GET  /                     → webchat.html, a built-in same-origin test UI
     GET  /health               → {"status":"ok", "engine":"up|down"}
     GET  /sysmem               → macOS physical-memory snapshot for the console
     GET  /v1/models            → every vault discovered in --vault-dir
-    POST /v1/chat/completions  → streaming (SSE) or non-streaming completion
+    POST /v1/chat/completions  → OpenAI Chat Completions (streaming + non-streaming)
+    POST /v1/messages          → Anthropic Messages API (streaming + non-streaming)
+
+OpenAI protocol: the original lingua franca — Open WebUI, LibreChat, editor
+plugins, the `openai` SDK, plain `curl`.
+
+Anthropic protocol: Claude Code and the Anthropic SDK speak a different wire
+format (/v1/messages with typed SSE events).  The mapping is mechanical —
+Anthropic's `system` (top-level) becomes a system message, content-block
+arrays are flattened to text, and the engine's token stream is wrapped in
+message_start / content_block_delta / message_stop events instead of OpenAI's
+choices[].delta.  Engine.generate() is already protocol-agnostic, so both
+protocols share the same tokenization, KV cache, and serialization lock.
+Set ANTHROPIC_BASE_URL=http://127.0.0.1:<port> to use Claude Code.
 
 Model switching: every *.smoe with a sibling *.scout.safetensors in
 --vault-dir is a servable model (id = filename stem); identity (quant bits,
@@ -349,7 +362,7 @@ class Engine:
                     resp_tokens.append(int(clean))
                     text = self.tok.decode(resp_tokens, skip_special_tokens=True)
                     # Hold back while the tail is an incomplete UTF-8 sequence.
-                    if text.endswith("�"):
+                    if text.endswith("\ufffd"):
                         continue
                     if len(text) > len(emitted):
                         on_delta(text[len(emitted):])
@@ -362,6 +375,8 @@ class Engine:
                 if not at_boundary:
                     self._drain()
 
+
+# ── OpenAI request parsing ───────────────────────────────────────────
 
 def _messages_from(body):
     msgs = body.get("messages")
@@ -401,6 +416,73 @@ def _sampling_from(body):
             out[dst] = v
     return out
 
+
+# ── Anthropic request parsing ────────────────────────────────────────
+
+def _anthropic_messages_from(body):
+    """Parse an Anthropic /v1/messages request into the internal
+    [{role, content}] list that Engine.generate() expects.
+    Anthropic puts system at the top level and uses content-block arrays."""
+    out = []
+    # Anthropic's system prompt is top-level, not a message.
+    system = body.get("system")
+    if system:
+        if isinstance(system, list):  # content-block array form
+            system = "".join(
+                b.get("text", "") for b in system
+                if isinstance(b, dict) and b.get("type") == "text")
+        out.append({"role": "system", "content": system})
+    msgs = body.get("messages")
+    if not isinstance(msgs, list) or not msgs:
+        raise ValueError("'messages' must be a non-empty array")
+    for m in msgs:
+        role = m.get("role")
+        content = m.get("content", "")
+        if isinstance(content, list):
+            # Flatten content blocks: extract text from text blocks,
+            # represent tool_use/tool_result as readable text so the
+            # model sees them even without structured tool support.
+            parts = []
+            for b in content:
+                if not isinstance(b, dict):
+                    continue
+                btype = b.get("type", "")
+                if btype == "text":
+                    parts.append(b.get("text", ""))
+                elif btype == "tool_use":
+                    # Render tool calls as text the model can see.
+                    name = b.get("name", "")
+                    inp = json.dumps(b.get("input", {}), ensure_ascii=False)
+                    parts.append(f"[tool_use: {name}({inp})]")
+                elif btype == "tool_result":
+                    # Tool results may carry text or nested content blocks.
+                    rc = b.get("content", "")
+                    if isinstance(rc, list):
+                        rc = "".join(
+                            p.get("text", "") for p in rc
+                            if isinstance(p, dict) and p.get("type") == "text")
+                    err = " [error]" if b.get("is_error") else ""
+                    parts.append(f"[tool_result{err}: {rc}]")
+                elif btype == "image":
+                    parts.append("[image]")
+            content = "\n".join(parts)
+        out.append({"role": role, "content": content})
+    return out
+
+
+def _anthropic_sampling_from(body):
+    """Collect sampling params from an Anthropic request. The field names
+    are the same as OpenAI's (temperature, top_p, top_k) — only
+    repetition_penalty is absent from the Anthropic spec."""
+    out = {}
+    for name in ("temperature", "top_p", "top_k"):
+        v = body.get(name)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            out[name] = v
+    return out
+
+
+# ── system memory (macOS) ────────────────────────────────────────────
 
 _MEMSIZE = None    # hw.memsize never changes at runtime — fetch it once.
 
@@ -473,6 +555,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(payload)
 
@@ -485,11 +568,19 @@ class Handler(BaseHTTPRequestHandler):
         # closing. "keep-alive" here would leave readers blocked forever
         # after [DONE].
         self.send_header("Connection", "close")
+        self.send_header("Access-Control-Allow-Origin", "*")
         self.close_connection = True
         self.end_headers()
 
     def _sse(self, obj):
+        """OpenAI SSE: data-only frames (no event: line)."""
         self.wfile.write(f"data: {json.dumps(obj)}\n\n".encode())
+        self.wfile.flush()
+
+    def _sse_event(self, event, obj):
+        """Anthropic SSE: each frame carries an `event:` line + `data:` line,
+        separated by a blank line — distinct from OpenAI's data-only format."""
+        self.wfile.write(f"event: {event}\ndata: {json.dumps(obj)}\n\n".encode())
         self.wfile.flush()
 
     def _file(self, name, ctype):
@@ -510,54 +601,94 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     # ── routes ───────────────────────────────────────────────
+    def do_OPTIONS(self):
+        """CORS preflight — Claude Code and other local clients may issue
+        an OPTIONS probe before POST when running from a different origin."""
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "*")
+        self.send_header("Access-Control-Max-Age", "86400")
+        self.end_headers()
+
     def do_GET(self):
+        path = self.path.split("?")[0]
         # Same-origin test console (see webchat.html) — no CORS needed because
         # it is served from the very origin its fetch() calls target.
-        if self.path in ("/", "/index.html"):
+        if path in ("/", "/index.html"):
             self._file("webchat.html", "text/html; charset=utf-8")
-        elif self.path == "/health":
+        elif path == "/health":
             self._json(200, {"status": "ok",
                              "engine": "up" if self.engine.alive() else "down"})
-        elif self.path == "/sysmem":
+        elif path == "/sysmem":
             # System RAM for the console's memory meter. Pass the engine's live
             # pid (when up) so the snapshot can include S-MoE's own resident set.
             proc = getattr(self.engine, "proc", None)
             pid = proc.pid if proc and self.engine.alive() else None
             self._json(200, _sysmem(pid) or {"error": "unavailable"})
-        elif self.path in ("/v1/models", "/models"):
+        elif path in ("/v1/models", "/models"):
             self._json(200, {"object": "list", "data": self.engine.model_cards()})
         else:
             self._json(404, {"error": {"message": "not found", "type": "invalid_request_error"}})
 
     def do_POST(self):
-        if self.path not in ("/v1/chat/completions", "/chat/completions"):
-            self._json(404, {"error": {"message": "not found", "type": "invalid_request_error"}})
+        path = self.path.split("?")[0]
+        # ── OpenAI: /v1/chat/completions ─────────────────────────
+        if path in ("/v1/chat/completions", "/chat/completions"):
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(length) or b"{}")
+                messages = _messages_from(body)
+            except Exception as e:
+                self._json(400, {"error": {"message": str(e), "type": "invalid_request_error"}})
+                return
+
+            max_tokens = _max_tokens_from(body, self.default_max, self.max_cap)
+            sampling = _sampling_from(body)
+            stream = bool(body.get("stream", False))
+            cid = "chatcmpl-" + uuid.uuid4().hex[:24]
+            created = int(time.time())
+            # The request's model field selects the vault. The legacy alias and
+            # unknown labels resolve to whatever is loaded — the response then
+            # reports the model that actually generated.
+            model = body.get("model")
+            if model == self.model_id or model not in getattr(self.engine, "models", {}):
+                model = getattr(self.engine, "active", self.model_id)
+
+            if stream:
+                self._stream(cid, created, messages, max_tokens, sampling, model)
+            else:
+                self._complete(cid, created, messages, max_tokens, sampling, model)
             return
-        try:
-            length = int(self.headers.get("Content-Length", 0))
-            body = json.loads(self.rfile.read(length) or b"{}")
-            messages = _messages_from(body)
-        except Exception as e:
-            self._json(400, {"error": {"message": str(e), "type": "invalid_request_error"}})
+
+        # ── Anthropic: /v1/messages ──────────────────────────────
+        if path in ("/v1/messages", "/messages"):
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(length) or b"{}")
+                messages = _anthropic_messages_from(body)
+            except Exception as e:
+                self._json(400, {"type": "error", "error": {
+                    "type": "invalid_request_error", "message": str(e)}})
+                return
+
+            max_tokens = _max_tokens_from(body, self.default_max, self.max_cap)
+            sampling = _anthropic_sampling_from(body)
+            stream = bool(body.get("stream", False))
+            mid = "msg_" + uuid.uuid4().hex[:24]
+            model = body.get("model")
+            if not model or model not in getattr(self.engine, "models", {}):
+                model = getattr(self.engine, "active", self.model_id)
+
+            if stream:
+                self._anthropic_stream(mid, messages, max_tokens, sampling, model)
+            else:
+                self._anthropic_complete(mid, messages, max_tokens, sampling, model)
             return
 
-        max_tokens = _max_tokens_from(body, self.default_max, self.max_cap)
-        sampling = _sampling_from(body)
-        stream = bool(body.get("stream", False))
-        cid = "chatcmpl-" + uuid.uuid4().hex[:24]
-        created = int(time.time())
-        # The request's model field selects the vault. The legacy alias and
-        # unknown labels resolve to whatever is loaded — the response then
-        # reports the model that actually generated.
-        model = body.get("model")
-        if model == self.model_id or model not in getattr(self.engine, "models", {}):
-            model = getattr(self.engine, "active", self.model_id)
+        self._json(404, {"error": {"message": "not found", "type": "invalid_request_error"}})
 
-        if stream:
-            self._stream(cid, created, messages, max_tokens, sampling, model)
-        else:
-            self._complete(cid, created, messages, max_tokens, sampling, model)
-
+    # ── OpenAI streaming ─────────────────────────────────────────
     def _stream(self, cid, created, messages, max_tokens, sampling, model):
         self._sse_open()
         base = {"id": cid, "object": "chat.completion.chunk",
@@ -603,6 +734,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
+    # ── OpenAI non-streaming ─────────────────────────────────────
     def _complete(self, cid, created, messages, max_tokens, sampling, model):
         parts = []
         try:
@@ -622,9 +754,101 @@ class Handler(BaseHTTPRequestHandler):
                       "total_tokens": p_n + c_n},
         })
 
+    # ── Anthropic streaming ──────────────────────────────────────
+    def _anthropic_stream(self, mid, messages, max_tokens, sampling, model):
+        """Stream a completion using Anthropic's typed-event SSE protocol.
+        The event sequence mirrors the official API: message_start →
+        content_block_start → content_block_delta* → content_block_stop →
+        message_delta → message_stop."""
+        self._sse_open()
+        try:
+            # message_start — carries the message shell and input token count
+            # (filled in by on_prompt once the template is tokenized).
+            msg_obj = {
+                "id": mid, "type": "message", "role": "assistant",
+                "content": [], "model": model,
+                "stop_reason": None, "stop_sequence": None,
+                "usage": {"input_tokens": 0, "output_tokens": 0},
+            }
+            self._sse_event("message_start",
+                            {"type": "message_start", "message": msg_obj})
+
+            # content_block_start — one text block (index 0).
+            self._sse_event("content_block_start", {
+                "type": "content_block_start", "index": 0,
+                "content_block": {"type": "text", "text": ""}})
+
+            # A ping keeps the connection alive during long prefills.
+            self._sse_event("ping", {"type": "ping"})
+
+            prompt_n = [0]  # mutated by on_prompt
+
+            def on_delta(text):
+                self._sse_event("content_block_delta", {
+                    "type": "content_block_delta", "index": 0,
+                    "delta": {"type": "text_delta", "text": text}})
+
+            def on_prompt(n):
+                prompt_n[0] = n
+
+            _, p_n, c_n, finish = self.engine.generate(
+                messages, max_tokens, on_delta, sampling, on_prompt=on_prompt,
+                model=model)
+
+            # content_block_stop
+            self._sse_event("content_block_stop",
+                            {"type": "content_block_stop", "index": 0})
+
+            # message_delta — stop_reason + output token count.
+            stop = "end_turn" if finish == "stop" else "max_tokens"
+            self._sse_event("message_delta", {
+                "type": "message_delta",
+                "delta": {"stop_reason": stop, "stop_sequence": None},
+                "usage": {"output_tokens": c_n}})
+
+            # message_stop — end of stream.
+            self._sse_event("message_stop", {"type": "message_stop"})
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # client hung up mid-stream
+        except Exception as e:
+            try:
+                self._sse_event("content_block_delta", {
+                    "type": "content_block_delta", "index": 0,
+                    "delta": {"type": "text_delta",
+                              "text": f"\n[engine error: {e}]"}})
+                self._sse_event("content_block_stop",
+                                {"type": "content_block_stop", "index": 0})
+                self._sse_event("message_delta", {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                    "usage": {"output_tokens": 0}})
+                self._sse_event("message_stop", {"type": "message_stop"})
+            except Exception:
+                pass
+
+    # ── Anthropic non-streaming ──────────────────────────────────
+    def _anthropic_complete(self, mid, messages, max_tokens, sampling, model):
+        """Non-streaming Anthropic /v1/messages response."""
+        try:
+            full, p_n, c_n, finish = self.engine.generate(
+                messages, max_tokens, lambda t: None, sampling, model=model)
+        except Exception as e:
+            self._json(503, {"type": "error", "error": {
+                "type": "api_error",
+                "message": f"engine error: {e}"}})
+            return
+        stop = "end_turn" if finish == "stop" else "max_tokens"
+        self._json(200, {
+            "id": mid, "type": "message", "role": "assistant",
+            "content": [{"type": "text", "text": full}],
+            "model": model,
+            "stop_reason": stop, "stop_sequence": None,
+            "usage": {"input_tokens": p_n, "output_tokens": c_n},
+        })
+
 
 def main():
-    ap = argparse.ArgumentParser(description="OpenAI-compatible server for S-MoE.")
+    ap = argparse.ArgumentParser(description="Multi-protocol HTTP server for S-MoE.")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--engine", default=os.path.join(ROOT, "build/smoe-engine"))
@@ -673,8 +897,9 @@ def main():
 
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"[serve] listening on http://{args.host}:{args.port}  "
-          f"(POST /v1/chat/completions, GET /v1/models)", flush=True)
+          f"(OpenAI /v1/chat/completions + Anthropic /v1/messages)", flush=True)
     print(f"[serve] web console: open http://{args.host}:{args.port}/ in a browser", flush=True)
+    print(f"[serve] Claude Code: ANTHROPIC_BASE_URL=http://{args.host}:{args.port} claude", flush=True)
     print("[serve] per-request sampling: temperature/top_p/top_k/repetition_penalty "
           "forwarded to the engine; launch values are the defaults.", flush=True)
     if len(models) > 1:

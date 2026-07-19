@@ -58,7 +58,7 @@ static inline void print_usage(const char* argv0) {
         "    --tokens-in <ids>   Comma-separated prompt token IDs (one-shot run)\n"
         "    --serve             Persistent server mode: read GEN/RESET requests\n"
         "                        on stdin, reuse KV cache across requests\n"
-        "                        (chat.py / serve_openai.py drive this mode)\n"
+        "                        (chat.py / serve.py drive this mode)\n"
         "\n"
         "  Optional:\n"
         "    --tokens  <N>       Max tokens to generate (default: %u)\n"

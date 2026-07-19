@@ -1,11 +1,11 @@
 <!DOCTYPE html>
 <!--
-  webchat.html — a dependency-free manual test console for serve_openai.py.
+  webchat.html — a dependency-free manual test console for serve.py.
 
   Served at GET / by the OpenAI-compatible server, so it shares the server's
   origin: fetch() to /v1/chat/completions needs no CORS. It is a *test*
   client, deliberately thin — one file, vanilla JS, no build step — mirroring
-  the ethos of chat.py and serve_openai.py. Any real OpenAI client (Open
+  the ethos of chat.py and serve.py. Any real OpenAI client (Open
   WebUI, LibreChat, the openai SDK) works identically against /v1.
 
   It resends the full message history every turn, exactly as OpenAI-style
@@ -167,7 +167,7 @@ const input = document.getElementById("input");
 const sendBtn = document.getElementById("send");
 let busy = false;
 
-// This page must be SERVED by serve_openai.py, not opened from disk: its
+// This page must be SERVED by serve.py, not opened from disk: its
 // fetches are relative, so on file:// they resolve to file:///v1/... and the
 // browser blocks them. Fail loud and clear instead of silently.
 if (location.protocol === "file:") {
@@ -176,7 +176,7 @@ if (location.protocol === "file:") {
     '<div class="msg assistant"><div class="role">webchat</div><div class="body">'
     + "This console is open from a file:// URL, so it can’t reach the engine "
     + "(the browser blocks file:///v1/... requests).\n\nRun the server and open it "
-    + "through that origin instead:\n\n    .venv/bin/python serve_openai.py --port 8000\n\n"
+    + "through that origin instead:\n\n    .venv/bin/python serve.py --port 8000\n\n"
     + "then visit  http://127.0.0.1:8000/  in your browser."
     + "</div></div>";
   input.disabled = true; sendBtn.disabled = true;
@@ -231,7 +231,7 @@ async function poll() {
 poll(); setInterval(poll, 5000);
 
 // ── system RAM meter ───────────────────────────────────────────────
-// The browser can't read host memory, so serve_openai.py exposes it at
+// The browser can't read host memory, so serve.py exposes it at
 // GET /sysmem (macOS vm_stat + hw.memsize). We surface installed total, used,
 // and free headroom — the space S-MoE's expert-streaming ring can grow into.
 // Colour follows macOS memory PRESSURE (the honest "fullness" signal — a 48 GB
