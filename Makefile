@@ -7,8 +7,8 @@
 #   make setup          ← creates .venv and installs Python deps
 #
 # Then, every day:
-#   make shatter MODEL=./deepseek-moe-16b OUT=./vault --validate
-#   make probe   MODEL=./deepseek-moe-16b
+#   make shatter MODEL=./checkpoints/qwen3-235b-instruct OUT=./vault --validate
+#   make probe   MODEL=./checkpoints/qwen3-235b-instruct
 #   make all             ← build the C++ engine
 # ═══════════════════════════════════════════════════════════════
 
@@ -73,7 +73,7 @@ setup:
 # OFFLINE SCULPTOR
 # ─────────────────────────────────────────────────────────────
 
-## shatter: Slice a DeepSeek MoE model into a .smoe vault.
+## shatter: Slice a supported MoE monolith into a .smoe vault.
 ##   Usage : make shatter MODEL=<model_dir> OUT=<output_dir>
 ##   Flags : set ARGS to pass extra flags (e.g. ARGS="--max-layers 2")
 .PHONY: shatter
@@ -103,7 +103,7 @@ print('  ✓  SMOE-Q2 smoke-test passed') \
 "
 
 # ─────────────────────────────────────────────────────────────
-# C++ / METAL ENGINE  (Weeks 2-4)
+# C++ / METAL ENGINE
 # ─────────────────────────────────────────────────────────────
 
 ## all: Build the C++ engine binary.
