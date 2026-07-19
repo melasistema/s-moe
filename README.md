@@ -35,11 +35,6 @@ No cloud. No H100. No half-terabyte workstation. A 235-billion-parameter frontie
 | **Interfaces** | Native console · **OpenAI-compatible HTTP server** · built-in web chat |
 
 
-| Qwen 235B | Qwen 30B |
-|---|---|
-| [![Qwen 235B](https://img.youtube.com/vi/lbf4aqNezus/default.jpg)](https://www.youtube.com/watch?v=lbf4aqNezus) | [![Qwen 30B](https://img.youtube.com/vi/xDjyxQ-GHcY/default.jpg)](https://www.youtube.com/watch?v=xDjyxQ-GHcY) |
-
-
 The mountain rests cold on the SSD; only the handful of experts each word actually needs is ever pulled into memory. See how the wall came down in [Current Status](#current-status).
 
 ---
@@ -55,6 +50,10 @@ Every vault in `vault/` becomes a servable model, and they trade places live:
 | **Role** | The frontier — maximum intelligence | The daily driver — speed |
 | **Vault (Q4)** | ~112 GB, streamed from SSD | ~14 GB, fits almost entirely in the RAM ring |
 | **Decode** | 1.84 tok/s | **~13.7 tok/s** |
+
+| Qwen 235B | Qwen 30B |
+|---|---|
+| [![Qwen 235B](https://img.youtube.com/vi/lbf4aqNezus/default.jpg)](https://www.youtube.com/watch?v=lbf4aqNezus) | [![Qwen 30B](https://img.youtube.com/vi/xDjyxQ-GHcY/default.jpg)](https://www.youtube.com/watch?v=xDjyxQ-GHcY) |
 
 Same engine, same binary, same laptop. The smaller the model, the more of it lives in memory — and the streaming cost that bounds the frontier simply vanishes. The full model matrix and hardware projections live in the [official documentation](https://docs.s-moe.com/).
 
